@@ -89,8 +89,15 @@ fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> R
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler_stop = Arc::clone(&stop);
     let handler_interrupted = Arc::clone(&interrupted);
+    // The handler runs on its own thread, so it can hand the device back itself. A second
+    // signal means the caller is not willing to wait for the tail, so leave at once - but
+    // still release the device, or it stays claimed until macOS notices the process died.
     ctrlc::set_handler(move || {
-        handler_interrupted.store(true, Ordering::Relaxed);
+        if handler_interrupted.swap(true, Ordering::Relaxed) {
+            eprintln!();
+            output::stream::release_claimed_device();
+            std::process::exit(130);
+        }
         handler_stop.store(true, Ordering::Relaxed);
     })?;
 

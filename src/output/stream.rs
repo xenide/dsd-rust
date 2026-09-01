@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::os::raw::c_void;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -258,10 +258,16 @@ impl Output {
                 Ok(()) => hogged = true,
                 Err(error) => {
                     if let Some(owner) = device.hog_owner() {
-                        bail!(
-                            "the device is held exclusively by process {owner}; quit it, or pass \
-                             --shared to play alongside it"
-                        );
+                        // ESRCH means the claim outlived the process that made it; macOS
+                        // reclaims those on its own, but not always immediately.
+                        let alive = unsafe { libc::kill(owner, 0) } == 0;
+                        let advice = if alive {
+                            "quit it, or pass --shared to play alongside it"
+                        } else {
+                            "that process is gone, so the claim should clear shortly; retry, or \
+                             unplug and replug the device"
+                        };
+                        bail!("the device is held exclusively by process {owner}; {advice}");
                     }
                     warn!("could not take exclusive access: {error}");
                 }
@@ -297,6 +303,7 @@ impl Output {
         let format = adopt_format(&stream, &choice.formats, pcm_rate)
             .with_context(|| format!("device rejected every {pcm_rate} Hz format"))?;
         output.format_changed = true;
+        output.publish_claim();
 
         let virtual_format = negotiate_virtual_format(&stream, &format, exclusive)?;
         if virtual_format.mSampleRate != f64::from(pcm_rate) {
@@ -352,6 +359,20 @@ impl Output {
 
     /// A device that has just changed sample rate rejects the start of a callback bound
     /// before the change, so a refused start rebinds the callback and tries again.
+    /// Mirror the claim into the global record the signal path reads.
+    fn publish_claim(&self) {
+        let reclaim = Reclaim {
+            device: self.device,
+            stream: self.stream,
+            format: self.format_changed.then_some(self.original_format),
+            rate: self.original_rate,
+            mixing_disabled: self.mixing_disabled,
+            hogged: self.hogged,
+            was_default_output: self.was_default_output,
+        };
+        *CLAIMED.lock().unwrap_or_else(|error| error.into_inner()) = Some(reclaim);
+    }
+
     pub fn start(&mut self) -> Result<()> {
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
@@ -404,34 +425,66 @@ impl Drop for Output {
         if !self.context.is_null() {
             drop(unsafe { Box::from_raw(self.context) });
         }
-        // Wait for the restore to land: leaving a reconfiguration in flight makes the next
-        // track's format change fail with EAGAIN.
-        if !self.format_changed {
-            // nothing was adopted, so the device still holds its own format
-        } else if let Err(error) = self.stream.set_physical_format(&self.original_format) {
+        release_claimed_device();
+    }
+}
+
+/// Everything a claimed device needs undone, in a form a signal handler can act on.
+#[derive(Clone, Copy)]
+struct Reclaim {
+    device: Device,
+    stream: Stream,
+    format: Option<AudioStreamBasicDescription>,
+    rate: f64,
+    mixing_disabled: bool,
+    hogged: bool,
+    was_default_output: bool,
+}
+
+/// The device this process currently holds, so a signal can hand it back even though the
+/// owning [`Output`] lives on another thread and will never be dropped.
+static CLAIMED: Mutex<Option<Reclaim>> = Mutex::new(None);
+
+fn restore(reclaim: &Reclaim) {
+    // Wait for the restore to land: leaving a reconfiguration in flight makes the next
+    // track's format change fail with EAGAIN.
+    if let Some(format) = reclaim.format {
+        if let Err(error) = reclaim.stream.set_physical_format(&format) {
             warn!("could not restore the stream format: {error}");
-        } else if let Err(error) = settle(&self.stream, self.original_format.mSampleRate) {
+        } else if let Err(error) = settle(&reclaim.stream, format.mSampleRate) {
             debug!("stream format did not settle back: {error}");
         }
-        if let Err(error) = self.device.set_nominal_sample_rate(self.original_rate) {
-            debug!("could not restore the sample rate: {error}");
-        }
-        if self.mixing_disabled
-            && let Err(error) = self.device.set_mixing(true)
-        {
-            warn!("could not re-enable mixing: {error}");
-        }
-        if self.hogged
-            && let Err(error) = self.device.set_hog_mode(-1)
-        {
-            warn!("could not release exclusive access: {error}");
-        }
-        // Claiming a device moves the system output elsewhere, and macOS does not move it back.
-        let moved_away = self.was_default_output
-            && Device::default_output().is_ok_and(|current| current != self.device);
-        if moved_away && let Err(error) = self.device.make_default_output() {
-            debug!("could not restore the system output device: {error}");
-        }
+    }
+    if let Err(error) = reclaim.device.set_nominal_sample_rate(reclaim.rate) {
+        debug!("could not restore the sample rate: {error}");
+    }
+    if reclaim.mixing_disabled
+        && let Err(error) = reclaim.device.set_mixing(true)
+    {
+        warn!("could not re-enable mixing: {error}");
+    }
+    if reclaim.hogged
+        && let Err(error) = reclaim.device.set_hog_mode(-1)
+    {
+        warn!("could not release exclusive access: {error}");
+    }
+    // Claiming a device moves the system output elsewhere, and macOS does not move it back.
+    let moved_away = reclaim.was_default_output
+        && Device::default_output().is_ok_and(|current| current != reclaim.device);
+    if moved_away && let Err(error) = reclaim.device.make_default_output() {
+        debug!("could not restore the system output device: {error}");
+    }
+}
+
+/// Hand back whatever device this process holds. Safe to call from the signal thread, and
+/// safe to call twice: the second call finds nothing to do.
+pub fn release_claimed_device() {
+    let claimed = CLAIMED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(reclaim) = claimed {
+        restore(&reclaim);
     }
 }
 

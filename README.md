@@ -45,6 +45,10 @@ The device format, sample rate, mixing switch, and hog mode are all restored whe
 ends, along with the system output device: claiming a device exclusively makes macOS pick a
 different default, and it does not put it back on its own.
 
+The same teardown runs on `Ctrl-C`, on `SIGTERM`, and when the terminal goes away, so an
+interrupted player never leaves a DAC claimed. A second `Ctrl-C` skips the closing silence
+and exits at once, still handing the device back.
+
 ## Supported files
 
 * DSF (`.dsf`), DSD64 through DSD512, up to 6 channels
