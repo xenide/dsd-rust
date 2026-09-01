@@ -1,0 +1,261 @@
+use std::io::Read;
+
+use anyhow::{Context, Result, bail, ensure};
+
+use crate::dsd::{BitOrder, DsdFormat, DsdRate};
+use crate::reader::{DsdSource, read_available};
+
+const CHUNK_BYTES: usize = 4096;
+
+/// Reader for Philips' DSDIFF container: big-endian chunks, byte-interleaved MSB-first DSD.
+pub struct DffReader<R> {
+    inner: R,
+    format: DsdFormat,
+    audio_bytes_per_channel: u64,
+    emitted: u64,
+    scratch: Vec<u8>,
+}
+
+struct ChunkHeader {
+    id: [u8; 4],
+    size: u64,
+}
+
+fn read_chunk_header<R: Read>(inner: &mut R) -> Result<Option<ChunkHeader>> {
+    let mut header = [0_u8; 12];
+    let filled = read_available(inner, &mut header)?;
+    if filled == 0 {
+        return Ok(None);
+    }
+    ensure!(filled == header.len(), "truncated chunk header");
+    let id = header[0..4].try_into().expect("4 bytes in range");
+    let size = u64::from_be_bytes(header[4..12].try_into().expect("8 bytes in range"));
+    Ok(Some(ChunkHeader { id, size }))
+}
+
+/// DSDIFF pads every chunk body to an even length.
+fn skip<R: Read>(inner: &mut R, bytes: u64) -> Result<()> {
+    let padded = bytes + bytes % 2;
+    let copied = std::io::copy(&mut inner.by_ref().take(padded), &mut std::io::sink())?;
+    ensure!(copied == padded, "truncated chunk body");
+    Ok(())
+}
+
+fn read_exact_vec<R: Read>(inner: &mut R, len: usize) -> Result<Vec<u8>> {
+    let mut body = vec![0_u8; len];
+    inner
+        .read_exact(&mut body)
+        .context("truncated chunk body")?;
+    Ok(body)
+}
+
+impl<R: Read + Send + 'static> DffReader<R> {
+    pub fn new(mut inner: R) -> Result<Self> {
+        let mut form = [0_u8; 16];
+        inner.read_exact(&mut form)?;
+        ensure!(&form[0..4] == b"FRM8", "missing FRM8 chunk");
+        ensure!(&form[12..16] == b"DSD ", "not a DSD form type");
+
+        let mut rate = None;
+        let mut channels = None;
+        loop {
+            let Some(chunk) = read_chunk_header(&mut inner)? else {
+                bail!("no DSD sound data chunk found");
+            };
+            match &chunk.id {
+                b"PROP" => {
+                    let body = read_exact_vec(&mut inner, chunk.size as usize)?;
+                    let (found_rate, found_channels) = parse_properties(&body)?;
+                    rate = found_rate;
+                    channels = found_channels;
+                    if chunk.size % 2 == 1 {
+                        inner.read_exact(&mut [0_u8; 1])?;
+                    }
+                }
+                b"DSD " => {
+                    let rate = rate.context("sound data reached before the FS chunk")?;
+                    let channels = channels.context("sound data reached before the CHNL chunk")?;
+                    let format = DsdFormat {
+                        rate: DsdRate::new(rate),
+                        channels,
+                    };
+                    return Ok(Self {
+                        inner,
+                        format,
+                        audio_bytes_per_channel: chunk.size / u64::from(channels),
+                        emitted: 0,
+                        scratch: vec![0; CHUNK_BYTES * channels as usize],
+                    });
+                }
+                b"DST " => bail!("DST compressed DSDIFF is not supported"),
+                _ => skip(&mut inner, chunk.size)?,
+            }
+        }
+    }
+}
+
+/// Pull the sample rate and channel count out of a PROP/SND chunk body.
+fn parse_properties(body: &[u8]) -> Result<(Option<u32>, Option<u16>)> {
+    ensure!(
+        body.len() >= 4 && &body[0..4] == b"SND ",
+        "PROP chunk is not sound properties"
+    );
+    let mut rate = None;
+    let mut channels = None;
+    let mut offset = 4;
+    while offset + 12 <= body.len() {
+        let id = &body[offset..offset + 4];
+        let size = u64::from_be_bytes(body[offset + 4..offset + 12].try_into().expect("8 bytes"));
+        let start = offset + 12;
+        let end = start
+            .checked_add(size as usize)
+            .filter(|end| *end <= body.len())
+            .context("PROP sub-chunk runs past the chunk body")?;
+        match id {
+            b"FS  " => {
+                ensure!(size == 4, "bad FS chunk size {size}");
+                rate = Some(u32::from_be_bytes(
+                    body[start..end].try_into().expect("4 bytes"),
+                ));
+            }
+            b"CHNL" => {
+                ensure!(size >= 2, "bad CHNL chunk size {size}");
+                let count = u16::from_be_bytes(body[start..start + 2].try_into().expect("2 bytes"));
+                ensure!(
+                    (1..=6).contains(&count),
+                    "unsupported channel count {count}"
+                );
+                channels = Some(count);
+            }
+            b"CMPR" => {
+                ensure!(size >= 4, "bad CMPR chunk size {size}");
+                let compression = &body[start..start + 4];
+                ensure!(
+                    compression == b"DSD ",
+                    "unsupported DSDIFF compression {compression:?}"
+                );
+            }
+            _ => {}
+        }
+        offset = end + end % 2;
+    }
+    Ok((rate, channels))
+}
+
+impl<R: Read + Send + 'static> DsdSource for DffReader<R> {
+    fn container(&self) -> &'static str {
+        "DSDIFF"
+    }
+
+    fn format(&self) -> DsdFormat {
+        self.format
+    }
+
+    fn total_bytes_per_channel(&self) -> u64 {
+        self.audio_bytes_per_channel
+    }
+
+    fn chunk_bytes(&self) -> usize {
+        CHUNK_BYTES
+    }
+
+    fn read(&mut self, planes: &mut [Box<[u8]>]) -> Result<usize> {
+        let remaining = self.audio_bytes_per_channel - self.emitted;
+        if remaining == 0 {
+            return Ok(0);
+        }
+
+        let channels = self.format.channels as usize;
+        let wanted = (remaining as usize).min(CHUNK_BYTES) * channels;
+        let filled = read_available(&mut self.inner, &mut self.scratch[..wanted])?;
+        let count = filled / channels;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        for (channel, plane) in planes.iter_mut().enumerate().take(channels) {
+            for (index, byte) in plane[..count].iter_mut().enumerate() {
+                *byte = self.scratch[index * channels + channel];
+            }
+            BitOrder::MsbFirst.normalize_to_msb_first(&mut plane[..count]);
+        }
+        self.emitted += count as u64;
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::dsd::DsdRate;
+    use crate::reader::DsdSource;
+    use crate::reader::dff::DffReader;
+
+    fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::from(*id);
+        out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        out.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    fn dff_file_with(audio_id: &[u8; 4], samples: &[u8]) -> Vec<u8> {
+        let mut properties = Vec::from(*b"SND ");
+        properties.extend_from_slice(&chunk(b"FS  ", &2_822_400_u32.to_be_bytes()));
+        properties.extend_from_slice(&chunk(b"CHNL", &[0, 2, b'S', b'L', b'S', b'R']));
+        properties.extend_from_slice(&chunk(b"CMPR", b"DSD \x0enot compressed"));
+
+        let mut body = Vec::from(*b"DSD ");
+        body.extend_from_slice(&chunk(b"FVER", &[1, 5, 0, 0]));
+        body.extend_from_slice(&chunk(b"COMT", &[0, 0]));
+        body.extend_from_slice(&chunk(b"PROP", &properties));
+        body.extend_from_slice(&chunk(audio_id, samples));
+
+        let mut file = Vec::from(*b"FRM8");
+        file.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        file.extend_from_slice(&body);
+        file
+    }
+
+    fn dff_file(samples: &[u8]) -> Vec<u8> {
+        dff_file_with(b"DSD ", samples)
+    }
+
+    #[test]
+    fn interleaved_bytes_are_split_into_channel_planes() {
+        let samples: Vec<u8> = (0..64_u8).collect();
+        let mut reader = DffReader::new(Cursor::new(dff_file(&samples))).expect("parses");
+
+        assert_eq!(reader.format().rate, DsdRate::new(2_822_400));
+        assert_eq!(reader.format().channels, 2);
+        assert_eq!(reader.total_bytes_per_channel(), 32);
+
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; reader.chunk_bytes()].into(); 2];
+        let count = reader.read(&mut planes).expect("reads");
+
+        assert_eq!(count, 32);
+        assert_eq!(
+            planes[0][..32],
+            samples.iter().copied().step_by(2).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(
+            planes[1][..32],
+            samples[1..].iter().copied().step_by(2).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(reader.read(&mut planes).expect("reads"), 0);
+    }
+
+    #[test]
+    fn dst_compression_is_rejected_with_a_clear_message() {
+        let file = dff_file_with(b"DST ", &[0; 8]);
+
+        let error = DffReader::new(Cursor::new(file))
+            .map(|_| ())
+            .expect_err("rejects");
+
+        assert!(error.to_string().contains("DST compressed"), "{error}");
+    }
+}
