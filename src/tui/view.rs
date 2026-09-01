@@ -169,8 +169,8 @@ fn debug_rows(device: &DeviceInfo, track: &TrackInfo, progress: Progress) -> Vec
         row(
             "transport",
             format!(
-                "{} 24 bit, DoP {} Hz{volume}",
-                device.transport, device.pcm_rate
+                "{} {} bit, {} {} Hz{volume}",
+                device.transport, device.bits, device.carrier, device.pcm_rate
             ),
         ),
         row(
@@ -193,7 +193,7 @@ fn debug_rows(device: &DeviceInfo, track: &TrackInfo, progress: Progress) -> Vec
         row(
             "underruns",
             format!(
-                "{} frames ({:.0} ms of DoP silence)",
+                "{} frames ({:.0} ms of DSD silence)",
                 progress.underrun_frames,
                 progress.underrun_frames as f64 * 1000.0 / rate
             ),
@@ -268,6 +268,8 @@ mod tests {
                 bytes_per_channel: 84_672_000,
             }),
             device: Some(DeviceInfo {
+                carrier: "DoP",
+                bits: 24,
                 name: "Topping D50".to_owned(),
                 pcm_rate: 352_800,
                 buffer_frames: 512,
@@ -323,6 +325,25 @@ mod tests {
         assert!(screen.contains("integer 24 bit, DoP 352800 Hz"), "{screen}");
         assert!(screen.contains("512 frames (1.5 ms)"), "{screen}");
         assert!(screen.contains("50%"), "{screen}");
+    }
+
+    #[test]
+    fn a_natively_streamed_track_names_its_carrier_and_container_width() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut status = playing_status(dir.path());
+        let device = status.device.as_mut().expect("device");
+        device.carrier = "native DSD";
+        device.bits = 32;
+        device.name = "Cayin RU7".to_owned();
+
+        let browser = Browser::open(dir.path().to_path_buf());
+        let screen = render(&browser, &status);
+
+        assert!(
+            screen.contains("integer 32 bit, native DSD 352800 Hz"),
+            "{screen}"
+        );
+        assert!(!screen.contains("DoP"), "{screen}");
     }
 
     #[test]

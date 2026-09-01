@@ -18,6 +18,7 @@ use crate::native;
 use crate::output::stream::PlaybackState;
 use crate::output::usb::device::Dac;
 use crate::output::usb::stream::NativeStream;
+use crate::player::{DeviceInfo, Progress, TrackInfo};
 use crate::reader::{self, DsdSource};
 
 /// How long the DAC keeps receiving DSD silence after the music ends, so it does not pop.
@@ -47,6 +48,7 @@ pub struct NativeSession {
     feed: Arc<FeedState>,
     stop: Arc<AtomicBool>,
     state: Arc<PlaybackState>,
+    queue_frames: u64,
     pub info: NativeInfo,
 }
 
@@ -148,8 +150,56 @@ impl NativeSession {
             feed,
             stop: Arc::clone(stop),
             state,
+            queue_frames: (capacity / frame_bytes) as u64,
             info,
         })
+    }
+
+    /// Hold the queue where it is. The engine keeps sending DSD silence, so the DAC stays
+    /// locked and resuming costs no relock.
+    pub fn set_paused(&self, paused: bool) {
+        self.state.paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn track(&self) -> TrackInfo {
+        TrackInfo {
+            container: self.info.container,
+            format: self.info.format,
+            duration: self.info.duration,
+            total_frames: self.info.total_frames,
+            bytes_per_channel: self.info.total_frames * native::BYTES_PER_SUBSLOT as u64,
+        }
+    }
+
+    pub fn device(&self) -> DeviceInfo {
+        DeviceInfo {
+            name: self.info.name.clone(),
+            carrier: "native DSD",
+            bits: 32,
+            pcm_rate: self.info.frame_rate,
+            // Audio frames in flight per isochronous transfer.
+            buffer_frames: self.info.frame_rate / 8_000 * 32,
+            transport: "integer",
+            exclusive: true,
+            mixing_disabled: true,
+            volume: None,
+        }
+    }
+
+    pub fn progress(&self) -> Progress {
+        let frames_played = self.state.frames_played.load(Ordering::Relaxed);
+        let written = self.feed.frames_written.load(Ordering::Relaxed);
+        Progress {
+            elapsed: self.elapsed(),
+            frames_played,
+            underrun_frames: self.underrun_frames(),
+            queued_frames: written.saturating_sub(frames_played),
+            queue_frames: self.queue_frames,
+        }
     }
 
     pub fn elapsed(&self) -> f64 {

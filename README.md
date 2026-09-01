@@ -6,7 +6,7 @@ are stored in the file, wrapped in DSD over PCM (DoP) 1.1.
 ## Usage
 
 ```
-dsd-rust devices                       # output devices and the DoP rates they accept
+dsd-rust devices                       # output devices, and the DSD rates they accept
 dsd-rust devices --formats             # plus every stream format each device advertises
 dsd-rust info track.dsf                # container, rate, channels, duration
 dsd-rust play track.dsf                # play on the default output device
@@ -70,9 +70,21 @@ after a device enumerates, though, so `play` re-enumerates the DAC and claims th
 in the window before the daemon does, then holds them for the session. No kernel extension,
 no system extension, and no change to System Integrity Protection.
 
+`devices` reports both paths, so the difference is visible before playing anything:
+
+```
+* Cayin RU7 Playback
+    dop       176400/DSD64 352800/DSD128
+    native    88200/DSD64 96000/DSD64 176400/DSD128 192000/DSD128 352800/DSD256 384000/DSD256
+```
+
+The native rates come from the DAC's own clock range report rather than from what the
+endpoint could carry, so they are rates it will actually accept.
+
 The cost is that claiming the DAC drops it off the USB bus for a moment and takes it away
 from every other application until playback ends, which is heavier than Core Audio's hog
-mode. Playback hands it back the same way it took it, by re-enumerating: releasing the
+mode. While a native track is playing the DAC belongs to `dsd-rust` alone, so it does not
+appear in `devices` and no other application can open it. Playback hands it back the same way it took it, by re-enumerating: releasing the
 interfaces alone is not enough, because `usbaudiod` only looks at a device as it enumerates,
 so a device it lost would stay missing until physically replugged.
 

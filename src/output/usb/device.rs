@@ -26,6 +26,10 @@ const RACE_POLL: Duration = Duration::from_micros(500);
 
 /// UAC2 class request: set the current value of a control.
 const UAC2_CUR: u8 = 0x01;
+/// UAC2 class request: report the valid range of a control.
+const UAC2_RANGE: u8 = 0x02;
+/// A clock range report is a count followed by (min, max, resolution) triples.
+const SUBRANGE_BYTES: usize = 12;
 const CS_SAM_FREQ_CONTROL: u16 = 0x01;
 /// Host to device, class request, addressed to an interface.
 const REQUEST_TYPE_SET: u8 = 0x21;
@@ -115,6 +119,48 @@ impl Dac {
             })();
             call!(device, Release);
             result
+        }
+    }
+
+    /// Frame rates the clock will actually accept, straight from the DAC's RANGE report.
+    ///
+    /// The endpoint's packet size only bounds what the wire can carry; it says nothing about
+    /// what the converter supports. Reporting the bandwidth ceiling as a capability would
+    /// promise rates the DAC rejects.
+    pub fn clock_rates(&self) -> Result<Vec<u32>> {
+        // SAFETY: the device interface is opened and closed on every path.
+        unsafe {
+            let Some(device) = device_interface(self.service) else {
+                bail!("{}: cannot open a USB device interface", self.name);
+            };
+            // Plain open only, never a seize: reading the clock range is what `devices`
+            // does, and taking a device away from whoever is streaming to it would
+            // interrupt their playback just to print a line.
+            let opened = call!(device, USBDeviceOpen);
+            if opened != sys::kIOReturnSuccess as sys::IOReturn {
+                call!(device, Release);
+                bail!(
+                    "{}: in use by another process, so its clock range cannot be read",
+                    self.name
+                );
+            }
+
+            let mut buffer = [0_u8; 2 + SUBRANGE_BYTES * 32];
+            let mut request = sys::IOUSBDevRequest {
+                bmRequestType: REQUEST_TYPE_GET,
+                bRequest: UAC2_RANGE,
+                wValue: CS_SAM_FREQ_CONTROL << 8,
+                wIndex: (u16::from(self.native.clock_id) << 8)
+                    | u16::from(self.native.control_interface),
+                wLength: buffer.len() as u16,
+                pData: buffer.as_mut_ptr().cast::<c_void>(),
+                wLenDone: 0,
+            };
+            let result = call!(device, DeviceRequest, &raw mut request);
+            call!(device, USBDeviceClose);
+            call!(device, Release);
+            ok(result, "read clock range")?;
+            Ok(parse_clock_ranges(&buffer[..request.wLenDone as usize]))
         }
     }
 
@@ -603,5 +649,92 @@ fn registry_string(service: sys::io_service_t, key: &str) -> Option<String> {
             .map(|b| *b as u8)
             .collect();
         String::from_utf8(bytes).ok()
+    }
+}
+
+/// Flatten a UAC2 range report into the discrete rates it allows.
+///
+/// A subrange with a resolution walks from min to max in steps; one with a zero resolution
+/// is a single rate, which is how clock sources usually report a fixed rate list.
+fn parse_clock_ranges(report: &[u8]) -> Vec<u32> {
+    let Some(count) = report.first_chunk::<2>().map(|n| u16::from_le_bytes(*n)) else {
+        return Vec::new();
+    };
+    let mut rates = Vec::new();
+    for index in 0..count as usize {
+        let start = 2 + index * SUBRANGE_BYTES;
+        let Some(triple) = report.get(start..start + SUBRANGE_BYTES) else {
+            break;
+        };
+        let value = |at: usize| {
+            u32::from_le_bytes([triple[at], triple[at + 1], triple[at + 2], triple[at + 3]])
+        };
+        let (min, max, step) = (value(0), value(4), value(8));
+        if step == 0 || min == max {
+            rates.push(min);
+            if max != min {
+                rates.push(max);
+            }
+            continue;
+        }
+        let mut rate = min;
+        while rate <= max {
+            rates.push(rate);
+            let Some(next) = rate.checked_add(step) else {
+                break;
+            };
+            rate = next;
+        }
+    }
+    rates.sort_unstable();
+    rates.dedup();
+    rates
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::output::usb::device::parse_clock_ranges;
+
+    fn subrange(min: u32, max: u32, step: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for field in [min, max, step] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn discrete_rates_are_listed_once_each() {
+        let mut report = 3_u16.to_le_bytes().to_vec();
+        report.extend(subrange(44_100, 44_100, 0));
+        report.extend(subrange(176_400, 176_400, 0));
+        report.extend(subrange(352_800, 352_800, 0));
+
+        assert_eq!(parse_clock_ranges(&report), [44_100, 176_400, 352_800]);
+    }
+
+    #[test]
+    fn a_stepped_subrange_walks_from_min_to_max() {
+        let mut report = 1_u16.to_le_bytes().to_vec();
+        report.extend(subrange(44_100, 176_400, 44_100));
+
+        assert_eq!(
+            parse_clock_ranges(&report),
+            [44_100, 88_200, 132_300, 176_400]
+        );
+    }
+
+    #[test]
+    fn a_report_shorter_than_it_claims_stops_at_what_is_there() {
+        let mut report = 4_u16.to_le_bytes().to_vec();
+        report.extend(subrange(352_800, 352_800, 0));
+
+        assert_eq!(parse_clock_ranges(&report), [352_800]);
+    }
+
+    #[test]
+    fn an_empty_report_yields_no_rates() {
+        assert!(parse_clock_ranges(&[]).is_empty());
+        assert!(parse_clock_ranges(&0_u16.to_le_bytes()).is_empty());
     }
 }

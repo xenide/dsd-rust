@@ -16,8 +16,10 @@ use coreaudio_sys::{
     kAudioFormatLinearPCM,
 };
 
+use crate::dsd::DsdRate;
 use crate::output::hal::Device;
 use crate::output::stream::supported_dop_rates;
+use crate::output::usb::device::Dac;
 
 /// What the `devices` command shows for one output device.
 pub struct DeviceSummary {
@@ -27,14 +29,20 @@ pub struct DeviceSummary {
     pub current_rate: f64,
     pub dop_rates: Vec<u32>,
     pub hog_owner: Option<i32>,
+    /// DSD rates this device plays natively, when it advertises a RAW_DATA alternate
+    /// setting. Independent of `dop_rates`, and usually reaching higher.
+    pub native_dsd: Vec<u32>,
 }
 
 pub fn list_devices() -> Result<Vec<DeviceSummary>> {
     let default = Device::default_output().ok();
+    let native = Dac::discover().unwrap_or_default();
     let mut summaries = Vec::new();
     for device in Device::all()? {
+        let name = device.name().unwrap_or_else(|_| "<unnamed>".to_owned());
         summaries.push(DeviceSummary {
-            name: device.name().unwrap_or_else(|_| "<unnamed>".to_owned()),
+            native_dsd: native_rates(&native, &name),
+            name,
             uid: device.uid().unwrap_or_default(),
             is_default: default == Some(device),
             current_rate: device.nominal_sample_rate().unwrap_or(0.0),
@@ -43,6 +51,39 @@ pub fn list_devices() -> Result<Vec<DeviceSummary>> {
         });
     }
     Ok(summaries)
+}
+
+/// DSD rates one device plays natively.
+///
+/// The clock is shared with the PCM path, so its range report lists PCM rates too. A frame
+/// rate counts here only when 32 DSD bits per frame lands on a real DSD rate, which is what
+/// separates 352800 Hz carrying DSD256 from 352800 Hz carrying PCM.
+fn native_rates(dacs: &[Dac], core_audio_name: &str) -> Vec<u32> {
+    let haystack = core_audio_name.to_lowercase();
+    // Core Audio and USB name the same device differently -- "Cayin RU7 Playback" against
+    // "Cayin RU7" -- so match whichever name contains the other.
+    let Some(dac) = dacs.iter().find(|dac| {
+        let usb = dac.name.to_lowercase();
+        !usb.is_empty() && (haystack.contains(&usb) || usb.contains(&haystack))
+    }) else {
+        return Vec::new();
+    };
+    let Ok(clock) = dac.clock_rates() else {
+        return Vec::new();
+    };
+
+    let bandwidth = dac.native.max_dsd_rate(2);
+    let mut rates = Vec::new();
+    for frame in clock {
+        let hz = frame.saturating_mul(32);
+        if hz > bandwidth {
+            continue;
+        }
+        if DsdRate::new(hz).multiplier().is_some_and(|n| n >= 64) {
+            rates.push(hz);
+        }
+    }
+    rates
 }
 
 /// One line describing a stream format, as the driver advertises it.

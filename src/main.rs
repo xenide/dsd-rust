@@ -6,6 +6,7 @@ mod player;
 mod reader;
 mod tui;
 
+use crate::dsd::DsdRate;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,6 +165,20 @@ fn show_devices(formats: bool) -> Result<()> {
         println!("    uid       {}", device.uid);
         println!("    current   {:.0} Hz", device.current_rate);
         println!("    dop       {rates}");
+        if !device.native_dsd.is_empty() {
+            // Same shape as the dop line: the frame rate the clock runs at, then the DSD
+            // rate it carries. Both the 44.1 and 48 kHz families reach a given multiplier,
+            // so the rate is what tells them apart.
+            let native: Vec<String> = device
+                .native_dsd
+                .iter()
+                .filter_map(|hz| {
+                    let multiplier = DsdRate::new(*hz).multiplier()?;
+                    Some(format!("{}/DSD{multiplier}", hz / 32))
+                })
+                .collect();
+            println!("    native    {}", native.join(" "));
+        }
         if let Some(owner) = device.hog_owner {
             println!("    exclusive held by process {owner}");
         }

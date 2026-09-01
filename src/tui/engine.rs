@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::player::{DeviceInfo, PlayOptions, Progress, Session, Target, TrackInfo};
+use crate::player::{DeviceInfo, PlayOptions, Playback, Progress, Target, TrackInfo};
 
 const POLL: Duration = Duration::from_millis(20);
 /// How long the worker waits for a command when there is nothing playing to watch.
@@ -71,8 +71,8 @@ impl Engine {
         let (commands, receiver) = channel();
         let status = Arc::new(Mutex::new(Status::default()));
         let published = Arc::clone(&status);
-        // The worker is built on its own thread because a live session owns the Core Audio
-        // callback context, which must not travel between threads.
+        // The worker is built on its own thread because a live session owns either the Core
+        // Audio callback context or the USB device, neither of which travels between threads.
         let worker = thread::spawn(move || {
             Worker {
                 target,
@@ -135,7 +135,7 @@ struct Worker {
     options: PlayOptions,
     status: Arc<Mutex<Status>>,
     commands: Receiver<Command>,
-    session: Option<Session>,
+    session: Option<Playback>,
     stop: Arc<AtomicBool>,
     playlist: Vec<PathBuf>,
     index: usize,
@@ -185,7 +185,7 @@ impl Worker {
         };
         self.index = index;
         self.set_error(None);
-        match Session::open_retrying(&path, &self.target, &self.options, &self.stop) {
+        match Playback::open(&path, &self.target, &self.options, &self.stop) {
             Ok(session) => self.session = Some(session),
             Err(error) => self.set_error(Some(format!("{path:?}: {error:#}"))),
         }
@@ -193,7 +193,7 @@ impl Worker {
 
     /// Move to the next track once the current one has drained, and stop at the end.
     fn advance_if_complete(&mut self) {
-        if !self.session.as_ref().is_some_and(Session::is_complete) {
+        if !self.session.as_ref().is_some_and(Playback::is_complete) {
             return;
         }
         let next = self.index + 1;
@@ -238,8 +238,8 @@ impl Worker {
             State::Playing
         };
         status.path = self.playlist.get(self.index).cloned();
-        status.track = Some(session.track.clone());
-        status.device = Some(session.device.clone());
+        status.track = Some(session.track());
+        status.device = Some(session.device());
         status.progress = session.progress();
     }
 }
