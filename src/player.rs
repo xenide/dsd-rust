@@ -94,7 +94,7 @@ fn play_once(
     };
     let mut output = Output::open(device, &request, consumer)
         .with_context(|| format!("{device_name} cannot play {}", format.rate))?;
-    warn_about_volume(&device);
+    warn_about_volume(&device, &output);
 
     println!(
         "{}  {}  {}",
@@ -195,14 +195,20 @@ fn clock(seconds: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-fn warn_about_volume(device: &Device) {
+/// A software volume scales the samples and so destroys the DoP markers. Integer transport
+/// has no gain stage at all, and a DAC that applies its own volume never sees one either, so
+/// the warning is only worth making when the samples pass through Core Audio as float.
+fn warn_about_volume(device: &Device, output: &Output) {
+    if output.encoding.is_integer() {
+        return;
+    }
     let Some(volume) = device.volume_scalar() else {
         return;
     };
     if volume < 1.0 {
         eprintln!(
-            "warning: device volume is {:.0}%. If it is applied in software it will corrupt the \
-             DoP stream; set it to maximum and use the DAC's own volume control.",
+            "warning: device volume is {:.0}%. If macOS applies it in software the DAC will lose \
+             DSD lock and play noise; if the DAC applies it itself, playback is unaffected.",
             volume * 100.0
         );
     }

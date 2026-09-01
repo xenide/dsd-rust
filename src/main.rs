@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::output::FormatLine;
 use crate::player::{PlayOptions, Target};
 
 /// Bit-perfect DSD player. DSD is carried to the DAC untouched, as DoP 1.1.
@@ -41,7 +42,11 @@ enum Command {
         buffer_frames: Option<u32>,
     },
     /// List output devices and the DoP rates they accept
-    Devices,
+    Devices {
+        /// Also list every stream format each device advertises
+        #[arg(long)]
+        formats: bool,
+    },
     /// Print what a DSD file contains
     Info {
         #[arg(required = true)]
@@ -73,7 +78,7 @@ fn main() -> Result<()> {
             };
             play_all(&files, device.as_deref(), &options)
         }
-        Command::Devices => show_devices(),
+        Command::Devices { formats } => show_devices(formats),
         Command::Info { files } => show_info(&files),
     }
 }
@@ -84,8 +89,15 @@ fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> R
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler_stop = Arc::clone(&stop);
     let handler_interrupted = Arc::clone(&interrupted);
+    // The handler runs on its own thread, so it can hand the device back itself. A second
+    // signal means the caller is not willing to wait for the tail, so leave at once - but
+    // still release the device, or it stays claimed until macOS notices the process died.
     ctrlc::set_handler(move || {
-        handler_interrupted.store(true, Ordering::Relaxed);
+        if handler_interrupted.swap(true, Ordering::Relaxed) {
+            eprintln!();
+            output::stream::release_claimed_device();
+            std::process::exit(130);
+        }
         handler_stop.store(true, Ordering::Relaxed);
     })?;
 
@@ -98,7 +110,7 @@ fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> R
     Ok(())
 }
 
-fn show_devices() -> Result<()> {
+fn show_devices(formats: bool) -> Result<()> {
     for device in output::list_devices()? {
         let marker = if device.is_default { "*" } else { " " };
         let rates = if device.dop_rates.is_empty() {
@@ -115,6 +127,37 @@ fn show_devices() -> Result<()> {
         println!("    uid       {}", device.uid);
         println!("    current   {:.0} Hz", device.current_rate);
         println!("    dop       {rates}");
+        if let Some(owner) = device.hog_owner {
+            println!("    exclusive held by process {owner}");
+        }
+        if formats {
+            show_formats(&device.name)?;
+        }
+    }
+    Ok(())
+}
+
+fn show_formats(name: &str) -> Result<()> {
+    let (device, _) = output::find_device(Some(name))?;
+    for (index, stream) in output::stream_formats(&device)?.iter().enumerate() {
+        println!("    stream {index}");
+        println!(
+            "      in use physical  {}",
+            FormatLine(stream.current_physical)
+        );
+        println!(
+            "      in use virtual   {}",
+            FormatLine(stream.current_virtual)
+        );
+        for (label, list) in [
+            ("physical", &stream.physical),
+            ("virtual", &stream.virtual_formats),
+        ] {
+            println!("      available {label}");
+            for ranged in list {
+                println!("        {}", FormatLine(ranged.mFormat));
+            }
+        }
     }
     Ok(())
 }
