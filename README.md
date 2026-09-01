@@ -53,6 +53,29 @@ dsd        5644800 bit/s per channel, 84672000 bytes per channel
 A rising `underruns` count means the reader is not keeping up; raise `--buffer-ms`. A `queue`
 that sits near 0% is the same warning before it becomes audible.
 
+## Native DSD
+
+Some DACs top out at a PCM rate too low to carry the file as DoP. DoP packs 16 DSD bits into
+each 24-bit frame, so DSD256 needs a 705600 Hz carrier; a DAC whose PCM ceiling is 384000 Hz
+cannot reach it however willing the DAC is. Those DACs usually can still play the rate, over
+an alternate setting Core Audio never offers because its format is `RAW_DATA` rather than PCM.
+
+When the chosen device advertises no PCM rate able to carry a file, `play` takes that path
+instead. It packs 32 DSD bits per channel into each USB frame with no markers and no carrier,
+and paces the stream from the DAC's own feedback endpoint.
+
+Reaching it means taking the device away from macOS. USB audio runs in a userspace daemon,
+`usbaudiod`, which holds the audio interfaces and will not give them up. It re-acquires them
+after a device enumerates, though, so `play` re-enumerates the DAC and claims the interfaces
+in the window before the daemon does, then holds them for the session. No kernel extension,
+no system extension, and no change to System Integrity Protection.
+
+The cost is that claiming the DAC drops it off the USB bus for a moment and takes it away
+from every other application until playback ends, which is heavier than Core Audio's hog
+mode. Playback hands it back the same way it took it, by re-enumerating: releasing the
+interfaces alone is not enough, because `usbaudiod` only looks at a device as it enumerates,
+so a device it lost would stay missing until physically replugged.
+
 ## What "bit-perfect" means here
 
 * DSD samples are never resampled, filtered, or attenuated. The player only reorders bits
@@ -90,4 +113,5 @@ DST-compressed DSDIFF and SACD ISO images are not supported.
 
 ## Requirements
 
-macOS, a DAC that accepts DoP, and a stable Rust toolchain. Build with `cargo build --release`.
+macOS, a DAC that accepts DoP or native DSD, and a stable Rust toolchain. Build with
+`cargo build --release`.

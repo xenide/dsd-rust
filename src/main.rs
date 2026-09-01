@@ -1,5 +1,6 @@
 mod dop;
 mod dsd;
+mod native;
 mod output;
 mod player;
 mod reader;

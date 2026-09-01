@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::dop;
 use crate::dsd::DsdFormat;
-use crate::output::stream::{DeviceBusy, Output, Request};
+use crate::dsd::DsdRate;
+use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
+use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
 use crate::reader::{self, DsdSource};
 use anyhow::{Context, Result};
@@ -31,12 +33,24 @@ pub struct PlayOptions {
 pub struct Target {
     pub device: Device,
     pub name: String,
+    /// Kept so the native USB path can resolve the same DAC: Core Audio and USB report
+    /// different names for one device, so only the user's own query matches both.
+    pub query: Option<String>,
 }
 
 impl Target {
     pub fn resolve(query: Option<&str>) -> Result<Self> {
         let (device, name) = output::find_device(query)?;
-        Ok(Self { device, name })
+        Ok(Self {
+            device,
+            name,
+            query: query.map(str::to_owned),
+        })
+    }
+
+    /// True when this device advertises a PCM rate able to carry the file as DoP.
+    fn carries_dop(&self, rate: DsdRate) -> bool {
+        supported_dop_rates(&self.device).contains(&rate.dop_pcm_rate())
     }
 }
 
@@ -256,6 +270,12 @@ pub fn play(
     options: &PlayOptions,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
+    // A DAC whose PCM rates top out below the DoP carrier this file needs can still play it
+    // natively, where 32 DSD bits ride in each frame instead of 16.
+    let rate = reader::open(path)?.format().rate;
+    if !target.carries_dop(rate) {
+        return play_native(path, target, options, stop);
+    }
     let session = Session::open_retrying(path, target, options, stop)?;
     warn_about_volume(&session.device);
 
@@ -401,6 +421,62 @@ fn feed_loop(
             feed.frames_written
                 .fetch_add((take / channels) as u64, Ordering::Relaxed);
         }
+    }
+    Ok(())
+}
+
+/// Play one file over the native DSD path, for a DAC that cannot carry it as DoP.
+///
+/// Claiming the device re-enumerates it, which drops it off the USB bus briefly. Anything
+/// else playing through it stops, so this says what it is about to do before doing it.
+fn play_native(
+    path: &Path,
+    target: &Target,
+    options: &PlayOptions,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
+    let session = NativeSession::open(path, target.query.as_deref(), options.buffer_ms, stop)?;
+
+    println!(
+        "{}  {}  {}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        session.info.format,
+        session.info.container
+    );
+    println!(
+        "  -> {}: native DSD {} Hz, exclusive USB",
+        session.info.name, session.info.frame_rate
+    );
+
+    let duration = session.info.duration;
+    let mut dropouts = 0;
+    let mut shown = u64::MAX;
+    while !stop.load(Ordering::Relaxed) {
+        if session.is_complete() {
+            break;
+        }
+        if !session.fully_queued() {
+            // Silence sent once the file is fully queued is the tail, not a dropout.
+            dropouts = session.underrun_frames();
+        }
+        let elapsed = session.elapsed();
+        if elapsed as u64 != shown {
+            shown = elapsed as u64;
+            print_progress(elapsed, duration);
+        }
+        thread::sleep(POLL);
+    }
+
+    let frame_rate = session.info.frame_rate;
+    session.finish()?;
+    print_progress(duration, duration);
+    println!();
+
+    if dropouts > 0 {
+        eprintln!(
+            "  {dropouts} frames of DSD silence filled underruns ({:.0} ms); raise --buffer-ms",
+            dropouts as f64 * 1000.0 / f64::from(frame_rate)
+        );
     }
     Ok(())
 }

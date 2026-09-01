@@ -4,6 +4,7 @@ compile_error!("dsd-rust currently supports macOS Core Audio only");
 pub mod encoding;
 pub mod hal;
 pub mod stream;
+pub mod usb;
 
 use std::fmt;
 
