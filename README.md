@@ -11,6 +11,7 @@ dsd-rust devices --formats             # plus every stream format each device ad
 dsd-rust info track.dsf                # container, rate, channels, duration
 dsd-rust play track.dsf                # play on the default output device
 dsd-rust play *.dsf --device "D50"     # pick a device by name fragment or UID
+dsd-rust tui ~/Music/dsd               # browse, play, and watch the transport
 ```
 
 `play` options: `--shared` leaves the device available to other apps, `--buffer-ms`
@@ -20,6 +21,37 @@ sizes the queue between the reader and the audio callback (default 250), and
 Files play in the order given, and the device is resolved once for the whole list: holding a
 device exclusively moves the system default output elsewhere, so re-resolving between tracks
 would pick the wrong one. Tracks may mix DSD rates; the device is reconfigured for each.
+
+## Terminal UI
+
+`dsd-rust tui [dir]` opens a file browser over `dir` (the working directory by default),
+showing folders and DSD files only. It takes the same `--device`, `--shared`, `--buffer-ms`,
+and `--buffer-frames` options as `play`.
+
+```
+ ↑↓ / j k     move             enter / → / l   open folder or play file
+ ← / h        parent folder    space           play/pause
+ s            stop             n / p           next / previous track
+ r            re-read folder   q / esc         quit
+```
+
+Playing a file queues the whole folder from that file on, in the order the pane lists it.
+Pausing keeps the DAC fed with DoP silence rather than stopping the stream, so the DAC holds
+DSD lock and resuming costs no relock. The debug pane shows what the device settled on and
+what the transport is doing right now:
+
+```
+device     Topping D50  exclusive, mixing off
+transport  integer 24 bit, DoP 352800 Hz
+io buffer  512 frames (1.5 ms)
+queue       50%   44100 of 88200 frames
+underruns  0 frames (0 ms of DoP silence)
+frames     10584000 of 42336000
+dsd        5644800 bit/s per channel, 84672000 bytes per channel
+```
+
+A rising `underruns` count means the reader is not keeping up; raise `--buffer-ms`. A `queue`
+that sits near 0% is the same warning before it becomes audible.
 
 ## What "bit-perfect" means here
 

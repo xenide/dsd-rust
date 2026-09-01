@@ -25,6 +25,8 @@ pub struct PlaybackState {
     pub underrun_frames: AtomicU64,
     /// Set to drop whatever is queued and send DoP silence, so playback can end without a pop.
     pub silence: AtomicBool,
+    /// Set to hold the queue where it is and send DoP silence, so the DAC keeps DSD lock.
+    pub paused: AtomicBool,
 }
 
 struct IoContext {
@@ -52,7 +54,8 @@ impl IoContext {
             return;
         }
         let frames = out.len() / frame_bytes;
-        let silenced = state.silence.load(Ordering::Relaxed);
+        let silenced =
+            state.silence.load(Ordering::Relaxed) || state.paused.load(Ordering::Relaxed);
         let ready = if silenced {
             0
         } else {
@@ -740,6 +743,28 @@ mod tests {
         let decoded = decode(&buffer, 4, &mut frame);
         assert_eq!(decoded[2], SILENCE_PAYLOAD.to_be_bytes().repeat(4));
         assert_eq!(decoded[3], decoded[2]);
+    }
+
+    #[test]
+    fn pausing_holds_the_queue_and_keeps_the_dac_fed_with_dsd_silence() {
+        let (payloads, _) = payloads_of(dsf_file(8, (BLOCK * 8) as u64, 1));
+        let queued = payloads.len();
+        let (mut context, state) = context(&payloads, 2);
+        state.paused.store(true, Ordering::Relaxed);
+        let mut buffer = vec![0_u8; 3 * 2 * 4];
+
+        context.fill(&mut buffer, 2);
+
+        let mut frame = 0;
+        assert_eq!(decode(&buffer, 2, &mut frame)[0], vec![0x69; 8]);
+        assert_eq!(state.frames_played.load(Ordering::Relaxed), 0);
+        // A pause is not a dropout, and nothing is consumed, so resuming loses no audio.
+        assert_eq!(state.underrun_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(context.consumer.slots(), queued);
+
+        state.paused.store(false, Ordering::Relaxed);
+        context.fill(&mut buffer, 2);
+        assert_eq!(state.frames_played.load(Ordering::Relaxed), 4);
     }
 
     #[test]

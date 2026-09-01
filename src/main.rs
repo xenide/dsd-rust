@@ -3,6 +3,7 @@ mod dsd;
 mod output;
 mod player;
 mod reader;
+mod tui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,23 @@ enum Command {
     Play {
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Output device name fragment or UID; defaults to the system output device
+        #[arg(short, long)]
+        device: Option<String>,
+        /// Leave the device shared with other apps instead of claiming it exclusively
+        #[arg(long)]
+        shared: bool,
+        /// Size of the DoP queue between the reader and the audio callback
+        #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u32).range(20..=5000))]
+        buffer_ms: u32,
+        /// Override the device IO buffer size, in frames
+        #[arg(long)]
+        buffer_frames: Option<u32>,
+    },
+    /// Browse and play DSD files in a terminal UI
+    Tui {
+        /// Directory to start browsing in; defaults to the working directory
+        dir: Option<PathBuf>,
         /// Output device name fragment or UID; defaults to the system output device
         #[arg(short, long)]
         device: Option<String>,
@@ -77,6 +95,24 @@ fn main() -> Result<()> {
                 buffer_frames,
             };
             play_all(&files, device.as_deref(), &options)
+        }
+        Command::Tui {
+            dir,
+            device,
+            shared,
+            buffer_ms,
+            buffer_frames,
+        } => {
+            let options = PlayOptions {
+                exclusive: !shared,
+                buffer_ms,
+                buffer_frames,
+            };
+            tui::run(
+                dir.unwrap_or_else(|| PathBuf::from(".")),
+                device.as_deref(),
+                options,
+            )
         }
         Command::Devices { formats } => show_devices(formats),
         Command::Info { files } => show_info(&files),
