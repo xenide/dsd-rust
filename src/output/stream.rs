@@ -1,13 +1,15 @@
+use std::cmp::Reverse;
 use std::os::raw::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use coreaudio_sys::{
     AudioBufferList, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
     AudioDeviceStart, AudioDeviceStop, AudioObjectID, AudioStreamBasicDescription,
-    AudioStreamRangedDescription, AudioTimeStamp, OSStatus, kAudioFormatLinearPCM,
+    AudioStreamRangedDescription, AudioTimeStamp, OSStatus, kAudioFormatFlagIsNonMixable,
+    kAudioFormatLinearPCM,
 };
 use rtrb::Consumer;
 use tracing::{debug, warn};
@@ -138,6 +140,9 @@ pub struct DeviceBusy;
 /// How long a device gets to adopt a stream format.
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the virtual format gets to follow a non-mixable physical format.
+const VIRTUAL_FORMAT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// The DSD rates a DoP link can carry, as PCM frame rates.
 pub const DOP_PCM_RATES: [u32; 4] = [176_400, 352_800, 705_600, 1_411_200];
 
@@ -151,9 +156,23 @@ fn carries_rate(ranged: &AudioStreamRangedDescription, rate: u32) -> bool {
         && wanted <= ranged.mSampleRateRange.mMaximum
 }
 
-/// Prefer integer transport, then 24-bit containers, then an exact channel match.
-fn score(format: &AudioStreamBasicDescription, encoding: Encoding, channels: u32) -> i32 {
+/// A non-mixable format takes the Core Audio mixer out of the path, which is what makes
+/// the callback receive the device's own integer samples instead of converted float.
+fn is_non_mixable(format: &AudioStreamBasicDescription) -> bool {
+    format.mFormatFlags & kAudioFormatFlagIsNonMixable != 0
+}
+
+/// Prefer a non-mixable integer format, then 24-bit containers, then an exact channel match.
+fn score(
+    format: &AudioStreamBasicDescription,
+    encoding: Encoding,
+    channels: u32,
+    exclusive: bool,
+) -> i32 {
     let mut score = 0;
+    if exclusive && is_non_mixable(format) {
+        score += 200;
+    }
     if encoding.is_integer() {
         score += 100;
     }
@@ -210,6 +229,9 @@ pub struct Output {
     mixing_disabled: bool,
     hogged: bool,
     running: bool,
+    format_changed: bool,
+    /// Set when this device was the system output before exclusive use moved it away.
+    was_default_output: bool,
     pub encoding: Encoding,
     pub buffer_frames: u32,
     pub state: Arc<PlaybackState>,
@@ -223,16 +245,26 @@ impl Output {
             exclusive,
             buffer_frames,
         } = *request;
-        let (stream_index, stream, mut format) = choose_format(&device, pcm_rate, channels)?;
+        let choice = choose_stream(&device, request)?;
+        let (stream_index, stream) = (choice.index, choice.stream);
         let original_format = stream.physical_format()?;
         let original_rate = device.nominal_sample_rate()?;
 
+        let was_default_output = Device::default_output().is_ok_and(|current| current == device);
         let mut hogged = false;
         let mut mixing_disabled = false;
         if exclusive {
             match device.set_hog_mode(unsafe { libc::getpid() }) {
                 Ok(()) => hogged = true,
-                Err(error) => warn!("could not take exclusive access: {error}"),
+                Err(error) => {
+                    if let Some(owner) = device.hog_owner() {
+                        bail!(
+                            "the device is held exclusively by process {owner}; quit it, or pass \
+                             --shared to play alongside it"
+                        );
+                    }
+                    warn!("could not take exclusive access: {error}");
+                }
             }
             if device.supports_mixing_switch() {
                 match device.set_mixing(false) {
@@ -252,22 +284,19 @@ impl Output {
             mixing_disabled,
             hogged,
             running: false,
+            format_changed: false,
+            was_default_output,
             encoding: Encoding::Float32,
             buffer_frames: 0,
             state: Arc::new(PlaybackState::default()),
         };
 
-        format.mSampleRate = f64::from(pcm_rate);
-        if let Err(error) = device.set_nominal_sample_rate(format.mSampleRate) {
+        if let Err(error) = device.set_nominal_sample_rate(f64::from(pcm_rate)) {
             debug!("nominal sample rate not settable directly: {error}");
         }
-        stream.set_physical_format(&format).with_context(|| {
-            format!(
-                "device rejected {pcm_rate} Hz {} bit",
-                format.mBitsPerChannel
-            )
-        })?;
-        settle(&stream, f64::from(pcm_rate))?;
+        let format = adopt_format(&stream, &choice.formats, pcm_rate)
+            .with_context(|| format!("device rejected every {pcm_rate} Hz format"))?;
+        output.format_changed = true;
 
         let virtual_format = negotiate_virtual_format(&stream, &format, exclusive)?;
         if virtual_format.mSampleRate != f64::from(pcm_rate) {
@@ -377,7 +406,9 @@ impl Drop for Output {
         }
         // Wait for the restore to land: leaving a reconfiguration in flight makes the next
         // track's format change fail with EAGAIN.
-        if let Err(error) = self.stream.set_physical_format(&self.original_format) {
+        if !self.format_changed {
+            // nothing was adopted, so the device still holds its own format
+        } else if let Err(error) = self.stream.set_physical_format(&self.original_format) {
             warn!("could not restore the stream format: {error}");
         } else if let Err(error) = settle(&self.stream, self.original_format.mSampleRate) {
             debug!("stream format did not settle back: {error}");
@@ -395,17 +426,33 @@ impl Drop for Output {
         {
             warn!("could not release exclusive access: {error}");
         }
+        // Claiming a device moves the system output elsewhere, and macOS does not move it back.
+        let moved_away = self.was_default_output
+            && Device::default_output().is_ok_and(|current| current != self.device);
+        if moved_away && let Err(error) = self.device.make_default_output() {
+            debug!("could not restore the system output device: {error}");
+        }
     }
 }
 
-fn choose_format(
-    device: &Device,
-    pcm_rate: u32,
-    channels: u16,
-) -> Result<(usize, Stream, AudioStreamBasicDescription)> {
-    let streams = device.output_streams()?;
-    let mut best: Option<(usize, Stream, AudioStreamBasicDescription, i32)> = None;
-    for (index, stream) in streams.iter().enumerate() {
+/// The output stream to drive, with the formats it can carry ordered best first.
+struct StreamChoice {
+    index: usize,
+    stream: Stream,
+    formats: Vec<AudioStreamBasicDescription>,
+    top_score: i32,
+}
+
+fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
+    let Request {
+        pcm_rate,
+        channels,
+        exclusive,
+        ..
+    } = *request;
+    let mut best: Option<StreamChoice> = None;
+    for (index, stream) in device.output_streams()?.iter().enumerate() {
+        let mut scored = Vec::new();
         for ranged in stream.available_physical_formats()? {
             let format = ranged.mFormat;
             if !carries_rate(&ranged, pcm_rate) || format.mChannelsPerFrame < u32::from(channels) {
@@ -414,16 +461,54 @@ fn choose_format(
             let Ok(encoding) = Encoding::from_format(&format) else {
                 continue;
             };
-            let candidate = score(&format, encoding, u32::from(channels));
-            if best.as_ref().is_none_or(|(.., best)| candidate > *best) {
-                best = Some((index, *stream, format, candidate));
+            scored.push((
+                score(&format, encoding, u32::from(channels), exclusive),
+                format,
+            ));
+        }
+        scored.sort_by_key(|(score, _)| Reverse(*score));
+        let Some((top_score, _)) = scored.first().copied() else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|best| top_score > best.top_score) {
+            best = Some(StreamChoice {
+                index,
+                stream: *stream,
+                formats: scored.into_iter().map(|(_, format)| format).collect(),
+                top_score,
+            });
+        }
+    }
+    best.with_context(|| {
+        format!("device has no {pcm_rate} Hz, {channels} channel, 24 bit or better output format")
+    })
+}
+
+/// Adopt the best format the device actually accepts, at the requested rate.
+fn adopt_format(
+    stream: &Stream,
+    candidates: &[AudioStreamBasicDescription],
+    pcm_rate: u32,
+) -> Result<AudioStreamBasicDescription> {
+    let mut last = None;
+    for format in candidates {
+        let mut format = *format;
+        format.mSampleRate = f64::from(pcm_rate);
+        match stream
+            .set_physical_format(&format)
+            .and_then(|()| settle(stream, f64::from(pcm_rate)))
+        {
+            Ok(()) => return Ok(format),
+            Err(error) => {
+                debug!(
+                    "device rejected {} bit format: {error}",
+                    format.mBitsPerChannel
+                );
+                last = Some(error);
             }
         }
     }
-    let (index, stream, format, _) = best.with_context(|| {
-        format!("device has no {pcm_rate} Hz, {channels} channel, 24 bit or better output format")
-    })?;
-    Ok((index, stream, format))
+    Err(last.unwrap_or_else(|| anyhow!("device offers no usable format at {pcm_rate} Hz")))
 }
 
 /// Changing the hardware format is asynchronous; wait for the device to settle.
@@ -440,12 +525,31 @@ fn settle(stream: &Stream, rate: f64) -> Result<()> {
     }
 }
 
-/// In exclusive mode, ask for integer buffers so no float conversion sits in the path.
+/// The callback is handed the stream's virtual format, so what it is must be settled before
+/// the callback exists: writing float samples into an integer buffer would be pure noise.
+///
+/// A non-mixable physical format takes the mixer out of the path, and the virtual format then
+/// becomes the physical one - but not instantly, so wait for it rather than sampling too early.
 fn negotiate_virtual_format(
     stream: &Stream,
     physical: &AudioStreamBasicDescription,
     exclusive: bool,
 ) -> Result<AudioStreamBasicDescription> {
+    if is_non_mixable(physical) {
+        let deadline = Instant::now() + VIRTUAL_FORMAT_TIMEOUT;
+        loop {
+            let current = stream.virtual_format()?;
+            if Encoding::from_format(&current).is_ok_and(Encoding::is_integer) {
+                return Ok(current);
+            }
+            if Instant::now() >= deadline {
+                debug!("device kept a float virtual format under a non-mixable physical one");
+                return Ok(current);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     let current = stream.virtual_format()?;
     let wants_integer = exclusive
         && Encoding::from_format(physical).is_ok_and(Encoding::is_integer)

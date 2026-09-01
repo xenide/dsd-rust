@@ -5,7 +5,15 @@ pub mod encoding;
 pub mod hal;
 pub mod stream;
 
+use std::fmt;
+
 use anyhow::{Result, bail};
+use coreaudio_sys::{
+    AudioStreamBasicDescription, AudioStreamRangedDescription, kAudioFormatFlagIsAlignedHigh,
+    kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
+    kAudioFormatFlagIsNonMixable, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM,
+};
 
 use crate::output::hal::Device;
 use crate::output::stream::supported_dop_rates;
@@ -17,6 +25,7 @@ pub struct DeviceSummary {
     pub is_default: bool,
     pub current_rate: f64,
     pub dop_rates: Vec<u32>,
+    pub hog_owner: Option<i32>,
 }
 
 pub fn list_devices() -> Result<Vec<DeviceSummary>> {
@@ -29,9 +38,76 @@ pub fn list_devices() -> Result<Vec<DeviceSummary>> {
             is_default: default == Some(device),
             current_rate: device.nominal_sample_rate().unwrap_or(0.0),
             dop_rates: supported_dop_rates(&device),
+            hog_owner: device.hog_owner(),
         });
     }
     Ok(summaries)
+}
+
+/// One line describing a stream format, as the driver advertises it.
+pub struct FormatLine(pub AudioStreamBasicDescription);
+
+impl fmt::Display for FormatLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let format = self.0;
+        if format.mFormatID != kAudioFormatLinearPCM {
+            let id = format.mFormatID.to_be_bytes();
+            return write!(f, "{} non-PCM", String::from_utf8_lossy(&id));
+        }
+        let flags = format.mFormatFlags;
+        let channels = format.mChannelsPerFrame.max(1);
+        let sample_bytes = format.mBytesPerFrame / channels;
+        let kind = if flags & kAudioFormatFlagIsFloat != 0 {
+            "float"
+        } else if flags & kAudioFormatFlagIsSignedInteger != 0 {
+            "int"
+        } else {
+            "uint"
+        };
+        write!(
+            f,
+            "{:>7.0} Hz  {:>2} bit {kind} in {sample_bytes} B  {channels} ch  {}",
+            format.mSampleRate,
+            format.mBitsPerChannel,
+            if flags & kAudioFormatFlagIsBigEndian != 0 {
+                "BE"
+            } else {
+                "LE"
+            }
+        )?;
+        for (flag, name) in [
+            (kAudioFormatFlagIsPacked, "packed"),
+            (kAudioFormatFlagIsAlignedHigh, "aligned-high"),
+            (kAudioFormatFlagIsNonInterleaved, "non-interleaved"),
+            (kAudioFormatFlagIsNonMixable, "non-mixable"),
+        ] {
+            if flags & flag != 0 {
+                write!(f, " {name}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every format one output stream advertises, for `devices --formats`.
+pub struct StreamFormats {
+    pub current_physical: AudioStreamBasicDescription,
+    pub current_virtual: AudioStreamBasicDescription,
+    pub physical: Vec<AudioStreamRangedDescription>,
+    pub virtual_formats: Vec<AudioStreamRangedDescription>,
+}
+
+pub fn stream_formats(device: &Device) -> Result<Vec<StreamFormats>> {
+    let mut streams = Vec::new();
+    for stream in device.output_streams()? {
+        streams.push(StreamFormats {
+            current_physical: stream.physical_format()?,
+            current_virtual: stream.virtual_format()?,
+            physical: stream.available_physical_formats().unwrap_or_default(),
+            virtual_formats: stream.available_virtual_formats().unwrap_or_default(),
+        });
+    }
+    Ok(streams)
 }
 
 /// Resolve a device by name fragment or UID, falling back to the system default.

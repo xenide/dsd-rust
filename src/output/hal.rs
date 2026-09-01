@@ -15,8 +15,8 @@ use coreaudio_sys::{
     kAudioDevicePropertyVolumeScalar, kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyPhysicalFormat,
-    kAudioStreamPropertyVirtualFormat, kCFStringEncodingUTF8,
+    kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyAvailableVirtualFormats,
+    kAudioStreamPropertyPhysicalFormat, kAudioStreamPropertyVirtualFormat, kCFStringEncodingUTF8,
 };
 
 pub const GLOBAL: u32 = kAudioObjectPropertyScopeGlobal;
@@ -173,6 +173,12 @@ impl Device {
         Ok(Self(get(kAudioObjectSystemObject, &address)?))
     }
 
+    /// Make this the system output device again after exclusive use moved it elsewhere.
+    pub fn make_default_output(&self) -> Result<()> {
+        let address = address(kAudioHardwarePropertyDefaultOutputDevice, GLOBAL);
+        set(kAudioObjectSystemObject, &address, &self.0)
+    }
+
     pub fn name(&self) -> Result<String> {
         get_string(self.0, &address(kAudioObjectPropertyName, GLOBAL))
     }
@@ -222,6 +228,12 @@ impl Device {
         set(self.0, &address(kAudioDevicePropertyHogMode, OUTPUT), &pid)
     }
 
+    /// The process holding the device exclusively, or `None` when it is free.
+    pub fn hog_owner(&self) -> Option<libc::pid_t> {
+        let owner: libc::pid_t = get(self.0, &address(kAudioDevicePropertyHogMode, OUTPUT)).ok()?;
+        (owner >= 0).then_some(owner)
+    }
+
     /// Ask the device to hand the IOProc the raw stream format instead of mixed float.
     pub fn set_mixing(&self, enabled: bool) -> Result<()> {
         let address = address(kAudioDevicePropertySupportsMixing, GLOBAL);
@@ -255,6 +267,13 @@ impl Stream {
         get_all(
             self.0,
             &address(kAudioStreamPropertyAvailablePhysicalFormats, GLOBAL),
+        )
+    }
+
+    pub fn available_virtual_formats(&self) -> Result<Vec<AudioStreamRangedDescription>> {
+        get_all(
+            self.0,
+            &address(kAudioStreamPropertyAvailableVirtualFormats, GLOBAL),
         )
     }
 
