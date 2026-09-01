@@ -36,7 +36,7 @@ enum Command {
         #[arg(long)]
         shared: bool,
         /// Size of the DoP queue between the reader and the audio callback
-        #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u32).range(20..=5000))]
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(20..=10000))]
         buffer_ms: u32,
         /// Override the device IO buffer size, in frames
         #[arg(long)]
@@ -53,7 +53,7 @@ enum Command {
         #[arg(long)]
         shared: bool,
         /// Size of the DoP queue between the reader and the audio callback
-        #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u32).range(20..=5000))]
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(20..=10000))]
         buffer_ms: u32,
         /// Override the device IO buffer size, in frames
         #[arg(long)]

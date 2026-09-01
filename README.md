@@ -15,7 +15,7 @@ dsd-rust tui ~/Music/dsd               # browse, play, and watch the transport
 ```
 
 `play` options: `--shared` leaves the device available to other apps, `--buffer-ms`
-sizes the queue between the reader and the audio callback (default 250), and
+sizes the queue between the reader and the audio callback (default 500), and
 `--buffer-frames` overrides the device IO buffer size.
 
 Files play in the order given, and the device is resolved once for the whole list: holding a
