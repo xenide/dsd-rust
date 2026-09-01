@@ -4,24 +4,39 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use crate::dop;
+use crate::output::stream::{DeviceBusy, Output, Request};
+use crate::output::{self, hal::Device};
+use crate::reader::{self, DsdSource};
 use anyhow::{Context, Result};
 use rtrb::{Producer, RingBuffer};
 use tracing::debug;
 
-use crate::dop;
-use crate::output::stream::{Output, Request};
-use crate::output::{self, hal::Device};
-use crate::reader::{self, DsdSource};
-
 /// How long the DAC keeps receiving DoP silence after the music ends, so it does not pop.
 const TAIL: Duration = Duration::from_millis(150);
-const POLL: Duration = Duration::from_millis(100);
+const POLL: Duration = Duration::from_millis(20);
+/// A track gets this many goes at claiming a device that is still switching rate.
+const SETUP_ATTEMPTS: u32 = 4;
+const SETTLE: Duration = Duration::from_millis(300);
 
 pub struct PlayOptions {
-    pub device: Option<String>,
     pub exclusive: bool,
     pub buffer_ms: u32,
     pub buffer_frames: Option<u32>,
+}
+
+/// The device a playlist plays to, resolved once: holding a device exclusively moves the
+/// system default elsewhere, so re-resolving between tracks would pick the wrong one.
+pub struct Target {
+    pub device: Device,
+    pub name: String,
+}
+
+impl Target {
+    pub fn resolve(query: Option<&str>) -> Result<Self> {
+        let (device, name) = output::find_device(query)?;
+        Ok(Self { device, name })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -30,14 +45,44 @@ struct FeedState {
     finished: AtomicBool,
 }
 
-pub fn play(path: &Path, options: &PlayOptions, stop: &Arc<AtomicBool>) -> Result<()> {
+/// Play one file, retrying while the device is still settling from the previous track.
+pub fn play(
+    path: &Path,
+    target: &Target,
+    options: &PlayOptions,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
+    for attempt in 1..=SETUP_ATTEMPTS {
+        let result = play_once(path, target, options, stop);
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if attempt == SETUP_ATTEMPTS || error.downcast_ref::<DeviceBusy>().is_none() {
+            return Err(error);
+        }
+        debug!("{error}; retrying {}", path.display());
+        thread::sleep(SETTLE);
+    }
+    Ok(())
+}
+
+fn play_once(
+    path: &Path,
+    target: &Target,
+    options: &PlayOptions,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
     let source = reader::open(path)?;
     let format = source.format();
     let channels = format.channels as usize;
     let pcm_rate = format.rate.dop_pcm_rate();
     let total_frames = source.total_bytes_per_channel() / 2;
 
-    let (device, device_name) = output::find_device(options.device.as_deref())?;
+    let Target {
+        device,
+        name: device_name,
+    } = target;
+    let device = *device;
     let capacity = (pcm_rate as usize * channels * options.buffer_ms as usize / 1000).max(1 << 14);
     let (producer, consumer) = RingBuffer::<u16>::new(capacity);
 
@@ -86,13 +131,22 @@ pub fn play(path: &Path, options: &PlayOptions, stop: &Arc<AtomicBool>) -> Resul
 
     output.start()?;
     let duration = source_duration(total_frames, pcm_rate);
+    let mut dropouts = 0;
+    let mut shown = u64::MAX;
     while !stop.load(Ordering::Relaxed) {
         let played = output.state.frames_played.load(Ordering::Relaxed);
-        print_progress(played, total_frames, pcm_rate, duration);
-        if feed.finished.load(Ordering::Relaxed)
-            && played >= feed.frames_written.load(Ordering::Relaxed)
-        {
-            break;
+        if feed.finished.load(Ordering::Relaxed) {
+            if played >= feed.frames_written.load(Ordering::Relaxed) {
+                break;
+            }
+        } else {
+            // Silence sent once the file is fully queued is the tail, not a dropout.
+            dropouts = output.state.underrun_frames.load(Ordering::Relaxed);
+        }
+        let elapsed = source_duration(played.min(total_frames), pcm_rate) as u64;
+        if elapsed != shown {
+            print_progress(elapsed as f64, duration);
+            shown = elapsed;
         }
         thread::sleep(POLL);
     }
@@ -100,11 +154,17 @@ pub fn play(path: &Path, options: &PlayOptions, stop: &Arc<AtomicBool>) -> Resul
     output.state.silence.store(true, Ordering::Relaxed);
     thread::sleep(TAIL);
     output.stop();
+    print_progress(
+        duration.min(source_duration(total_frames, pcm_rate)),
+        duration,
+    );
     println!();
 
-    let underruns = output.state.underrun_frames.load(Ordering::Relaxed);
-    if underruns > 0 {
-        debug!("{underruns} frames of DoP silence were inserted");
+    if dropouts > 0 {
+        eprintln!(
+            "  {dropouts} frames of DoP silence filled underruns ({:.0} ms); raise --buffer-ms",
+            f64::from(dropouts as u32) * 1000.0 / f64::from(pcm_rate)
+        );
     }
     stop.store(true, Ordering::Relaxed);
     let result = feeder.join().unwrap_or_else(|_| Ok(()));
@@ -124,8 +184,7 @@ fn source_duration(total_frames: u64, pcm_rate: u32) -> f64 {
     total_frames as f64 / f64::from(pcm_rate)
 }
 
-fn print_progress(played: u64, total_frames: u64, pcm_rate: u32, duration: f64) {
-    let elapsed = source_duration(played.min(total_frames), pcm_rate);
+fn print_progress(elapsed: f64, duration: f64) {
     print!("\r  {} / {}   ", clock(elapsed), clock(duration));
     use std::io::Write;
     let _ = std::io::stdout().flush();

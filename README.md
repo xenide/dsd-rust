@@ -16,6 +16,10 @@ dsd-rust play *.dsf --device "D50"     # pick a device by name fragment or UID
 sizes the queue between the reader and the audio callback (default 250), and
 `--buffer-frames` overrides the device IO buffer size.
 
+Files play in the order given, and the device is resolved once for the whole list: holding a
+device exclusively moves the system default output elsewhere, so re-resolving between tracks
+would pick the wrong one. Tracks may mix DSD rates; the device is reconfigured for each.
+
 ## What "bit-perfect" means here
 
 * DSD samples are never resampled, filtered, or attenuated. The player only reorders bits

@@ -50,7 +50,8 @@ impl IoContext {
             return;
         }
         let frames = out.len() / frame_bytes;
-        let ready = if state.silence.load(Ordering::Relaxed) {
+        let silenced = state.silence.load(Ordering::Relaxed);
+        let ready = if silenced {
             0
         } else {
             (consumer.slots() / *channels).min(frames)
@@ -82,9 +83,11 @@ impl IoContext {
         state
             .frames_played
             .fetch_add(ready as u64, Ordering::Relaxed);
-        state
-            .underrun_frames
-            .fetch_add((frames - ready) as u64, Ordering::Relaxed);
+        if !silenced {
+            state
+                .underrun_frames
+                .fetch_add((frames - ready) as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -120,6 +123,20 @@ unsafe extern "C" fn io_proc(
     }
     0
 }
+
+/// How long a device gets to become startable after another track released it.
+const START_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Core Audio reports a device that is still reconfiguring as temporarily unavailable.
+const EAGAIN: OSStatus = 35;
+
+/// The device is mid-reconfiguration; the same request usually succeeds a moment later.
+#[derive(Debug, thiserror::Error)]
+#[error("the audio device is busy reconfiguring")]
+pub struct DeviceBusy;
+
+/// How long a device gets to adopt a stream format.
+const FORMAT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The DSD rates a DoP link can carry, as PCM frame rates.
 pub const DOP_PCM_RATES: [u32; 4] = [176_400, 352_800, 705_600, 1_411_200];
@@ -250,7 +267,7 @@ impl Output {
                 format.mBitsPerChannel
             )
         })?;
-        wait_for_format(&stream, pcm_rate)?;
+        settle(&stream, f64::from(pcm_rate))?;
 
         let virtual_format = negotiate_virtual_format(&stream, &format, exclusive)?;
         if virtual_format.mSampleRate != f64::from(pcm_rate) {
@@ -275,12 +292,22 @@ impl Output {
         }));
         output.context = context;
 
+        output.create_proc()?;
+        Ok(output)
+    }
+
+    /// Bind the render callback to the device, replacing any previous binding.
+    fn create_proc(&mut self) -> Result<()> {
+        if self.proc_id.is_some() {
+            unsafe { AudioDeviceDestroyIOProcID(self.device.0, self.proc_id) };
+            self.proc_id = None;
+        }
         let mut proc_id: AudioDeviceIOProcID = None;
         let status = unsafe {
             AudioDeviceCreateIOProcID(
-                device.0,
+                self.device.0,
                 Some(io_proc),
-                context.cast::<c_void>(),
+                self.context.cast::<c_void>(),
                 &mut proc_id,
             )
         };
@@ -290,17 +317,33 @@ impl Output {
                 hal::status_text(status)
             );
         }
-        output.proc_id = proc_id;
-        Ok(output)
+        self.proc_id = proc_id;
+        Ok(())
     }
 
+    /// A device that has just changed sample rate rejects the start of a callback bound
+    /// before the change, so a refused start rebinds the callback and tries again.
     pub fn start(&mut self) -> Result<()> {
-        let status = unsafe { AudioDeviceStart(self.device.0, self.proc_id) };
-        if status != 0 {
-            bail!("AudioDeviceStart failed: {}", hal::status_text(status));
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            let status = unsafe { AudioDeviceStart(self.device.0, self.proc_id) };
+            if status == 0 {
+                self.running = true;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                if status == EAGAIN {
+                    return Err(DeviceBusy.into());
+                }
+                bail!("AudioDeviceStart failed: {}", hal::status_text(status));
+            }
+            debug!(
+                "device refused to start ({}); rebinding the callback",
+                hal::status_text(status)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+            self.create_proc()?;
         }
-        self.running = true;
-        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -332,8 +375,12 @@ impl Drop for Output {
         if !self.context.is_null() {
             drop(unsafe { Box::from_raw(self.context) });
         }
+        // Wait for the restore to land: leaving a reconfiguration in flight makes the next
+        // track's format change fail with EAGAIN.
         if let Err(error) = self.stream.set_physical_format(&self.original_format) {
             warn!("could not restore the stream format: {error}");
+        } else if let Err(error) = settle(&self.stream, self.original_format.mSampleRate) {
+            debug!("stream format did not settle back: {error}");
         }
         if let Err(error) = self.device.set_nominal_sample_rate(self.original_rate) {
             debug!("could not restore the sample rate: {error}");
@@ -380,14 +427,14 @@ fn choose_format(
 }
 
 /// Changing the hardware format is asynchronous; wait for the device to settle.
-fn wait_for_format(stream: &Stream, pcm_rate: u32) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+fn settle(stream: &Stream, rate: f64) -> Result<()> {
+    let deadline = Instant::now() + FORMAT_TIMEOUT;
     loop {
-        if stream.physical_format()?.mSampleRate == f64::from(pcm_rate) {
+        if stream.physical_format()?.mSampleRate == rate {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("device did not switch to {pcm_rate} Hz within 3 s");
+            bail!("device did not switch to {rate} Hz within {FORMAT_TIMEOUT:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -550,5 +597,6 @@ mod tests {
         let mut frame = 0;
         assert_eq!(decode(&buffer, 2, &mut frame)[0], vec![0x69; 8]);
         assert_eq!(state.frames_played.load(Ordering::Relaxed), 0);
+        assert_eq!(state.underrun_frames.load(Ordering::Relaxed), 0);
     }
 }

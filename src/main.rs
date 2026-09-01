@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::player::PlayOptions;
+use crate::player::{PlayOptions, Target};
 
 /// Bit-perfect DSD player. DSD is carried to the DAC untouched, as DoP 1.1.
 #[derive(Debug, Parser)]
@@ -67,19 +67,19 @@ fn main() -> Result<()> {
             buffer_frames,
         } => {
             let options = PlayOptions {
-                device,
                 exclusive: !shared,
                 buffer_ms,
                 buffer_frames,
             };
-            play_all(&files, &options)
+            play_all(&files, device.as_deref(), &options)
         }
         Command::Devices => show_devices(),
         Command::Info { files } => show_info(&files),
     }
 }
 
-fn play_all(files: &[PathBuf], options: &PlayOptions) -> Result<()> {
+fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> Result<()> {
+    let target = Target::resolve(device)?;
     let stop = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler_stop = Arc::clone(&stop);
@@ -90,7 +90,7 @@ fn play_all(files: &[PathBuf], options: &PlayOptions) -> Result<()> {
     })?;
 
     for file in files {
-        player::play(file, options, &stop)?;
+        player::play(file, &target, options, &stop)?;
         if interrupted.load(Ordering::Relaxed) {
             break;
         }
