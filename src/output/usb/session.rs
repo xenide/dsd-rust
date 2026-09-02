@@ -305,6 +305,15 @@ impl NativeSession {
                 >= self.feed.frames_written.load(Ordering::Relaxed)
     }
 
+    /// True when the engine gave up before the file was played out.
+    ///
+    /// A DAC that rejects a transfer ends the chain on the engine thread, which the session
+    /// otherwise has no way of noticing: it would keep reporting a track that is playing
+    /// nothing, and hold the DAC for as long as it did so.
+    pub fn has_stalled(&self) -> bool {
+        !self.stream.is_running() && !self.is_complete()
+    }
+
     pub fn fully_queued(&self) -> bool {
         self.feed.finished.load(Ordering::Relaxed)
     }

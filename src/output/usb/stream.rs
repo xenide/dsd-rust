@@ -8,9 +8,9 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use rtrb::Consumer;
@@ -36,6 +36,10 @@ const MAX_RATIO: f64 = 1.05;
 
 /// Retries before a chain is declared dead rather than merely late.
 const SUBMIT_ATTEMPTS: usize = 3;
+/// How long to wait for aborted transfers to come back before giving up on freeing their
+/// buffers. Taking the endpoint down returns them within a few milliseconds, so reaching
+/// this means the device has gone away mid-teardown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 macro_rules! call {
     ($iface:expr, $method:ident $(, $arg:expr)* $(,)?) => {{
@@ -68,7 +72,11 @@ struct Token {
 }
 
 struct Engine {
-    held: Held,
+    /// `None` once the DAC has been handed back to the caller of `run`.
+    held: Option<Held>,
+    /// The interface every transfer goes through, cached so the hot path does not reach
+    /// through `held` -- which an engine that outlives its own run has already given up.
+    streaming: *mut *mut sys::IOUSBInterfaceInterface500,
     out_pipe: u8,
     feedback_pipe: Option<u8>,
     slots: Vec<Slot>,
@@ -86,6 +94,13 @@ struct Engine {
     stop: Arc<AtomicBool>,
     running: bool,
     feedback_updates: u64,
+    /// Transfers IOKit has taken and not yet completed. Their buffers and this engine have
+    /// to outlive every one of them, so nothing is freed while this is above zero.
+    ///
+    /// Atomic because the completions reach it through the raw pointer in their token: a
+    /// plain field read behind `&mut self` is one the compiler may hoist out of a loop,
+    /// which is exactly what the drain below does.
+    in_flight: AtomicUsize,
 }
 
 impl Engine {
@@ -158,7 +173,7 @@ impl Engine {
             // SAFETY: the interface is held open and the buffers outlive the transfer.
             let result = unsafe {
                 call!(
-                    self.held.streaming(),
+                    self.streaming,
                     LowLatencyWriteIsochPipeAsync,
                     self.out_pipe,
                     self.slots[slot].data,
@@ -172,6 +187,7 @@ impl Engine {
             };
             if succeeded(result) {
                 self.next_frame += UFRAMES_PER_XFER as u64 / UFRAMES_PER_MS;
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             self.resync_output();
@@ -183,8 +199,13 @@ impl Engine {
     }
 
     fn on_complete(&mut self, slot: usize, result: sys::IOReturn) {
+        self.transfer_returned();
         if !tolerable(result) {
-            debug!("native DSD transfer failed: IOReturn 0x{result:08x}");
+            // Stopping aborts every transfer still on the wire, so an error on the way out
+            // is the teardown working rather than the stream breaking.
+            if !self.stop.load(Ordering::Relaxed) {
+                debug!("native DSD transfer failed: IOReturn 0x{result:08x}");
+            }
             self.running = false;
             return;
         }
@@ -195,6 +216,7 @@ impl Engine {
 
     /// Read the DAC's requested rate. High-speed feedback is 16.16 samples per microframe.
     fn on_feedback(&mut self, result: sys::IOReturn) {
+        self.transfer_returned();
         if tolerable(result)
             && let Some(feedback) = self.feedback.as_ref()
         {
@@ -251,7 +273,7 @@ impl Engine {
             // SAFETY: as for the output chain.
             let result = unsafe {
                 call!(
-                    self.held.streaming(),
+                    self.streaming,
                     LowLatencyReadIsochPipeAsync,
                     pipe,
                     data,
@@ -265,6 +287,7 @@ impl Engine {
             };
             if succeeded(result) {
                 self.feedback_frame += UFRAMES_PER_XFER as u64 / UFRAMES_PER_MS;
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             // SAFETY: no callback fires for a transfer that never started.
@@ -282,7 +305,7 @@ impl Engine {
         // SAFETY: the interface is open.
         let result = unsafe {
             call!(
-                self.held.streaming(),
+                self.streaming,
                 GetBusFrameNumber,
                 &raw mut frame,
                 &raw mut at
@@ -307,6 +330,48 @@ impl Engine {
             self.feedback_frame = now + START_LEAD / 2;
         }
     }
+
+    fn transfer_returned(&self) {
+        if self.in_flight.load(Ordering::Relaxed) > 0 {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Tell IOKit to give back every transfer it is still holding. Each one comes back as an
+    /// aborted completion, which is what lets the run loop drain to nothing.
+    fn abort_pipes(&self) {
+        // SAFETY: the interface is open for the lifetime of `self`.
+        unsafe {
+            call!(self.streaming, AbortPipe, self.out_pipe);
+            if let Some(pipe) = self.feedback_pipe {
+                call!(self.streaming, AbortPipe, pipe);
+            }
+        }
+    }
+
+    /// The DAC, taken back out of the engine so a run that has to outlive its own transfers
+    /// still hands it to the caller.
+    fn take_dac(&mut self) -> Held {
+        self.held
+            .take()
+            .expect("the DAC is taken once, when `run` ends")
+    }
+}
+
+/// Run the loop until no transfer is outstanding, so nothing completes into buffers that are
+/// about to be freed -- or into the next engine, whose allocation may land where this one is.
+///
+/// Takes the counter rather than the engine: completions write to it through the raw pointer
+/// in their token, which a `&mut Engine` parameter would tell the compiler cannot happen.
+fn drain(in_flight: &AtomicUsize) -> bool {
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    while in_flight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        // SAFETY: the run loop and its source belong to this thread.
+        unsafe {
+            sys::CFRunLoopRunInMode(sys::kCFRunLoopDefaultMode, 0.02, 0);
+        }
+    }
+    in_flight.load(Ordering::Relaxed) == 0
 }
 
 /// IOKit calls this on the engine thread's run loop when an output transfer completes.
@@ -384,6 +449,13 @@ impl NativeStream {
         })
     }
 
+    /// False once the engine thread has ended, whether it was asked to or gave up on its own.
+    pub fn is_running(&self) -> bool {
+        self.engine
+            .as_ref()
+            .is_some_and(|engine| !engine.is_finished())
+    }
+
     /// Stop the engine and take the DAC back, still claimed, so the next track does not have
     /// to race `usbaudiod` for it again. `None` once it has already been taken.
     pub fn stop(&mut self) -> Option<Held> {
@@ -415,7 +487,8 @@ fn run(
 ) -> Held {
     let streaming = held.streaming();
     let mut engine = Box::new(Engine {
-        held,
+        held: Some(held),
+        streaming,
         out_pipe,
         feedback_pipe,
         slots: Vec::new(),
@@ -431,6 +504,7 @@ fn run(
         stop: Arc::clone(&stop),
         running: true,
         feedback_updates: 0,
+        in_flight: AtomicUsize::new(0),
     });
 
     // SAFETY: every allocation below is destroyed before this function returns.
@@ -439,7 +513,7 @@ fn run(
             let Some(slot) = create_slot(streaming, UFRAMES_PER_XFER * max_packet, false) else {
                 debug!("native DSD: cannot allocate transfer buffers");
                 destroy_slots(streaming, &mut engine);
-                return engine.held;
+                return engine.take_dac();
             };
             engine.slots.push(slot);
         }
@@ -458,7 +532,7 @@ fn run(
         )) {
             debug!("native DSD: cannot create an async event source");
             destroy_slots(streaming, &mut engine);
-            return engine.held;
+            return engine.take_dac();
         }
         sys::CFRunLoopAddSource(
             sys::CFRunLoopGetCurrent(),
@@ -481,8 +555,18 @@ fn run(
             sys::CFRunLoopRunInMode(sys::kCFRunLoopDefaultMode, 0.05, 1);
         }
         engine.running = false;
-        // Let in-flight completions land so no callback fires after the buffers are gone.
-        sys::CFRunLoopRunInMode(sys::kCFRunLoopDefaultMode, 0.25, 1);
+        // Take back every transfer still on the wire and let its completion land. Freeing
+        // the buffers or this engine with one outstanding hands IOKit a pointer into memory
+        // the next track is about to allocate, and the aborted completion then stops it dead.
+        //
+        // Aborting the pipes is not enough on its own: a low latency isochronous transfer
+        // sits on IOKit's queue until the endpoint goes away, so the alternate setting is
+        // dropped here rather than after the drain.
+        engine.abort_pipes();
+        if let Some(held) = &engine.held {
+            held.reset();
+        }
+        let drained = drain(&engine.in_flight);
 
         sys::CFRunLoopRemoveSource(
             sys::CFRunLoopGetCurrent(),
@@ -493,11 +577,26 @@ fn run(
             "native DSD engine stopped after {} feedback updates",
             engine.feedback_updates
         );
-        engine.held.reset();
-        destroy_slots(streaming, &mut engine);
+        if drained {
+            destroy_slots(streaming, &mut engine);
+        } else {
+            // Leaking a few hundred kilobytes beats freeing a buffer IOKit still owns.
+            debug!(
+                "native DSD: {} transfers never came back; leaving their buffers allocated",
+                engine.in_flight.load(Ordering::Relaxed)
+            );
+            engine.slots.clear();
+            engine.feedback = None;
+            // A completion still to come carries a pointer to this engine, so it has to
+            // outlive the transfer. Give the DAC back and leave the rest allocated.
+            let held = engine.take_dac();
+            Box::leak(engine);
+            thread::sleep(Duration::from_millis(1));
+            return held;
+        }
     }
     thread::sleep(Duration::from_millis(1));
-    engine.held
+    engine.take_dac()
 }
 
 unsafe fn create_slot(

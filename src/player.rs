@@ -393,6 +393,15 @@ impl Playback {
         }
     }
 
+    /// True when playback stopped on its own, short of the end of the file. Only the native
+    /// path can: a Core Audio IOProc runs until it is told to stop.
+    pub fn has_stalled(&self) -> bool {
+        match self {
+            Self::Dop(_) => false,
+            Self::Native(session) => session.has_stalled(),
+        }
+    }
+
     /// True once the reader has queued the whole file, after which silence is the tail
     /// rather than a dropout.
     pub fn fully_queued(&self) -> bool {
@@ -469,9 +478,14 @@ pub fn play(
     let duration = track.duration;
     let mut dropouts = 0;
     let mut shown = u64::MAX;
+    let mut stalled = false;
     while !stop.load(Ordering::Relaxed) {
         let progress = session.progress();
         if session.is_complete() {
+            break;
+        }
+        if session.has_stalled() {
+            stalled = true;
             break;
         }
         if !session.fully_queued() {
@@ -486,9 +500,18 @@ pub fn play(
     }
 
     let frame_rate = device.pcm_rate;
+    let elapsed = session.progress().elapsed;
     session.finish(target)?;
-    print_progress(duration, duration);
+    print_progress(if stalled { elapsed } else { duration }, duration);
     println!();
+
+    if stalled {
+        bail!(
+            "{}: stopped accepting transfers at {}; the track did not play out",
+            device.name,
+            clock(elapsed)
+        );
+    }
 
     if dropouts > 0 {
         eprintln!(

@@ -150,7 +150,9 @@ impl Worker {
                 Ok(command) => self.handle(command),
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            self.advance_if_complete();
+            if !self.end_if_stalled() {
+                self.advance_if_complete();
+            }
             self.publish();
         }
         self.stop_playback();
@@ -202,6 +204,19 @@ impl Worker {
         } else {
             self.stop_playback();
         }
+    }
+
+    /// A dead engine ends playback with a reason, rather than leaving the transport saying
+    /// "playing" over a counter that never moves and a DAC nothing will hand back.
+    fn end_if_stalled(&mut self) -> bool {
+        if !self.session.as_ref().is_some_and(Playback::has_stalled) {
+            return false;
+        }
+        self.stop_playback();
+        self.set_error(Some(
+            "the DAC stopped accepting transfers, so playback ended".to_owned(),
+        ));
+        true
     }
 
     /// End the current track, leaving a natively claimed DAC held for the next one.
