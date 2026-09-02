@@ -16,9 +16,10 @@ use rtrb::{Producer, RingBuffer};
 use crate::dsd::DsdFormat;
 use crate::native;
 use crate::output::stream::PlaybackState;
-use crate::output::usb::device::Dac;
+use crate::output::usb::descriptors::NativeDsd;
+use crate::output::usb::device::{Dac, Held};
 use crate::output::usb::stream::NativeStream;
-use crate::player::{DeviceInfo, Progress, TrackInfo};
+use crate::player::{DeviceInfo, Progress, Target, TrackInfo};
 use crate::reader::{self, DsdSource};
 
 /// How long the DAC keeps receiving DSD silence after the music ends, so it does not pop.
@@ -124,12 +125,51 @@ pub fn find_dac(query: Option<&str>, device_name: &str) -> Result<Dac> {
     Ok(dacs.remove(index))
 }
 
+/// The DAC a track will play to: one the target is already holding, or one still to be
+/// claimed. Only the second costs a race with `usbaudiod`.
+enum Claim {
+    Held(Held),
+    Free(Dac),
+}
+
+impl Claim {
+    fn name(&self) -> &str {
+        match self {
+            Self::Held(held) => &held.name,
+            Self::Free(dac) => &dac.name,
+        }
+    }
+
+    fn native(&self) -> NativeDsd {
+        match self {
+            Self::Held(held) => held.native,
+            Self::Free(dac) => dac.native,
+        }
+    }
+
+    /// The interfaces to stream on, taking them from `usbaudiod` if they are not held yet.
+    fn hold(self) -> Result<Held> {
+        match self {
+            Self::Held(held) => Ok(held),
+            Self::Free(dac) => {
+                let name = dac.name.clone();
+                dac.acquire()
+                    .with_context(|| format!("{name} cannot be claimed for native DSD"))
+            }
+        }
+    }
+}
+
 impl NativeSession {
     /// Open the file, take the DAC away from `usbaudiod`, prefill, and start streaming.
+    ///
+    /// A DAC the target is already holding is reused as it stands. Handing one back
+    /// re-enumerates it, and the claim after that would have to race `usbaudiod` for a
+    /// window that the re-enumeration has already closed, so the race is run once per
+    /// playlist rather than once per track.
     pub fn open(
         path: &Path,
-        query: Option<&str>,
-        device_name: &str,
+        target: &mut Target,
         buffer_ms: u32,
         stop: &Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -138,27 +178,20 @@ impl NativeSession {
         let channels = format.channels as usize;
         let dsd_rate = format.rate.hz();
 
-        let dac = find_dac(query, device_name)?;
-        // The alternate setting has a fixed channel count. Sending any other count would put
-        // each channel's subslots where the DAC expects a different channel's.
-        if format.channels != u16::from(dac.native.channels) {
-            bail!(
-                "{}: its native DSD path carries {} channels, but this file has {}",
-                dac.name,
-                dac.native.channels,
-                format.channels
-            );
+        let claim = match target.dac.take() {
+            Some(held) => Claim::Held(held),
+            None => Claim::Free(find_dac(target.query.as_deref(), &target.name)?),
+        };
+        // A file the DAC cannot carry puts the claim straight back, so the next track still
+        // finds it held rather than paying for a fresh race.
+        if let Err(error) = claim.native().accepts(format) {
+            let name = claim.name().to_owned();
+            if let Claim::Held(held) = claim {
+                target.dac = Some(held);
+            }
+            return Err(error.context(name));
         }
-        let max = dac.native.max_dsd_rate();
-        if dsd_rate > max {
-            bail!(
-                "{}: native endpoint carries at most {:.4} MHz per channel, but this file is {}",
-                dac.name,
-                f64::from(max) / 1_000_000.0,
-                format.rate
-            );
-        }
-        let name = dac.name.clone();
+        let name = claim.name().to_owned();
 
         let frame_bytes = native::frame_bytes(channels);
         let capacity =
@@ -180,22 +213,21 @@ impl NativeSession {
         let feeder = Feeder::spawn(source, producer, Arc::clone(&feed));
 
         // Prefill before taking the device, so the first transfers carry music.
-        let target = (capacity / frame_bytes / 2) as u64;
-        while feed.frames_written.load(Ordering::Relaxed) < target.min(info.total_frames())
+        let prefill = (capacity / frame_bytes / 2) as u64;
+        while feed.frames_written.load(Ordering::Relaxed) < prefill.min(info.total_frames())
             && !feed.finished.load(Ordering::Relaxed)
             && !stop.load(Ordering::Relaxed)
         {
             thread::sleep(Duration::from_millis(5));
         }
         // Claiming the DAC re-enumerates it and then races usbaudiod for its interfaces,
-        // which is not worth starting for a track that has already been cancelled.
+        // which is not worth starting for a track that has already been cancelled. A claim
+        // already in hand is dropped here, which is what a cancelled playlist wants anyway.
         if stop.load(Ordering::Relaxed) {
             bail!("{name}: interrupted before the DAC was claimed");
         }
 
-        let held = dac
-            .acquire()
-            .with_context(|| format!("{name} cannot be claimed for native DSD"))?;
+        let held = claim.hold()?;
         let state = Arc::new(PlaybackState::default());
         let stream = NativeStream::start(held, consumer, channels, dsd_rate, Arc::clone(&state))
             .with_context(|| format!("{name} cannot play {} natively", format.rate))?;
@@ -273,16 +305,27 @@ impl NativeSession {
                 >= self.feed.frames_written.load(Ordering::Relaxed)
     }
 
+    /// True when the engine gave up before the file was played out.
+    ///
+    /// A DAC that rejects a transfer ends the chain on the engine thread, which the session
+    /// otherwise has no way of noticing: it would keep reporting a track that is playing
+    /// nothing, and hold the DAC for as long as it did so.
+    pub fn has_stalled(&self) -> bool {
+        !self.stream.is_running() && !self.is_complete()
+    }
+
     pub fn fully_queued(&self) -> bool {
         self.feed.finished.load(Ordering::Relaxed)
     }
 
-    /// Play out the closing silence, stop the engine, and hand the DAC back.
-    pub fn finish(mut self) -> Result<()> {
+    /// Play out the closing silence and stop the engine, handing the still-claimed DAC back
+    /// to the caller. It comes back even when the reader ended in an error: a claim dropped
+    /// on an error path costs the next track the same race as any other.
+    pub fn finish(mut self) -> (Option<Held>, Result<()>) {
         self.state.silence.store(true, Ordering::Relaxed);
         thread::sleep(TAIL);
-        self.stream.stop();
-        self.feeder.join()
+        let held = self.stream.stop();
+        (held, self.feeder.join())
     }
 }
 

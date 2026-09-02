@@ -122,7 +122,7 @@ fn main() -> Result<()> {
 }
 
 fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> Result<()> {
-    let target = Target::resolve(device)?;
+    let mut target = Target::resolve(device)?;
     let stop = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
     let handler_stop = Arc::clone(&stop);
@@ -142,7 +142,7 @@ fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> R
     })?;
 
     for file in files {
-        let played = player::play(file, &target, options, &stop);
+        let played = player::play(file, &mut target, options, &stop);
         // An interrupt can surface as an error from a half-opened device. The user asked to
         // stop, so that is not worth reporting as a failure.
         if interrupted.load(Ordering::Relaxed) {
