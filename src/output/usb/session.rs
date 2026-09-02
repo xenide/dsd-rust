@@ -22,6 +22,7 @@ use crate::output::usb::stream::NativeStream;
 use crate::player::{
     DeviceInfo, PARK, PREFILL_TIMEOUT, Progress, Target, TrackInfo, seek_position,
 };
+use crate::reader::tags::TrackTags;
 use crate::reader::{self, DsdSource};
 
 /// How long the DAC keeps receiving DSD silence after the music ends, so it does not pop.
@@ -40,6 +41,7 @@ struct FeedState {
 
 /// What a native session is playing and where.
 pub struct NativeInfo {
+    pub tags: TrackTags,
     pub name: String,
     pub format: DsdFormat,
     pub container: &'static str,
@@ -212,6 +214,7 @@ impl NativeSession {
 
         let info = NativeInfo {
             name: name.clone(),
+            tags: source.tags().clone(),
             format,
             container: source.container(),
             duration: source.duration_secs(),
@@ -313,6 +316,7 @@ impl NativeSession {
     pub fn track(&self) -> TrackInfo {
         TrackInfo {
             container: self.info.container,
+            tags: self.info.tags.clone(),
             format: self.info.format,
             duration: self.info.duration,
             total_frames: self.info.total_frames(),
@@ -483,6 +487,7 @@ fn queue(
 mod tests {
     use crate::dsd::{DsdFormat, DsdRate};
     use crate::output::usb::session::NativeInfo;
+    use crate::reader::tags::TrackTags;
 
     fn info(bytes_per_channel: u64) -> NativeInfo {
         NativeInfo {
@@ -492,6 +497,7 @@ mod tests {
                 channels: 2,
             },
             container: "DSF",
+            tags: TrackTags::default(),
             duration: 1.0,
             frame_rate: 352_800,
             bytes_per_channel,

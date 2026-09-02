@@ -43,9 +43,10 @@ fn draw_files(frame: &mut Frame, area: Rect, browser: &Browser, status: &Status)
             ("  ", Style::new())
         };
         let suffix = if entry.is_dir { "/" } else { "" };
+        let label = entry.title.as_ref().unwrap_or(&entry.name);
         items.push(ListItem::new(Line::from(vec![
             Span::raw(marker),
-            Span::styled(format!("{}{suffix}", entry.name), style),
+            Span::styled(format!("{label}{suffix}"), style),
         ])));
     }
 
@@ -63,22 +64,32 @@ fn draw_playing(frame: &mut Frame, area: Rect, status: &Status) {
     let block = Block::bordered().title(" now playing ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height < 4 {
+    if inner.height < 5 {
         return;
     }
 
     let [header, bar, _] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .areas(inner);
-    let name = status
+    let filename = status
         .path
         .as_ref()
         .and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "nothing loaded".to_owned());
+    // The tags name the recording; the filename is what is left when a file carries none.
+    let tags = status.track.as_ref().map(|track| &track.tags);
+    let name = tags
+        .and_then(|tags| tags.headline())
+        .unwrap_or_else(|| filename.clone());
+    let album = match tags.and_then(|tags| tags.album.clone()) {
+        Some(album) => album,
+        None if name == filename => String::new(),
+        None => filename,
+    };
     let format = match &status.track {
         Some(track) => format!("{}  {}", track.format, track.container),
         None => "—".to_owned(),
@@ -89,6 +100,7 @@ fn draw_playing(frame: &mut Frame, area: Rect, status: &Status) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(name, Style::new().add_modifier(Modifier::BOLD)),
+            Line::styled(album, Style::new().fg(Color::Gray)),
             Line::styled(format, Style::new().fg(Color::DarkGray)),
             Line::from(vec![
                 Span::styled(status.state.glyph(), Style::new().fg(ACCENT)),
@@ -248,6 +260,7 @@ mod tests {
 
     use crate::dsd::{DsdFormat, DsdRate};
     use crate::player::{DeviceInfo, Progress, TrackInfo};
+    use crate::reader::tags::TrackTags;
     use crate::tui::browser::Browser;
     use crate::tui::engine::{State, Status};
     use crate::tui::view::draw;
@@ -258,6 +271,7 @@ mod tests {
             path: Some(dir.join("track.dsf")),
             track: Some(TrackInfo {
                 container: "DSF",
+                tags: TrackTags::default(),
                 format: DsdFormat {
                     rate: DsdRate::new(5_644_800),
                     channels: 2,
@@ -343,6 +357,34 @@ mod tests {
             "{screen}"
         );
         assert!(!screen.contains("DoP"), "{screen}");
+    }
+
+    #[test]
+    fn a_tagged_track_is_named_by_its_tags_rather_than_its_filename() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut status = playing_status(dir.path());
+        status.track.as_mut().expect("track").tags = TrackTags {
+            title: Some("So What".to_owned()),
+            artist: Some("Miles Davis".to_owned()),
+            album: Some("Kind of Blue".to_owned()),
+            track: Some(1),
+        };
+        let browser = Browser::open(dir.path().to_path_buf());
+
+        let screen = render(&browser, &status);
+
+        assert!(screen.contains("Miles Davis — So What"), "{screen}");
+        assert!(screen.contains("Kind of Blue"), "{screen}");
+    }
+
+    #[test]
+    fn an_untagged_track_keeps_its_filename_on_the_name_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let browser = Browser::open(dir.path().to_path_buf());
+
+        let screen = render(&browser, &playing_status(dir.path()));
+
+        assert!(screen.contains("track.dsf"), "{screen}");
     }
 
     #[test]

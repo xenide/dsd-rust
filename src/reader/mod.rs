@@ -1,5 +1,6 @@
 pub mod dff;
 pub mod dsf;
+pub mod tags;
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -10,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::dsd::DsdFormat;
 use crate::reader::dff::DffReader;
 use crate::reader::dsf::DsfReader;
+use crate::reader::tags::TrackTags;
 
 /// A source of planar, MSB-first DSD bytes.
 pub trait DsdSource: Send {
@@ -19,6 +21,9 @@ pub trait DsdSource: Send {
 
     /// DSD bytes of audio per channel, excluding container padding.
     fn total_bytes_per_channel(&self) -> u64;
+
+    /// What the container says the recording is. Empty when it carries no tags.
+    fn tags(&self) -> &TrackTags;
 
     /// Bytes each plane passed to [`DsdSource::read`] must hold.
     fn chunk_bytes(&self) -> usize;
@@ -58,6 +63,11 @@ pub fn open(path: &Path) -> Result<Box<dyn DsdSource>> {
             other
         ),
     }
+}
+
+/// Read only what a file says it is, for a listing with no reason to keep the audio open.
+pub fn tags_of(path: &Path) -> Result<TrackTags> {
+    Ok(open(path)?.tags().clone())
 }
 
 /// Read until `buf` is full or the stream ends, returning how many bytes arrived.

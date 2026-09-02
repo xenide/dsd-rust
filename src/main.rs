@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 
 use crate::output::FormatLine;
 use crate::player::{PlayOptions, Target};
+use crate::reader::tags::TrackTags;
 
 /// Bit-perfect DSD player. DSD is carried to the DAC untouched, as DoP 1.1.
 #[derive(Debug, Parser)]
@@ -219,12 +220,31 @@ fn show_formats(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The tag lines a file has something to say on, in the order a listener reads them.
+fn tag_rows(tags: &TrackTags) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    for (label, value) in [
+        ("title", tags.title.clone()),
+        ("artist", tags.artist.clone()),
+        ("album", tags.album.clone()),
+        ("track", tags.track.map(|number| number.to_string())),
+    ] {
+        if let Some(value) = value {
+            rows.push((label, value));
+        }
+    }
+    rows
+}
+
 fn show_info(files: &[PathBuf]) -> Result<()> {
     for file in files {
         let source = reader::open(file)?;
         let format = source.format();
         let seconds = source.duration_secs();
         println!("{}", file.display());
+        for (label, value) in tag_rows(source.tags()) {
+            println!("    {label:<11} {value}");
+        }
         println!("    container   {}", source.container());
         println!("    format      {format}");
         println!(
