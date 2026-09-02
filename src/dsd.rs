@@ -21,6 +21,12 @@ impl DsdRate {
         self.0 / 16
     }
 
+    /// Native DSD carries 32 DSD bits per channel in each USB frame, so it reaches a given
+    /// DSD rate at half the frame rate DoP needs.
+    pub const fn native_frame_rate(self) -> u32 {
+        self.0 / 32
+    }
+
     /// The `NN` in `DSD64`, relative to whichever CD/DAT base rate divides evenly.
     pub fn multiplier(self) -> Option<u32> {
         for base in [44_100_u32, 48_000] {

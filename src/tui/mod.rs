@@ -14,6 +14,7 @@ use ratatui::crossterm::terminal::{
 };
 
 use crate::output::stream::release_claimed_device;
+use crate::output::usb::device::release_claimed_dac;
 use crate::player::{PlayOptions, Target};
 use crate::tui::browser::Browser;
 use crate::tui::engine::Engine;
@@ -112,10 +113,13 @@ impl App {
 
 fn enter_terminal() -> Result<ratatui::DefaultTerminal> {
     // The device is claimed on the worker thread, so a signal that kills this process has to
-    // hand it back itself - and put the terminal back, or the shell is left in raw mode.
+    // hand it back itself - and put the terminal back, or the shell is left in raw mode. A
+    // DAC held for native DSD needs re-enumerating too, or it stays missing from Core Audio
+    // until it is physically replugged.
     ctrlc::set_handler(|| {
         leave_terminal();
         release_claimed_device();
+        release_claimed_dac();
         std::process::exit(130);
     })?;
     let previous = std::panic::take_hook();

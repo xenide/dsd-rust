@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use crate::dop;
 use crate::dsd::DsdFormat;
-use crate::output::stream::{DeviceBusy, Output, Request};
+use crate::dsd::DsdRate;
+use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
+use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
 use crate::reader::{self, DsdSource};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rtrb::{Producer, RingBuffer};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// How long the DAC keeps receiving DoP silence after the music ends, so it does not pop.
 const TAIL: Duration = Duration::from_millis(150);
@@ -31,12 +33,24 @@ pub struct PlayOptions {
 pub struct Target {
     pub device: Device,
     pub name: String,
+    /// Kept so the native USB path can resolve the same DAC: Core Audio and USB report
+    /// different names for one device, so only the user's own query matches both.
+    pub query: Option<String>,
 }
 
 impl Target {
     pub fn resolve(query: Option<&str>) -> Result<Self> {
         let (device, name) = output::find_device(query)?;
-        Ok(Self { device, name })
+        Ok(Self {
+            device,
+            name,
+            query: query.map(str::to_owned),
+        })
+    }
+
+    /// True when this device advertises a PCM rate able to carry the file as DoP.
+    fn carries_dop(&self, rate: DsdRate) -> bool {
+        supported_dop_rates(&self.device).contains(&rate.dop_pcm_rate())
     }
 }
 
@@ -60,6 +74,10 @@ pub struct TrackInfo {
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub name: String,
+    /// How the DSD reaches the DAC: "DoP" or "native DSD".
+    pub carrier: &'static str,
+    /// Container width the carrier uses: 24 bits for DoP, 32 for native DSD.
+    pub bits: u8,
     pub pcm_rate: u32,
     pub buffer_frames: u32,
     pub transport: &'static str,
@@ -134,6 +152,8 @@ impl Session {
 
         let info = DeviceInfo {
             name: target.name.clone(),
+            carrier: "DoP",
+            bits: 24,
             pcm_rate,
             buffer_frames: output.buffer_frames,
             transport: if output.encoding.is_integer() {
@@ -249,6 +269,108 @@ impl Drop for Session {
     }
 }
 
+/// One playing track, over whichever transport the device can carry it on.
+pub enum Playback {
+    Dop(Box<Session>),
+    Native(Box<NativeSession>),
+}
+
+impl Playback {
+    /// Open `path`, preferring DoP. A DAC whose PCM rates cannot carry the file still plays
+    /// it natively, where 32 DSD bits ride in each frame instead of 16.
+    pub fn open(
+        path: &Path,
+        target: &Target,
+        options: &PlayOptions,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let rate = reader::open(path)?.format().rate;
+        if target.carries_dop(rate) {
+            let session = Session::open_retrying(path, target, options, stop)?;
+            return Ok(Self::Dop(Box::new(session)));
+        }
+        // The native path takes both audio interfaces away from usbaudiod for the whole
+        // track, which is heavier than hog mode and cannot be shared. Say so rather than
+        // quietly doing the opposite of what was asked.
+        if !options.exclusive {
+            bail!(
+                "{} cannot carry {rate} over DoP, and the native DSD path always claims the \
+                 device exclusively; drop --shared to play this file",
+                target.name
+            );
+        }
+        if options.buffer_frames.is_some() {
+            warn!("--buffer-frames sizes the Core Audio buffer, so it does not apply natively");
+        }
+        let session = NativeSession::open(
+            path,
+            target.query.as_deref(),
+            &target.name,
+            options.buffer_ms,
+            stop,
+        )?;
+        Ok(Self::Native(Box::new(session)))
+    }
+
+    pub fn track(&self) -> TrackInfo {
+        match self {
+            Self::Dop(session) => session.track.clone(),
+            Self::Native(session) => session.track(),
+        }
+    }
+
+    pub fn device(&self) -> DeviceInfo {
+        match self {
+            Self::Dop(session) => session.device.clone(),
+            Self::Native(session) => session.device(),
+        }
+    }
+
+    pub fn progress(&self) -> Progress {
+        match self {
+            Self::Dop(session) => session.progress(),
+            Self::Native(session) => session.progress(),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Dop(session) => session.is_complete(),
+            Self::Native(session) => session.is_complete(),
+        }
+    }
+
+    /// True once the reader has queued the whole file, after which silence is the tail
+    /// rather than a dropout.
+    pub fn fully_queued(&self) -> bool {
+        match self {
+            Self::Dop(session) => session.feed.finished.load(Ordering::Relaxed),
+            Self::Native(session) => session.fully_queued(),
+        }
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        match self {
+            Self::Dop(session) => session.set_paused(paused),
+            Self::Native(session) => session.set_paused(paused),
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        match self {
+            Self::Dop(session) => session.is_paused(),
+            Self::Native(session) => session.is_paused(),
+        }
+    }
+
+    pub fn finish(self) -> Result<()> {
+        match self {
+            Self::Dop(session) => session.finish(),
+            Self::Native(session) => session.finish(),
+        }
+    }
+}
+
 /// Play one file, printing progress until it ends or `stop` is set.
 pub fn play(
     path: &Path,
@@ -256,34 +378,37 @@ pub fn play(
     options: &PlayOptions,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let session = Session::open_retrying(path, target, options, stop)?;
-    warn_about_volume(&session.device);
+    let session = Playback::open(path, target, options, stop)?;
+    let track = session.track();
+    let device = session.device();
+    warn_about_volume(&device);
 
     println!(
         "{}  {}  {}",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        session.track.format,
-        session.track.container
+        track.format,
+        track.container
     );
     println!(
-        "  -> {}: DoP {} Hz, {} frame buffer, {}, {}{}",
-        session.device.name,
-        session.device.pcm_rate,
-        session.device.buffer_frames,
-        session.device.transport,
-        if session.device.exclusive {
+        "  -> {}: {} {} Hz, {} frame buffer, {}, {}{}",
+        device.name,
+        device.carrier,
+        device.pcm_rate,
+        device.buffer_frames,
+        device.transport,
+        if device.exclusive {
             "exclusive"
         } else {
             "shared"
         },
-        if session.device.mixing_disabled {
+        if device.mixing_disabled {
             ", mixing off"
         } else {
             ""
         }
     );
 
-    let duration = session.track.duration;
+    let duration = track.duration;
     let mut dropouts = 0;
     let mut shown = u64::MAX;
     while !stop.load(Ordering::Relaxed) {
@@ -291,7 +416,7 @@ pub fn play(
         if session.is_complete() {
             break;
         }
-        if !session.feed.finished.load(Ordering::Relaxed) {
+        if !session.fully_queued() {
             // Silence sent once the file is fully queued is the tail, not a dropout.
             dropouts = progress.underrun_frames;
         }
@@ -302,15 +427,15 @@ pub fn play(
         thread::sleep(POLL);
     }
 
-    let pcm_rate = session.device.pcm_rate;
+    let frame_rate = device.pcm_rate;
     session.finish()?;
     print_progress(duration, duration);
     println!();
 
     if dropouts > 0 {
         eprintln!(
-            "  {dropouts} frames of DoP silence filled underruns ({:.0} ms); raise --buffer-ms",
-            dropouts as f64 * 1000.0 / f64::from(pcm_rate)
+            "  {dropouts} frames of DSD silence filled underruns ({:.0} ms); raise --buffer-ms",
+            dropouts as f64 * 1000.0 / f64::from(frame_rate)
         );
     }
     Ok(())
