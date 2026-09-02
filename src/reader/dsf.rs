@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use anyhow::{Result, bail, ensure};
 
@@ -17,6 +17,8 @@ pub struct DsfReader<R> {
     bit_order: BitOrder,
     block_bytes: usize,
     audio_bytes_per_channel: u64,
+    /// Where the audio starts, so a seek can address the blocks from it.
+    data_start: u64,
     emitted: u64,
     scratch: Vec<u8>,
 }
@@ -37,7 +39,7 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     )
 }
 
-impl<R: Read + Send + 'static> DsfReader<R> {
+impl<R: Read + Seek + Send + 'static> DsfReader<R> {
     pub fn new(mut inner: R) -> Result<Self> {
         let mut header = [0_u8; DSD_CHUNK_LEN];
         inner.read_exact(&mut header)?;
@@ -89,6 +91,7 @@ impl<R: Read + Send + 'static> DsfReader<R> {
         let audio_bytes_per_channel = (sample_count / 8).min(data_bytes / u64::from(channels));
         ensure!(audio_bytes_per_channel > 0, "no audio in data chunk");
 
+        let data_start = inner.stream_position()?;
         let channels = u16::try_from(channels).expect("channel count fits u16");
         Ok(Self {
             inner,
@@ -99,13 +102,14 @@ impl<R: Read + Send + 'static> DsfReader<R> {
             bit_order,
             block_bytes,
             audio_bytes_per_channel,
+            data_start,
             emitted: 0,
             scratch: vec![0; block_bytes * channels as usize],
         })
     }
 }
 
-impl<R: Read + Send + 'static> DsdSource for DsfReader<R> {
+impl<R: Read + Seek + Send + 'static> DsdSource for DsfReader<R> {
     fn container(&self) -> &'static str {
         "DSF"
     }
@@ -146,6 +150,19 @@ impl<R: Read + Send + 'static> DsdSource for DsfReader<R> {
         }
         self.emitted += count as u64;
         Ok(count)
+    }
+
+    /// DSF stores whole blocks, one channel after another, so a position is only addressable
+    /// at a block boundary.
+    fn seek(&mut self, bytes_per_channel: u64) -> Result<u64> {
+        let block_bytes = self.block_bytes as u64;
+        let block = bytes_per_channel.min(self.audio_bytes_per_channel) / block_bytes;
+        let channels = u64::from(self.format.channels);
+        self.inner.seek(SeekFrom::Start(
+            self.data_start + block * block_bytes * channels,
+        ))?;
+        self.emitted = block * block_bytes;
+        Ok(self.emitted)
     }
 }
 
@@ -257,6 +274,41 @@ pub(crate) mod tests {
 
         assert_eq!(planes[0].len(), BLOCK);
         assert_eq!(planes[1].len(), BLOCK);
+    }
+
+    #[test]
+    fn a_seek_rounds_back_to_a_block_boundary_and_reads_on_from_there() {
+        let mut reader = DsfReader::new(Cursor::new(dsf_file(8, 96, 2))).expect("parses");
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; BLOCK].into(); 2];
+
+        let reached = reader.seek(BLOCK as u64 + 3).expect("seeks");
+
+        assert_eq!(reached, BLOCK as u64);
+        let count = reader.read(&mut planes).expect("reads");
+        assert_eq!(count, 4);
+        assert_eq!(planes[0][..4], [8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn a_seek_back_inside_the_first_block_starts_the_file_again() {
+        let mut reader = DsfReader::new(Cursor::new(dsf_file(8, 96, 2))).expect("parses");
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; BLOCK].into(); 2];
+        reader.read(&mut planes).expect("reads");
+
+        let reached = reader.seek(3).expect("seeks");
+
+        assert_eq!(reached, 0);
+        assert_eq!(reader.read(&mut planes).expect("reads"), BLOCK);
+        assert_eq!(planes[0][..BLOCK], [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_seek_past_the_end_stops_at_the_last_block_of_audio() {
+        let mut reader = DsfReader::new(Cursor::new(dsf_file(8, 96, 2))).expect("parses");
+
+        let reached = reader.seek(u64::MAX).expect("seeks");
+
+        assert_eq!(reached, BLOCK as u64);
     }
 
     #[test]

@@ -26,6 +26,11 @@ pub trait DsdSource: Send {
     /// Fill the head of each plane with the next DSD bytes. Returns bytes per plane, 0 at EOF.
     fn read(&mut self, planes: &mut [Box<[u8]>]) -> Result<usize>;
 
+    /// Move the read position to `bytes_per_channel` from the start of the audio, clamped to
+    /// the file. Returns where it landed, which a container addressable only in whole blocks
+    /// rounds down.
+    fn seek(&mut self, bytes_per_channel: u64) -> Result<u64>;
+
     fn duration_secs(&self) -> f64 {
         let bits = (self.total_bytes_per_channel() * 8) as f64;
         bits / f64::from(self.format().rate.hz())

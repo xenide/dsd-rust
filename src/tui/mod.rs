@@ -21,6 +21,8 @@ use crate::tui::engine::Engine;
 
 /// How long a redraw waits for a key before refreshing the counters anyway.
 const TICK: Duration = Duration::from_millis(100);
+/// How far one press of the seek keys moves within a track, in seconds.
+const SEEK: f64 = 5.0;
 
 pub struct App {
     browser: Browser,
@@ -82,6 +84,8 @@ impl App {
             KeyCode::Char('s') => self.engine.stop(),
             KeyCode::Char('n') => self.engine.skip(1),
             KeyCode::Char('p') => self.engine.skip(-1),
+            KeyCode::Char(',') => self.engine.seek(-SEEK),
+            KeyCode::Char('.') => self.engine.seek(SEEK),
             KeyCode::Char('r') => self.browser.refresh(),
             _ => {}
         }

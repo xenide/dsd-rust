@@ -17,6 +17,7 @@ enum Command {
     Toggle,
     Stop,
     Skip(i32),
+    Seek(f64),
     Quit,
 }
 
@@ -116,6 +117,11 @@ impl Engine {
         self.send(Command::Skip(delta));
     }
 
+    /// Move the play position by `delta` seconds within the current track.
+    pub fn seek(&self, delta: f64) {
+        self.send(Command::Seek(delta));
+    }
+
     fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
@@ -175,7 +181,18 @@ impl Worker {
                     self.start(next as usize);
                 }
             }
+            Command::Seek(delta) => self.seek(delta),
             Command::Quit => {}
+        }
+    }
+
+    /// Move within the current track. Nothing playing has no position to move.
+    fn seek(&mut self, delta: f64) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if let Err(error) = session.seek(delta) {
+            self.set_error(Some(format!("{error:#}")));
         }
     }
 

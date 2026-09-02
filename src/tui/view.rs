@@ -9,8 +9,7 @@ use crate::tui::browser::Browser;
 use crate::tui::engine::{State, Status};
 
 const ACCENT: Color = Color::Cyan;
-const KEYS: &str =
-    " ↑↓ move   enter open   space play/pause   s stop   n/p track   r refresh   q quit";
+const KEYS: &str = " ↑↓ move   enter open   space play/pause   ,. seek 5s   s stop   n/p track   r refresh   q quit";
 
 pub fn draw(frame: &mut Frame, browser: &Browser, status: &Status) {
     let [top, debug, hints] = Layout::vertical([

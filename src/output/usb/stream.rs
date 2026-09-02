@@ -107,8 +107,16 @@ impl Engine {
     /// Copy queued DSD into one microframe, padding with DSD silence rather than zero so an
     /// underrun never drops the DAC out of lock.
     fn fill(&mut self, dst: &mut [u8]) {
-        let held =
-            self.state.silence.load(Ordering::Relaxed) || self.state.paused.load(Ordering::Relaxed);
+        if self.state.flush.swap(false, Ordering::AcqRel) {
+            let queued = self.consumer.slots();
+            if let Ok(stale) = self.consumer.read_chunk(queued) {
+                stale.commit_all();
+            }
+        }
+
+        let held = self.state.silence.load(Ordering::Relaxed)
+            || self.state.paused.load(Ordering::Relaxed)
+            || self.state.seeking.load(Ordering::Relaxed);
         if held {
             dst.fill(DSD_SILENCE_BYTE);
             return;

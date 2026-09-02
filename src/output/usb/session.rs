@@ -5,10 +5,10 @@
 //! different units -- DoP queues 24-bit words, native queues raw bytes.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rtrb::{Producer, RingBuffer};
@@ -19,7 +19,9 @@ use crate::output::stream::PlaybackState;
 use crate::output::usb::descriptors::NativeDsd;
 use crate::output::usb::device::{Dac, Held};
 use crate::output::usb::stream::NativeStream;
-use crate::player::{DeviceInfo, Progress, Target, TrackInfo};
+use crate::player::{
+    DeviceInfo, PARK, PREFILL_TIMEOUT, Progress, Target, TrackInfo, seek_position,
+};
 use crate::reader::{self, DsdSource};
 
 /// How long the DAC keeps receiving DSD silence after the music ends, so it does not pop.
@@ -31,6 +33,9 @@ const MIN_RING: usize = 1 << 16;
 struct FeedState {
     frames_written: AtomicU64,
     finished: AtomicBool,
+    /// Set to park the reader, so a seek can take the source and drop the queue knowing
+    /// nothing from the old position is still on its way.
+    seeking: AtomicBool,
 }
 
 /// What a native session is playing and where.
@@ -61,7 +66,11 @@ struct Feeder {
 }
 
 impl Feeder {
-    fn spawn(source: Box<dyn DsdSource>, producer: Producer<u8>, feed: Arc<FeedState>) -> Self {
+    fn spawn(
+        source: Arc<Mutex<Box<dyn DsdSource>>>,
+        producer: Producer<u8>,
+        feed: Arc<FeedState>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let handle = spawn_feeder(source, producer, feed, Arc::clone(&stop));
         Self {
@@ -88,6 +97,8 @@ impl Drop for Feeder {
 
 pub struct NativeSession {
     stream: NativeStream,
+    /// Shared with the reader thread, which gives it up whenever a seek asks for it.
+    source: Arc<Mutex<Box<dyn DsdSource>>>,
     feeder: Feeder,
     feed: Arc<FeedState>,
     state: Arc<PlaybackState>,
@@ -209,8 +220,9 @@ impl NativeSession {
         };
 
         let feed = Arc::new(FeedState::default());
+        let source = Arc::new(Mutex::new(source));
         // Anything below that returns early drops this, which stops and joins the reader.
-        let feeder = Feeder::spawn(source, producer, Arc::clone(&feed));
+        let feeder = Feeder::spawn(Arc::clone(&source), producer, Arc::clone(&feed));
 
         // Prefill before taking the device, so the first transfers carry music.
         let prefill = (capacity / frame_bytes / 2) as u64;
@@ -234,6 +246,7 @@ impl NativeSession {
 
         Ok(Self {
             stream,
+            source,
             feeder,
             feed,
             state,
@@ -250,6 +263,51 @@ impl NativeSession {
 
     pub fn is_paused(&self) -> bool {
         self.state.paused.load(Ordering::Relaxed)
+    }
+
+    /// Move the play position by `delta` seconds, clamped to the file.
+    ///
+    /// The engine sends DSD silence throughout, so the DAC keeps lock across the jump and
+    /// the seek costs it no relock.
+    pub fn seek(&self, delta: f64) -> Result<()> {
+        self.state.seeking.store(true, Ordering::Relaxed);
+        self.feed.seeking.store(true, Ordering::Relaxed);
+        let result = self.reposition(delta);
+        self.feed.seeking.store(false, Ordering::Relaxed);
+        self.await_prefill();
+        self.state.seeking.store(false, Ordering::Relaxed);
+        result
+    }
+
+    /// Take the source from the parked reader, move it, and drop the queue that was filled
+    /// from the old position, moving the counters with it.
+    fn reposition(&self, delta: f64) -> Result<()> {
+        let target = seek_position(
+            self.elapsed(),
+            delta,
+            self.info.format.rate,
+            self.info.bytes_per_channel,
+        );
+        let mut source = self.source.lock().unwrap_or_else(PoisonError::into_inner);
+        let reached = source.seek(target)?;
+        self.state.drop_queued();
+        let frames = reached / native::BYTES_PER_SUBSLOT as u64;
+        self.state.frames_played.store(frames, Ordering::Relaxed);
+        self.feed.frames_written.store(frames, Ordering::Relaxed);
+        self.feed.finished.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Let the reader get ahead again before the queue is served, so a seek does not land as
+    /// an underrun. Bounded, because a seek to the end of the file never fills the queue.
+    fn await_prefill(&self) {
+        let deadline = Instant::now() + PREFILL_TIMEOUT;
+        while self.progress().queued_frames < self.queue_frames / 4
+            && !self.feed.finished.load(Ordering::Relaxed)
+            && Instant::now() < deadline
+        {
+            thread::sleep(PARK);
+        }
     }
 
     pub fn track(&self) -> TrackInfo {
@@ -330,17 +388,20 @@ impl NativeSession {
 }
 
 fn spawn_feeder(
-    mut source: Box<dyn DsdSource>,
+    source: Arc<Mutex<Box<dyn DsdSource>>>,
     mut producer: Producer<u8>,
     feed: Arc<FeedState>,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<Result<()>> {
     thread::spawn(move || {
-        let channels = source.format().channels as usize;
-        let mut planes: Vec<Box<[u8]>> = vec![vec![0; source.chunk_bytes()].into(); channels];
+        let (channels, chunk_bytes) = {
+            let source = source.lock().unwrap_or_else(PoisonError::into_inner);
+            (source.format().channels as usize, source.chunk_bytes())
+        };
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; chunk_bytes].into(); channels];
         let mut packed = Vec::new();
         let result = feed_loop(
-            &mut source,
+            &source,
             &mut producer,
             &feed,
             &stop,
@@ -352,42 +413,68 @@ fn spawn_feeder(
     })
 }
 
+/// Read, pack, and queue until the file ends or `stop` is set.
+///
+/// The source stays locked for as long as a chunk is in flight, so a seek that takes it back
+/// knows nothing read from the old position is still on its way to the queue. Both waits give
+/// it up as soon as a seek asks.
 fn feed_loop(
-    source: &mut Box<dyn DsdSource>,
+    source: &Mutex<Box<dyn DsdSource>>,
     producer: &mut Producer<u8>,
     feed: &FeedState,
     stop: &AtomicBool,
     planes: &mut [Box<[u8]>],
     packed: &mut Vec<u8>,
 ) -> Result<()> {
-    let channels = source.format().channels as usize;
-    let frame_bytes = native::frame_bytes(channels);
+    let frame_bytes = native::frame_bytes(planes.len());
     while !stop.load(Ordering::Relaxed) {
+        if feed.seeking.load(Ordering::Relaxed) {
+            thread::sleep(PARK);
+            continue;
+        }
+        let mut source = source.lock().unwrap_or_else(PoisonError::into_inner);
         let count = source.read(planes)?;
         if count == 0 {
-            return Ok(());
+            // The end of the file, not the end of the thread: a seek back into the track
+            // still has to find a reader.
+            feed.finished.store(true, Ordering::Relaxed);
+            drop(source);
+            thread::sleep(PARK);
+            continue;
         }
         packed.clear();
         let slices: Vec<&[u8]> = planes.iter().map(|plane| &plane[..count]).collect();
         native::pack_planes(&slices, packed);
+        queue(producer, feed, stop, packed, frame_bytes)?;
+    }
+    Ok(())
+}
 
-        let mut offset = 0;
-        while offset < packed.len() {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let free = producer.slots();
-            if free == 0 {
-                thread::sleep(Duration::from_millis(2));
-                continue;
-            }
-            let take = free.min(packed.len() - offset);
-            let chunk = producer.write_chunk_uninit(take)?;
-            chunk.fill_from_iter(packed[offset..offset + take].iter().copied());
-            offset += take;
-            feed.frames_written
-                .fetch_add((take / frame_bytes) as u64, Ordering::Relaxed);
+/// Hand `packed` to the ring, waiting for room. A stop or a seek gives up on whatever is
+/// left, which the queue it would have joined is dropping anyway.
+fn queue(
+    producer: &mut Producer<u8>,
+    feed: &FeedState,
+    stop: &AtomicBool,
+    packed: &[u8],
+    frame_bytes: usize,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < packed.len() {
+        if stop.load(Ordering::Relaxed) || feed.seeking.load(Ordering::Relaxed) {
+            return Ok(());
         }
+        let free = producer.slots();
+        if free == 0 {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let take = free.min(packed.len() - offset);
+        let chunk = producer.write_chunk_uninit(take)?;
+        chunk.fill_from_iter(packed[offset..offset + take].iter().copied());
+        offset += take;
+        feed.frames_written
+            .fetch_add((take / frame_bytes) as u64, Ordering::Relaxed);
     }
     Ok(())
 }
