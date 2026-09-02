@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::dsd::{BitOrder, DsdFormat, DsdRate};
+use crate::reader::tags::{TrackTags, parse_diin};
 use crate::reader::{DsdSource, read_available};
 
 const CHUNK_BYTES: usize = 4096;
@@ -16,6 +17,7 @@ pub struct DffReader<R> {
     data_start: u64,
     emitted: u64,
     scratch: Vec<u8>,
+    tags: TrackTags,
 }
 
 struct ChunkHeader {
@@ -58,43 +60,83 @@ impl<R: Read + Seek + Send + 'static> DffReader<R> {
         ensure!(&form[0..4] == b"FRM8", "missing FRM8 chunk");
         ensure!(&form[12..16] == b"DSD ", "not a DSD form type");
 
-        let mut rate = None;
-        let mut channels = None;
+        let mut walk = Walk::default();
+        let scan = walk.run(&mut inner);
+        // A file that ends mid-chunk after the audio still plays the audio it has, so only a
+        // failure before the sound data was found is worth refusing the file over.
+        if walk.sound.is_none() {
+            scan?;
+        }
+
+        let (data_start, data_bytes) = walk.sound.context("no DSD sound data chunk found")?;
+        let rate = walk.rate.context("no FS chunk giving the sample rate")?;
+        let channels = walk
+            .channels
+            .context("no CHNL chunk giving the channel count")?;
+        inner.seek(SeekFrom::Start(data_start))?;
+        Ok(Self {
+            inner,
+            format: DsdFormat {
+                rate: DsdRate::new(rate),
+                channels,
+            },
+            audio_bytes_per_channel: data_bytes / u64::from(channels),
+            data_start,
+            emitted: 0,
+            scratch: vec![0; CHUNK_BYTES * channels as usize],
+            tags: walk.tags,
+        })
+    }
+}
+
+/// What one pass over the chunks in a DSDIFF form collects.
+#[derive(Default)]
+struct Walk {
+    rate: Option<u32>,
+    channels: Option<u16>,
+    /// Where the sound data body starts, and how many bytes it declares.
+    sound: Option<(u64, u64)>,
+    tags: TrackTags,
+}
+
+impl Walk {
+    /// Read every chunk in the form. The edited-master information sits either side of the
+    /// sound data, so this runs to the end of the file rather than stopping at the audio.
+    /// Stepping over the audio is a seek, and a seek past a truncated file ends the walk.
+    fn run<R: Read + Seek>(&mut self, inner: &mut R) -> Result<()> {
         loop {
-            let Some(chunk) = read_chunk_header(&mut inner)? else {
-                bail!("no DSD sound data chunk found");
+            let Some(chunk) = read_chunk_header(inner)? else {
+                return Ok(());
             };
             match &chunk.id {
                 b"PROP" => {
-                    let body = read_exact_vec(&mut inner, chunk.size as usize)?;
-                    let (found_rate, found_channels) = parse_properties(&body)?;
-                    rate = found_rate;
-                    channels = found_channels;
-                    if chunk.size % 2 == 1 {
-                        inner.read_exact(&mut [0_u8; 1])?;
-                    }
+                    let body = self.read_body(inner, chunk.size)?;
+                    let (rate, channels) = parse_properties(&body)?;
+                    self.rate = rate;
+                    self.channels = channels;
+                }
+                b"DIIN" => {
+                    let body = self.read_body(inner, chunk.size)?;
+                    parse_diin(&body, &mut self.tags);
                 }
                 b"DSD " => {
-                    let rate = rate.context("sound data reached before the FS chunk")?;
-                    let channels = channels.context("sound data reached before the CHNL chunk")?;
-                    let format = DsdFormat {
-                        rate: DsdRate::new(rate),
-                        channels,
-                    };
-                    let data_start = inner.stream_position()?;
-                    return Ok(Self {
-                        inner,
-                        format,
-                        audio_bytes_per_channel: chunk.size / u64::from(channels),
-                        data_start,
-                        emitted: 0,
-                        scratch: vec![0; CHUNK_BYTES * channels as usize],
-                    });
+                    let start = inner.stream_position()?;
+                    self.sound = Some((start, chunk.size));
+                    inner.seek(SeekFrom::Start(start + chunk.size + chunk.size % 2))?;
                 }
                 b"DST " => bail!("DST compressed DSDIFF is not supported"),
-                _ => skip(&mut inner, chunk.size)?,
+                _ => skip(inner, chunk.size)?,
             }
         }
+    }
+
+    /// Read a chunk body and step over the pad byte an odd-length one carries.
+    fn read_body<R: Read>(&self, inner: &mut R, size: u64) -> Result<Vec<u8>> {
+        let body = read_exact_vec(inner, size as usize)?;
+        if size % 2 == 1 {
+            inner.read_exact(&mut [0_u8; 1])?;
+        }
+        Ok(body)
     }
 }
 
@@ -161,6 +203,10 @@ impl<R: Read + Seek + Send + 'static> DsdSource for DffReader<R> {
 
     fn chunk_bytes(&self) -> usize {
         CHUNK_BYTES
+    }
+
+    fn tags(&self) -> &TrackTags {
+        &self.tags
     }
 
     fn read(&mut self, planes: &mut [Box<[u8]>]) -> Result<usize> {
@@ -238,6 +284,20 @@ mod tests {
         dff_file_with(b"DSD ", samples)
     }
 
+    /// Put an edited-master information chunk after the audio, where the spec allows it and
+    /// a walk that stopped at the sound data would never see it.
+    fn dff_file_tagged_after_the_audio(samples: &[u8]) -> Vec<u8> {
+        let mut text = Vec::from(11_u32.to_be_bytes());
+        text.extend_from_slice(b"Peace Piece");
+        let diin = chunk(b"DIIN", &chunk(b"DITI", &text));
+
+        let mut file = dff_file(samples);
+        file.extend_from_slice(&diin);
+        let body = (file.len() - 12) as u64;
+        file[4..12].copy_from_slice(&body.to_be_bytes());
+        file
+    }
+
     #[test]
     fn interleaved_bytes_are_split_into_channel_planes() {
         let samples: Vec<u8> = (0..64_u8).collect();
@@ -289,6 +349,34 @@ mod tests {
 
         assert_eq!(reached, 32);
         assert_eq!(reader.read(&mut planes).expect("reads"), 0);
+    }
+
+    #[test]
+    fn an_information_chunk_after_the_audio_still_names_the_recording() {
+        let samples: Vec<u8> = (0..64_u8).collect();
+        let file = dff_file_tagged_after_the_audio(&samples);
+
+        let mut reader = DffReader::new(Cursor::new(file)).expect("parses");
+
+        assert_eq!(reader.tags().title.as_deref(), Some("Peace Piece"));
+        // The read position still starts at the audio, not at whatever the walk ended on.
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; reader.chunk_bytes()].into(); 2];
+        let count = reader.read(&mut planes).expect("reads");
+        assert_eq!(count, 32);
+        assert_eq!(planes[0][0], 0);
+    }
+
+    #[test]
+    fn a_file_ending_mid_chunk_after_the_audio_still_plays() {
+        let samples: Vec<u8> = (0..64_u8).collect();
+        let mut file = dff_file_tagged_after_the_audio(&samples);
+        file.truncate(file.len() - 6);
+
+        let mut reader = DffReader::new(Cursor::new(file)).expect("parses");
+
+        assert_eq!(reader.total_bytes_per_channel(), 32);
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; reader.chunk_bytes()].into(); 2];
+        assert_eq!(reader.read(&mut planes).expect("reads"), 32);
     }
 
     #[test]

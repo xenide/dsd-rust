@@ -8,7 +8,7 @@ are stored in the file, wrapped in DSD over PCM (DoP) 1.1.
 ```
 dsd-rust devices                       # output devices, and the DSD rates they accept
 dsd-rust devices --formats             # plus every stream format each device advertises
-dsd-rust info track.dsf                # container, rate, channels, duration
+dsd-rust info track.dsf                # tags, container, rate, channels, duration
 dsd-rust play track.dsf                # play on the default output device
 dsd-rust play *.dsf --device "D50"     # pick a device by name fragment or UID
 dsd-rust tui ~/Music/dsd               # browse, play, and watch the transport
@@ -24,10 +24,32 @@ Files play in the order given, and the device is resolved once for the whole lis
 device exclusively moves the system default output elsewhere, so re-resolving between tracks
 would pick the wrong one. Tracks may mix DSD rates; the device is reconfigured for each.
 
+## Tags
+
+Both containers can name the recording, and `info`, the file browser, and the transport all
+show what they carry. DSF files keep an ID3v2 tag past the audio; DSDIFF files keep the
+artist and title in an edited-master information chunk, which may sit either side of the
+sound data. Only the title, artist, album, and track number are read: artwork and the rest
+of a tag are skipped. A file with no tags, or one whose tag will not parse, still lists and plays
+under its filename.
+
+```
+dsd-rust info track.dsf
+track.dsf
+    title       So What
+    artist      Miles Davis
+    album       Kind of Blue
+    track       1
+    container   DSF
+    format      DSD64 (2.8224 MHz), 2 ch
+```
+
 ## Terminal UI
 
 `dsd-rust tui [dir]` opens a file browser over `dir` (the working directory by default),
-showing folders and DSD files only. It takes the same `--device`, `--shared`, `--buffer-ms`,
+showing folders and DSD files only. A tagged file lists under its track number and title, an
+untagged one under its filename, and either way the pane keeps the order the files sort in on
+disk. It takes the same `--device`, `--shared`, `--buffer-ms`,
 and `--buffer-frames` options as `play`.
 
 ```
@@ -42,7 +64,9 @@ Playing a file queues the whole folder from that file on, in the order the pane 
 Pausing and seeking keep the DAC fed with DoP silence rather than stopping the stream, so the
 DAC holds DSD lock and neither costs a relock. Seeking drops what is queued and restarts the
 reader at the new position, so the jump takes about as long as it takes to refill. The debug
-pane shows what the device settled on and what the transport is doing right now:
+pane shows what the device settled on and what the transport is doing right now. Above it the
+transport names the recording, artist and title with the album beneath, falling back to the
+filename for a file that carries no tags:
 
 ```
 device     Topping D50  exclusive, mixing off

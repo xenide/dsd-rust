@@ -2,10 +2,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::reader;
+
 /// One row of the file pane: a folder to descend into, or a file this player can open.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
+    /// What the file's tags call it, when it carries any.
+    pub title: Option<String>,
     pub path: PathBuf,
     pub is_dir: bool,
 }
@@ -93,9 +97,21 @@ fn read_dir(dir: &Path) -> Result<Vec<Entry>> {
         }
         let path = entry.path();
         let is_dir = path.is_dir();
-        if is_dir || is_dsd_file(&path) {
-            entries.push(Entry { name, path, is_dir });
+        if !is_dir && !is_dsd_file(&path) {
+            continue;
         }
+        // A file that will not open, or carries no tags, still lists under its own name.
+        let title = if is_dir {
+            None
+        } else {
+            reader::tags_of(&path).ok().and_then(|tags| tags.label())
+        };
+        entries.push(Entry {
+            name,
+            title,
+            path,
+            is_dir,
+        });
     }
     entries.sort_by(|a, b| {
         b.is_dir
@@ -107,6 +123,7 @@ fn read_dir(dir: &Path) -> Result<Vec<Entry>> {
             0,
             Entry {
                 name: "..".to_owned(),
+                title: None,
                 path: parent.to_path_buf(),
                 is_dir: true,
             },
@@ -127,6 +144,7 @@ fn is_dsd_file(path: &Path) -> bool {
 mod tests {
     use std::fs;
 
+    use crate::reader::dsf::tests::dsf_file_with_tag;
     use crate::tui::browser::{Browser, read_dir};
 
     fn fixture() -> tempfile::TempDir {
@@ -173,6 +191,19 @@ mod tests {
         browser.enter(dir.path().to_path_buf());
 
         assert_eq!(browser.selection().expect("album row").path, album);
+    }
+
+    #[test]
+    fn a_tagged_file_lists_under_its_title_and_an_untagged_one_under_its_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("01.dsf"), dsf_file_with_tag("So What")).expect("tagged");
+        fs::write(dir.path().join("02.dsf"), b"not a dsd file at all").expect("untagged");
+
+        let entries = read_dir(dir.path()).expect("reads");
+
+        let titles: Vec<Option<&str>> =
+            entries.iter().map(|entry| entry.title.as_deref()).collect();
+        assert_eq!(titles, [None, Some("So What"), None]);
     }
 
     #[test]

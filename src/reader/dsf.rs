@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use anyhow::{Result, bail, ensure};
 
 use crate::dsd::{BitOrder, DsdFormat, DsdRate};
+use crate::reader::tags::{TrackTags, read_id3v2};
 use crate::reader::{DsdSource, read_available};
 
 const DSD_CHUNK_LEN: usize = 28;
@@ -21,6 +22,7 @@ pub struct DsfReader<R> {
     data_start: u64,
     emitted: u64,
     scratch: Vec<u8>,
+    tags: TrackTags,
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
@@ -92,6 +94,18 @@ impl<R: Read + Seek + Send + 'static> DsfReader<R> {
         ensure!(audio_bytes_per_channel > 0, "no audio in data chunk");
 
         let data_start = inner.stream_position()?;
+        // The DSD chunk points at an ID3v2 tag past the audio, or at nothing when the file
+        // carries none. Reading it moves the cursor, so the audio position is set back after.
+        let metadata_start = u64_at(&header, 20);
+        let tags = match metadata_start {
+            0 => TrackTags::default(),
+            offset => {
+                let tags = read_id3v2(&mut inner, offset)?;
+                inner.seek(SeekFrom::Start(data_start))?;
+                tags
+            }
+        };
+
         let channels = u16::try_from(channels).expect("channel count fits u16");
         Ok(Self {
             inner,
@@ -105,6 +119,7 @@ impl<R: Read + Seek + Send + 'static> DsfReader<R> {
             data_start,
             emitted: 0,
             scratch: vec![0; block_bytes * channels as usize],
+            tags,
         })
     }
 }
@@ -124,6 +139,10 @@ impl<R: Read + Seek + Send + 'static> DsdSource for DsfReader<R> {
 
     fn chunk_bytes(&self) -> usize {
         self.block_bytes
+    }
+
+    fn tags(&self) -> &TrackTags {
+        &self.tags
     }
 
     fn read(&mut self, planes: &mut [Box<[u8]>]) -> Result<usize> {
@@ -173,6 +192,7 @@ pub(crate) mod tests {
     use crate::dsd::{DSD_SILENCE_BYTE, DsdRate};
     use crate::reader::DsdSource;
     use crate::reader::dsf::DsfReader;
+    use crate::reader::tags::TrackTags;
 
     pub(crate) const BLOCK: usize = 8;
 
@@ -212,6 +232,26 @@ pub(crate) mod tests {
                 }
             }
         }
+        file
+    }
+
+    /// Append an ID3v2.3 tag holding one title frame, and point the DSD chunk at it.
+    pub(crate) fn dsf_file_with_tag(title: &str) -> Vec<u8> {
+        let mut file = dsf_file(8, 96, 2);
+        let mut frames = Vec::new();
+        frames.extend_from_slice(b"TIT2");
+        frames.extend_from_slice(&((title.len() + 1) as u32).to_be_bytes());
+        frames.extend_from_slice(&[0, 0, 0]);
+        frames.extend_from_slice(title.as_bytes());
+
+        let start = file.len() as u64;
+        file[20..28].copy_from_slice(&start.to_le_bytes());
+        file.extend_from_slice(b"ID3");
+        file.extend_from_slice(&[3, 0, 0]);
+        for shift in [21, 14, 7, 0] {
+            file.push(((frames.len() as u32 >> shift) & 0x7F) as u8);
+        }
+        file.extend_from_slice(&frames);
         file
     }
 
@@ -309,6 +349,22 @@ pub(crate) mod tests {
         let reached = reader.seek(u64::MAX).expect("seeks");
 
         assert_eq!(reached, BLOCK as u64);
+    }
+
+    #[test]
+    fn a_tag_past_the_audio_is_read_without_moving_the_read_position() {
+        let mut reader = DsfReader::new(Cursor::new(dsf_file_with_tag("So What"))).expect("parses");
+
+        assert_eq!(reader.tags().title.as_deref(), Some("So What"));
+        let planes = drain(&mut reader);
+        assert_eq!(planes[0], (0..12_u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_file_pointing_at_no_metadata_reads_as_no_tags() {
+        let reader = DsfReader::new(Cursor::new(dsf_file(8, 96, 2))).expect("parses");
+
+        assert_eq!(reader.tags(), &TrackTags::default());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
 use crate::output::usb::device::Held;
 use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
+use crate::reader::tags::TrackTags;
 use crate::reader::{self, DsdSource};
 use anyhow::{Context, Result, bail};
 use rtrb::{Producer, RingBuffer};
@@ -133,6 +134,7 @@ struct FeedState {
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
     pub container: &'static str,
+    pub tags: TrackTags,
     pub format: DsdFormat,
     pub duration: f64,
     pub total_frames: u64,
@@ -201,6 +203,7 @@ impl Session {
         let pcm_rate = format.rate.dop_pcm_rate();
         let track = TrackInfo {
             container: source.container(),
+            tags: source.tags().clone(),
             format,
             duration: source.duration_secs(),
             total_frames: source.total_bytes_per_channel() / 2,
