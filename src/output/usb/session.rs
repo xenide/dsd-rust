@@ -39,50 +39,89 @@ pub struct NativeInfo {
     pub container: &'static str,
     pub duration: f64,
     pub frame_rate: u32,
-    pub total_frames: u64,
+    /// Straight from the reader. `total_frames` divides it, so storing the frame count
+    /// instead would round a file that is not a whole number of frames down.
+    pub bytes_per_channel: u64,
+}
+
+impl NativeInfo {
+    const fn total_frames(&self) -> u64 {
+        self.bytes_per_channel / native::BYTES_PER_SUBSLOT as u64
+    }
+}
+
+/// The reader thread filling the ring, stopped and joined when this is dropped.
+///
+/// It owns its own stop flag rather than sharing the caller's: the caller's carries a
+/// Ctrl-C, and clearing that on the way out would swallow the interrupt.
+struct Feeder {
+    handle: Option<JoinHandle<Result<()>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Feeder {
+    fn spawn(source: Box<dyn DsdSource>, producer: Producer<u8>, feed: Arc<FeedState>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_feeder(source, producer, feed, Arc::clone(&stop));
+        Self {
+            handle: Some(handle),
+            stop,
+        }
+    }
+
+    /// Stop reading and wait, returning what the reader ended with.
+    fn join(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.handle.take() {
+            Some(handle) => handle.join().unwrap_or_else(|_| Ok(())),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Feeder {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
 }
 
 pub struct NativeSession {
     stream: NativeStream,
-    feeder: Option<JoinHandle<Result<()>>>,
+    feeder: Feeder,
     feed: Arc<FeedState>,
-    stop: Arc<AtomicBool>,
     state: Arc<PlaybackState>,
     queue_frames: u64,
     pub info: NativeInfo,
 }
 
-/// Pick the DAC to play to: the one whose name matches, or the only one present.
-pub fn find_dac(query: Option<&str>) -> Result<Dac> {
+/// Pick the DAC the resolved target names.
+///
+/// `device_name` is the Core Audio name the target resolved to, and `query` is what the user
+/// typed, which may be a fragment or a UID. Either can name the DAC, so both are tried --
+/// but nothing else is: falling back to "the only DAC attached" would stream to a device the
+/// user did not choose.
+pub fn find_dac(query: Option<&str>, device_name: &str) -> Result<Dac> {
     let mut dacs = Dac::discover()?;
     if dacs.is_empty() {
         bail!("no attached USB DAC advertises a native DSD alternate setting");
     }
-    let Some(query) = query else {
-        if dacs.len() > 1 {
-            let names: Vec<&str> = dacs.iter().map(|dac| dac.name.as_str()).collect();
-            bail!(
-                "several DACs can play native DSD ({}); name one with --device",
-                names.join(", ")
-            );
-        }
-        return Ok(dacs.remove(0));
-    };
 
-    let needle = query.to_lowercase();
-    let found = dacs
-        .iter()
-        .position(|dac| dac.name.to_lowercase().contains(&needle));
-    match found {
-        Some(index) => Ok(dacs.remove(index)),
-        None => {
-            let names: Vec<&str> = dacs.iter().map(|dac| dac.name.as_str()).collect();
-            bail!(
-                "no native DSD device matches {query:?}; available: {}",
-                names.join(", ")
-            )
+    let mut found = None;
+    for name in query.into_iter().chain([device_name]) {
+        found = dacs.iter().position(|dac| dac.matches(name));
+        if found.is_some() {
+            break;
         }
     }
+    let Some(index) = found else {
+        let names: Vec<&str> = dacs.iter().map(|dac| dac.name.as_str()).collect();
+        bail!(
+            "{device_name} is not a USB DAC that plays native DSD; these are, and \
+             --device names one: {}",
+            names.join(", ")
+        );
+    };
+    Ok(dacs.remove(index))
 }
 
 impl NativeSession {
@@ -90,6 +129,7 @@ impl NativeSession {
     pub fn open(
         path: &Path,
         query: Option<&str>,
+        device_name: &str,
         buffer_ms: u32,
         stop: &Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -98,8 +138,18 @@ impl NativeSession {
         let channels = format.channels as usize;
         let dsd_rate = format.rate.hz();
 
-        let dac = find_dac(query)?;
-        let max = dac.native.max_dsd_rate(format.channels.into());
+        let dac = find_dac(query, device_name)?;
+        // The alternate setting has a fixed channel count. Sending any other count would put
+        // each channel's subslots where the DAC expects a different channel's.
+        if format.channels != u16::from(dac.native.channels) {
+            bail!(
+                "{}: its native DSD path carries {} channels, but this file has {}",
+                dac.name,
+                dac.native.channels,
+                format.channels
+            );
+        }
+        let max = dac.native.max_dsd_rate();
         if dsd_rate > max {
             bail!(
                 "{}: native endpoint carries at most {:.4} MHz per channel, but this file is {}",
@@ -122,19 +172,25 @@ impl NativeSession {
             container: source.container(),
             duration: source.duration_secs(),
             frame_rate: format.rate.native_frame_rate(),
-            total_frames: source.total_bytes_per_channel() / native::BYTES_PER_SUBSLOT as u64,
+            bytes_per_channel: source.total_bytes_per_channel(),
         };
 
         let feed = Arc::new(FeedState::default());
-        let feeder = spawn_feeder(source, producer, Arc::clone(&feed), Arc::clone(stop));
+        // Anything below that returns early drops this, which stops and joins the reader.
+        let feeder = Feeder::spawn(source, producer, Arc::clone(&feed));
 
         // Prefill before taking the device, so the first transfers carry music.
         let target = (capacity / frame_bytes / 2) as u64;
-        while feed.frames_written.load(Ordering::Relaxed) < target.min(info.total_frames)
+        while feed.frames_written.load(Ordering::Relaxed) < target.min(info.total_frames())
             && !feed.finished.load(Ordering::Relaxed)
             && !stop.load(Ordering::Relaxed)
         {
             thread::sleep(Duration::from_millis(5));
+        }
+        // Claiming the DAC re-enumerates it and then races usbaudiod for its interfaces,
+        // which is not worth starting for a track that has already been cancelled.
+        if stop.load(Ordering::Relaxed) {
+            bail!("{name}: interrupted before the DAC was claimed");
         }
 
         let held = dac
@@ -146,9 +202,8 @@ impl NativeSession {
 
         Ok(Self {
             stream,
-            feeder: Some(feeder),
+            feeder,
             feed,
-            stop: Arc::clone(stop),
             state,
             queue_frames: (capacity / frame_bytes) as u64,
             info,
@@ -170,8 +225,8 @@ impl NativeSession {
             container: self.info.container,
             format: self.info.format,
             duration: self.info.duration,
-            total_frames: self.info.total_frames,
-            bytes_per_channel: self.info.total_frames * native::BYTES_PER_SUBSLOT as u64,
+            total_frames: self.info.total_frames(),
+            bytes_per_channel: self.info.bytes_per_channel,
         }
     }
 
@@ -204,7 +259,7 @@ impl NativeSession {
 
     pub fn elapsed(&self) -> f64 {
         let played = self.state.frames_played.load(Ordering::Relaxed);
-        played.min(self.info.total_frames) as f64 / f64::from(self.info.frame_rate)
+        played.min(self.info.total_frames()) as f64 / f64::from(self.info.frame_rate)
     }
 
     pub fn underrun_frames(&self) -> u64 {
@@ -227,23 +282,7 @@ impl NativeSession {
         self.state.silence.store(true, Ordering::Relaxed);
         thread::sleep(TAIL);
         self.stream.stop();
-        self.stop.store(true, Ordering::Relaxed);
-        let result = match self.feeder.take() {
-            Some(feeder) => feeder.join().unwrap_or_else(|_| Ok(())),
-            None => Ok(()),
-        };
-        self.stop.store(false, Ordering::Relaxed);
-        result
-    }
-}
-
-impl Drop for NativeSession {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(feeder) = self.feeder.take() {
-            let _ = feeder.join();
-        }
-        self.stop.store(false, Ordering::Relaxed);
+        self.feeder.join()
     }
 }
 
@@ -308,4 +347,41 @@ fn feed_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dsd::{DsdFormat, DsdRate};
+    use crate::output::usb::session::NativeInfo;
+
+    fn info(bytes_per_channel: u64) -> NativeInfo {
+        NativeInfo {
+            name: "Cayin RU7".to_owned(),
+            format: DsdFormat {
+                rate: DsdRate::new(11_289_600),
+                channels: 2,
+            },
+            container: "DSF",
+            duration: 1.0,
+            frame_rate: 352_800,
+            bytes_per_channel,
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_whole_number_of_frames_keeps_every_byte_it_has() {
+        // One byte short of 101 frames: the frame count floors, the byte count must not.
+        let info = info(403);
+
+        assert_eq!(info.total_frames(), 100);
+        assert_eq!(info.bytes_per_channel, 403);
+    }
+
+    #[test]
+    fn a_whole_number_of_frames_reports_four_bytes_each() {
+        let info = info(404);
+
+        assert_eq!(info.total_frames(), 101);
+        assert_eq!(info.bytes_per_channel, 404);
+    }
 }

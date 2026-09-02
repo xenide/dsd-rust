@@ -59,20 +59,16 @@ pub fn list_devices() -> Result<Vec<DeviceSummary>> {
 /// rate counts here only when 32 DSD bits per frame lands on a real DSD rate, which is what
 /// separates 352800 Hz carrying DSD256 from 352800 Hz carrying PCM.
 fn native_rates(dacs: &[Dac], core_audio_name: &str) -> Vec<u32> {
-    let haystack = core_audio_name.to_lowercase();
-    // Core Audio and USB name the same device differently -- "Cayin RU7 Playback" against
-    // "Cayin RU7" -- so match whichever name contains the other.
-    let Some(dac) = dacs.iter().find(|dac| {
-        let usb = dac.name.to_lowercase();
-        !usb.is_empty() && (haystack.contains(&usb) || usb.contains(&haystack))
-    }) else {
+    let Some(dac) = dacs.iter().find(|dac| dac.matches(core_audio_name)) else {
         return Vec::new();
     };
     let Ok(clock) = dac.clock_rates() else {
         return Vec::new();
     };
 
-    let bandwidth = dac.native.max_dsd_rate(2);
+    // The endpoint's own channel count, not an assumed stereo: a rate listed here has to be
+    // one `NativeSession::open` will actually accept.
+    let bandwidth = dac.native.max_dsd_rate();
     let mut rates = Vec::new();
     for frame in clock {
         let hz = frame.saturating_mul(32);

@@ -9,6 +9,7 @@
 
 use std::ffi::{CString, c_void};
 use std::ptr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -44,6 +45,17 @@ macro_rules! call {
             .expect(concat!("IOKit vtable provides ", stringify!($method)));
         method($iface.cast::<c_void>() $(, $arg)*)
     }};
+}
+
+/// Whether a USB product name and some other name refer to the same device.
+///
+/// Core Audio and USB report different names for one device -- "Cayin RU7 Playback" against
+/// "Cayin RU7" -- and either may be the longer of the two, so whichever contains the other
+/// counts. Matching only one way rejects the very name the `devices` command prints.
+fn names_match(usb: &str, query: &str) -> bool {
+    let usb = usb.trim().to_lowercase();
+    let query = query.trim().to_lowercase();
+    !usb.is_empty() && !query.is_empty() && (query.contains(&usb) || usb.contains(&query))
 }
 
 fn ok(result: sys::IOReturn, what: &str) -> Result<()> {
@@ -164,6 +176,11 @@ impl Dac {
         }
     }
 
+    /// True when `query` names this DAC.
+    pub fn matches(&self, query: &str) -> bool {
+        names_match(&self.name, query)
+    }
+
     /// Force a re-enumeration, win the race for both audio interfaces, and hold them.
     pub fn acquire(self) -> Result<Held> {
         // SAFETY: every raw pointer below is checked before use and released on every path.
@@ -174,19 +191,12 @@ impl Dac {
 
             // Opening the device itself is allowed even while usbaudiod holds the
             // interfaces, and that is enough to ask for a re-enumeration.
-            let mut opened = call!(device, USBDeviceOpen);
-            if opened != sys::kIOReturnSuccess as sys::IOReturn {
-                opened = call!(device, USBDeviceOpenSeize);
-            }
-            if opened == sys::kIOReturnSuccess as sys::IOReturn {
-                let reenumerated = call!(device, USBDeviceReEnumerate, 0);
-                call!(device, USBDeviceClose);
-                ok(reenumerated, "USBDeviceReEnumerate")?;
-            } else {
-                debug!(
+            match reenumerate(device) {
+                Some(result) => ok(result, "USBDeviceReEnumerate")?,
+                None => debug!(
                     "{}: cannot re-enumerate; racing on the current device",
                     self.name
-                );
+                ),
             }
             call!(device, Release);
 
@@ -216,13 +226,13 @@ impl Dac {
                     streaming = open_interface(device, self.native.streaming_interface);
                 }
                 if let (Some(control), Some(streaming)) = (control, streaming) {
-                    return Ok(Held {
+                    return Ok(Held::claim(
                         device,
                         control,
                         streaming,
-                        native: self.native,
-                        name: self.name.clone(),
-                    });
+                        self.native,
+                        self.name.clone(),
+                    ));
                 }
                 call!(device, Release);
             }
@@ -255,7 +265,6 @@ impl Drop for Dac {
 /// Both audio interfaces of one DAC, held open so `usbaudiod` cannot take them back.
 pub struct Held {
     device: DeviceRef,
-    control: InterfaceRef,
     streaming: InterfaceRef,
     pub native: NativeDsd,
     pub name: String,
@@ -265,6 +274,33 @@ pub struct Held {
 unsafe impl Send for Held {}
 
 impl Held {
+    /// Take ownership of the interfaces and record them where a signal handler can find
+    /// them, so the DAC is handed back even on a path that runs no destructors.
+    fn claim(
+        device: DeviceRef,
+        control: InterfaceRef,
+        streaming: InterfaceRef,
+        native: NativeDsd,
+        name: String,
+    ) -> Self {
+        // Reaching here means `race` just opened both interfaces, which the previous holder
+        // must therefore have closed. So an entry still sitting here belongs to a `Held`
+        // that leaked, and handing that DAC back beats dropping its refs on the floor.
+        release_claimed_dac();
+        *CLAIMED.lock().unwrap_or_else(|error| error.into_inner()) = Some(Claim {
+            device,
+            control,
+            streaming,
+            name: name.clone(),
+        });
+        Self {
+            device,
+            streaming,
+            native,
+            name,
+        }
+    }
+
     /// Select the native DSD alternate setting and set the clock, returning what the DAC
     /// reports back. A DAC that accepts the request but reports a different rate has not
     /// done what was asked, so the readback is checked rather than assumed.
@@ -397,34 +433,81 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        // SAFETY: every pointer here was created in `race` and is released exactly once.
-        unsafe {
-            call!(self.streaming, SetAlternateInterface, 0);
-            call!(self.streaming, USBInterfaceClose);
-            call!(self.streaming, Release);
-            call!(self.control, USBInterfaceClose);
-            call!(self.control, Release);
+        release_claimed_dac();
+    }
+}
 
-            // Closing the interfaces is not enough on its own. usbaudiod only looks at a
-            // device when it enumerates, so a device it lost stays lost: the DAC would
-            // vanish from Core Audio until physically replugged. Re-enumerating puts it
-            // through the normal matching path again and the daemon picks it back up.
-            let mut opened = call!(self.device, USBDeviceOpen);
-            if opened != sys::kIOReturnSuccess as sys::IOReturn {
-                opened = call!(self.device, USBDeviceOpenSeize);
-            }
-            if opened == sys::kIOReturnSuccess as sys::IOReturn {
-                let result = call!(self.device, USBDeviceReEnumerate, 0);
-                call!(self.device, USBDeviceClose);
-                if result != sys::kIOReturnSuccess as sys::IOReturn {
-                    debug!(
-                        "{}: could not hand the device back: 0x{result:08x}",
-                        self.name
-                    );
-                }
-            }
-            call!(self.device, Release);
+/// The refs needed to hand one DAC back, kept where a signal handler can reach them.
+struct Claim {
+    device: DeviceRef,
+    control: InterfaceRef,
+    streaming: InterfaceRef,
+    name: String,
+}
+
+// SAFETY: the refs are only ever touched under CLAIMED, and `release_claimed_dac` takes the
+// entry before using them, so whichever thread wins releases each exactly once.
+unsafe impl Send for Claim {}
+
+static CLAIMED: Mutex<Option<Claim>> = Mutex::new(None);
+
+/// Hand the claimed DAC back to `usbaudiod`, if one is claimed.
+///
+/// `Held::drop` runs this on the normal path, but a signal handler has to call it too:
+/// `std::process::exit` runs no destructors, and a DAC that is never handed back stays
+/// missing from Core Audio until it is physically replugged.
+pub fn release_claimed_dac() {
+    let claimed = CLAIMED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    let Some(claim) = claimed else {
+        return;
+    };
+    // SAFETY: every ref was created in `race`, and taking the entry above means this runs
+    // once for them.
+    unsafe {
+        call!(claim.streaming, SetAlternateInterface, 0);
+        call!(claim.streaming, USBInterfaceClose);
+        call!(claim.streaming, Release);
+        call!(claim.control, USBInterfaceClose);
+        call!(claim.control, Release);
+
+        // Closing the interfaces is not enough on its own. usbaudiod only looks at a
+        // device when it enumerates, so a device it lost stays lost: the DAC would
+        // vanish from Core Audio until physically replugged. Re-enumerating puts it
+        // through the normal matching path again and the daemon picks it back up.
+        match reenumerate(claim.device) {
+            Some(result) if result != sys::kIOReturnSuccess as sys::IOReturn => debug!(
+                "{}: could not hand the device back: 0x{result:08x}",
+                claim.name
+            ),
+            Some(_) => {}
+            None => debug!(
+                "{}: could not reopen the device to hand it back",
+                claim.name
+            ),
         }
+        call!(claim.device, Release);
+    }
+}
+
+/// Open the device, ask it to re-enumerate, and close it again. `None` when the device
+/// could not be opened at all, which leaves it exactly as it was.
+///
+/// SAFETY: `device` must be a live device ref; it is not consumed.
+unsafe fn reenumerate(device: DeviceRef) -> Option<sys::IOReturn> {
+    unsafe {
+        let mut opened = call!(device, USBDeviceOpen);
+        if opened != sys::kIOReturnSuccess as sys::IOReturn {
+            opened = call!(device, USBDeviceOpenSeize);
+        }
+        if opened != sys::kIOReturnSuccess as sys::IOReturn {
+            return None;
+        }
+        let result = call!(device, USBDeviceReEnumerate, 0);
+        call!(device, USBDeviceClose);
+        Some(result)
     }
 }
 
@@ -693,7 +776,25 @@ fn parse_clock_ranges(report: &[u8]) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use crate::output::usb::device::parse_clock_ranges;
+    use crate::output::usb::device::{names_match, parse_clock_ranges};
+
+    #[test]
+    fn the_core_audio_name_and_the_usb_name_of_one_device_match_either_way_round() {
+        assert!(names_match("Cayin RU7", "Cayin RU7 Playback"));
+        assert!(names_match("Cayin RU7 Playback", "Cayin RU7"));
+        // The fragment a user would actually type.
+        assert!(names_match("Cayin RU7", "ru7"));
+        assert!(names_match("Cayin RU7", "CAYIN"));
+    }
+
+    #[test]
+    fn a_different_device_does_not_match_and_neither_does_an_empty_name() {
+        assert!(!names_match("Cayin RU7", "MacBook Pro Speakers"));
+        // An empty name is contained by every string, so it must not match anything.
+        assert!(!names_match("", "Cayin RU7"));
+        assert!(!names_match("Cayin RU7", ""));
+        assert!(!names_match("Cayin RU7", "   "));
+    }
 
     fn subrange(min: u32, max: u32, step: u32) -> Vec<u8> {
         let mut out = Vec::new();

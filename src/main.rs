@@ -130,20 +130,25 @@ fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> R
     // The handler runs on its own thread, so it can hand the device back itself. A second
     // signal means the caller is not willing to wait for the tail, so leave at once - but
     // still release the device, or it stays claimed until macOS notices the process died.
+    // Exiting runs no destructors, so a natively held DAC has to be re-enumerated here too.
     ctrlc::set_handler(move || {
         if handler_interrupted.swap(true, Ordering::Relaxed) {
             eprintln!();
             output::stream::release_claimed_device();
+            output::usb::device::release_claimed_dac();
             std::process::exit(130);
         }
         handler_stop.store(true, Ordering::Relaxed);
     })?;
 
     for file in files {
-        player::play(file, &target, options, &stop)?;
+        let played = player::play(file, &target, options, &stop);
+        // An interrupt can surface as an error from a half-opened device. The user asked to
+        // stop, so that is not worth reporting as a failure.
         if interrupted.load(Ordering::Relaxed) {
             break;
         }
+        played?;
     }
     Ok(())
 }

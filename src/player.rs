@@ -11,9 +11,9 @@ use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
 use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
 use crate::reader::{self, DsdSource};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rtrb::{Producer, RingBuffer};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// How long the DAC keeps receiving DoP silence after the music ends, so it does not pop.
 const TAIL: Duration = Duration::from_millis(150);
@@ -289,7 +289,26 @@ impl Playback {
             let session = Session::open_retrying(path, target, options, stop)?;
             return Ok(Self::Dop(Box::new(session)));
         }
-        let session = NativeSession::open(path, target.query.as_deref(), options.buffer_ms, stop)?;
+        // The native path takes both audio interfaces away from usbaudiod for the whole
+        // track, which is heavier than hog mode and cannot be shared. Say so rather than
+        // quietly doing the opposite of what was asked.
+        if !options.exclusive {
+            bail!(
+                "{} cannot carry {rate} over DoP, and the native DSD path always claims the \
+                 device exclusively; drop --shared to play this file",
+                target.name
+            );
+        }
+        if options.buffer_frames.is_some() {
+            warn!("--buffer-frames sizes the Core Audio buffer, so it does not apply natively");
+        }
+        let session = NativeSession::open(
+            path,
+            target.query.as_deref(),
+            &target.name,
+            options.buffer_ms,
+            stop,
+        )?;
         Ok(Self::Native(Box::new(session)))
     }
 

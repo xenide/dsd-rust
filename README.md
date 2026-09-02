@@ -16,7 +16,9 @@ dsd-rust tui ~/Music/dsd               # browse, play, and watch the transport
 
 `play` options: `--shared` leaves the device available to other apps, `--buffer-ms`
 sizes the queue between the reader and the audio callback (default 500), and
-`--buffer-frames` overrides the device IO buffer size.
+`--buffer-frames` overrides the device IO buffer size. Both `--shared` and
+`--buffer-frames` are Core Audio settings: a file that has to go over native DSD is
+refused under `--shared`, because that path claims the DAC outright.
 
 Files play in the order given, and the device is resolved once for the whole list: holding a
 device exclusively moves the system default output elsewhere, so re-resolving between tracks
@@ -86,7 +88,13 @@ from every other application until playback ends, which is heavier than Core Aud
 mode. While a native track is playing the DAC belongs to `dsd-rust` alone, so it does not
 appear in `devices` and no other application can open it. Playback hands it back the same way it took it, by re-enumerating: releasing the
 interfaces alone is not enough, because `usbaudiod` only looks at a device as it enumerates,
-so a device it lost would stay missing until physically replugged.
+so a device it lost would stay missing until physically replugged. Ctrl-C hands it back too.
+
+The DAC that plays natively is the one the target resolves to, matched by name against the
+USB product string: Core Audio and USB name the same device differently -- "Cayin RU7
+Playback" against "Cayin RU7" -- so whichever name contains the other counts as a match. A
+DAC whose two names have nothing in common needs its USB name passed to `--device`, which
+`devices` lists on the `native` line.
 
 ## What "bit-perfect" means here
 

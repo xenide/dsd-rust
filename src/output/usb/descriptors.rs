@@ -42,13 +42,17 @@ pub struct NativeDsd {
     pub out_endpoint: u8,
     pub feedback_endpoint: Option<u8>,
     pub max_packet: u16,
+    /// Channels the alternate setting carries. A file with any other count cannot be sent
+    /// down this path: the subslots would be read as a different channel order.
+    pub channels: u8,
 }
 
 impl NativeDsd {
     /// Largest DSD rate this endpoint can carry, in bits per second per channel.
-    pub const fn max_dsd_rate(self, channels: u32) -> u32 {
+    pub const fn max_dsd_rate(self) -> u32 {
         // 8000 microframes per second, 8 DSD bits per byte.
-        (self.max_packet as u32 / channels / NATIVE_SUBSLOT_BYTES as u32) * 32 * 8000
+        let subslots = self.max_packet as u32 / self.channels as u32;
+        (subslots / NATIVE_SUBSLOT_BYTES as u32) * 32 * 8000
     }
 }
 
@@ -116,14 +120,19 @@ struct Candidate {
     alt_setting: u8,
     raw_data: bool,
     subslot_bytes: u8,
+    channels: u8,
     out_endpoint: Option<u8>,
     feedback_endpoint: Option<u8>,
     max_packet: u16,
 }
 
 impl Candidate {
+    // A zero channel count is not just malformed, it would divide by zero in `max_dsd_rate`.
     const fn is_native_dsd(&self) -> bool {
-        self.raw_data && self.subslot_bytes == NATIVE_SUBSLOT_BYTES && self.out_endpoint.is_some()
+        self.raw_data
+            && self.subslot_bytes == NATIVE_SUBSLOT_BYTES
+            && self.channels > 0
+            && self.out_endpoint.is_some()
     }
 }
 
@@ -196,6 +205,7 @@ pub fn find_native_dsd(config: &[u8]) -> Result<NativeDsd> {
         out_endpoint: found.out_endpoint.expect("checked by is_native_dsd"),
         feedback_endpoint: found.feedback_endpoint,
         max_packet: found.max_packet,
+        channels: found.channels,
     })
 }
 
@@ -203,10 +213,11 @@ pub fn find_native_dsd(config: &[u8]) -> Result<NativeDsd> {
 /// candidate as it was rather than guessing at a truncated format.
 fn read_streaming_descriptor(subtype: u8, fields: &[u8], candidate: &mut Candidate) -> Option<()> {
     match subtype {
-        // bTerminalLink, bmControls, bFormatType, bmFormats(4)
+        // bTerminalLink, bmControls, bFormatType, bmFormats(4), bNrChannels
         AS_GENERAL => {
             let formats: [u8; 4] = fields.get(3..7)?.try_into().ok()?;
             candidate.raw_data = u32::from_le_bytes(formats) & FORMAT_TYPE_I_RAW_DATA != 0;
+            candidate.channels = *fields.get(7)?;
         }
         // bFormatType, bSubslotSize, bBitResolution
         AS_FORMAT_TYPE => candidate.subslot_bytes = *fields.get(1)?,
@@ -296,6 +307,7 @@ mod tests {
                 out_endpoint: 0x01,
                 feedback_endpoint: Some(0x81),
                 max_packet: 776,
+                channels: 2,
             }
         );
     }
@@ -305,9 +317,40 @@ mod tests {
         let found = find_native_dsd(&ru7()).expect("RU7 advertises native DSD");
 
         // 776 bytes per microframe over two channels is 97 subslots, so 24.832 MHz.
-        assert_eq!(found.max_dsd_rate(2), 24_832_000);
-        assert!(found.max_dsd_rate(2) >= 22_579_200, "reaches DSD512");
-        assert!(found.max_dsd_rate(2) < 45_158_400, "but not DSD1024");
+        assert_eq!(found.channels, 2);
+        assert_eq!(found.max_dsd_rate(), 24_832_000);
+        assert!(found.max_dsd_rate() >= 22_579_200, "reaches DSD512");
+        assert!(found.max_dsd_rate() < 45_158_400, "but not DSD1024");
+    }
+
+    #[test]
+    fn a_setting_that_claims_no_channels_is_rejected_rather_than_divided_by() {
+        let mut config = vec![9, 0x02, 0, 0, 2, 1, 0, 0x80, 50];
+        config.extend(interface(0, 0, 0, 0x01));
+        config.extend([8, 0x24, 0x0A, 0x05, 0x03, 0x07, 0x00, 0x00]);
+        config.extend(interface(1, 1, 2, 0x02));
+        // RAW_DATA and a native subslot, but bNrChannels is 0.
+        config.extend([
+            16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00,
+        ]);
+        config.extend([6, 0x24, 0x02, 0x01, 0x04, 0x20]);
+        config.extend(endpoint(0x01, 0x05, 776));
+
+        assert!(find_native_dsd(&config).is_err());
+    }
+
+    #[test]
+    fn more_channels_share_the_same_microframe_and_so_reach_a_lower_rate() {
+        let found = find_native_dsd(&ru7()).expect("RU7 advertises native DSD");
+        let quad = NativeDsd {
+            channels: 4,
+            ..found
+        };
+
+        // 776 bytes over four channels is 48 whole subslots each, not the 97 stereo gets.
+        assert_eq!(quad.max_dsd_rate(), 12_288_000);
+        assert!(quad.max_dsd_rate() < found.max_dsd_rate());
     }
 
     #[test]
