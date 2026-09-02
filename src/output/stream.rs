@@ -27,6 +27,33 @@ pub struct PlaybackState {
     pub silence: AtomicBool,
     /// Set to hold the queue where it is and send DoP silence, so the DAC keeps DSD lock.
     pub paused: AtomicBool,
+    /// Set while a seek is being served: the queue is left alone and a short read is not an
+    /// underrun, because the reader is repositioning rather than falling behind.
+    pub seeking: AtomicBool,
+    /// Set to drop everything queued, which the render path does and then clears. Only ever
+    /// set while the reader is parked, so one pass empties the queue.
+    pub flush: AtomicBool,
+}
+
+/// How long a seek waits for the render path to drop what is queued.
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+
+impl PlaybackState {
+    /// Drop whatever is queued and wait for it, because only the render path owns the
+    /// consuming end. A render path that has already stopped never clears the flag, so the
+    /// wait is bounded: a moment of stale audio beats a transport that will not move.
+    pub fn drop_queued(&self) {
+        self.flush.store(true, Ordering::Release);
+        let deadline = Instant::now() + FLUSH_TIMEOUT;
+        while self.flush.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                self.flush.store(false, Ordering::Release);
+                warn!("the render path did not drop the queue for a seek");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 struct IoContext {
@@ -48,14 +75,22 @@ impl IoContext {
             state,
             ..
         } = self;
+        if state.flush.swap(false, Ordering::AcqRel) {
+            let queued = consumer.slots();
+            if let Ok(stale) = consumer.read_chunk(queued) {
+                stale.commit_all();
+            }
+        }
+
         let sample_bytes = encoding.bytes_per_sample();
         let frame_bytes = sample_bytes * stream_channels;
         if frame_bytes == 0 || stream_channels == 0 {
             return;
         }
         let frames = out.len() / frame_bytes;
-        let silenced =
-            state.silence.load(Ordering::Relaxed) || state.paused.load(Ordering::Relaxed);
+        let silenced = state.silence.load(Ordering::Relaxed)
+            || state.paused.load(Ordering::Relaxed)
+            || state.seeking.load(Ordering::Relaxed);
         let ready = if silenced {
             0
         } else {

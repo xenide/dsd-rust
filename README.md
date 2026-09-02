@@ -34,13 +34,15 @@ and `--buffer-frames` options as `play`.
  ↑↓ / j k     move             enter / → / l   open folder or play file
  ← / h        parent folder    space           play/pause
  s            stop             n / p           next / previous track
- r            re-read folder   q / esc         quit
+ , / .        back / on 5 s    q / esc         quit
+ r            re-read folder
 ```
 
 Playing a file queues the whole folder from that file on, in the order the pane lists it.
-Pausing keeps the DAC fed with DoP silence rather than stopping the stream, so the DAC holds
-DSD lock and resuming costs no relock. The debug pane shows what the device settled on and
-what the transport is doing right now:
+Pausing and seeking keep the DAC fed with DoP silence rather than stopping the stream, so the
+DAC holds DSD lock and neither costs a relock. Seeking drops what is queued and restarts the
+reader at the new position, so the jump takes about as long as it takes to refill. The debug
+pane shows what the device settled on and what the transport is doing right now:
 
 ```
 device     Topping D50  exclusive, mixing off

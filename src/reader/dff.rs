@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -12,6 +12,8 @@ pub struct DffReader<R> {
     inner: R,
     format: DsdFormat,
     audio_bytes_per_channel: u64,
+    /// Where the sound data chunk's body starts, so a seek can address the audio from it.
+    data_start: u64,
     emitted: u64,
     scratch: Vec<u8>,
 }
@@ -49,7 +51,7 @@ fn read_exact_vec<R: Read>(inner: &mut R, len: usize) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-impl<R: Read + Send + 'static> DffReader<R> {
+impl<R: Read + Seek + Send + 'static> DffReader<R> {
     pub fn new(mut inner: R) -> Result<Self> {
         let mut form = [0_u8; 16];
         inner.read_exact(&mut form)?;
@@ -79,10 +81,12 @@ impl<R: Read + Send + 'static> DffReader<R> {
                         rate: DsdRate::new(rate),
                         channels,
                     };
+                    let data_start = inner.stream_position()?;
                     return Ok(Self {
                         inner,
                         format,
                         audio_bytes_per_channel: chunk.size / u64::from(channels),
+                        data_start,
                         emitted: 0,
                         scratch: vec![0; CHUNK_BYTES * channels as usize],
                     });
@@ -142,7 +146,7 @@ fn parse_properties(body: &[u8]) -> Result<(Option<u32>, Option<u16>)> {
     Ok((rate, channels))
 }
 
-impl<R: Read + Send + 'static> DsdSource for DffReader<R> {
+impl<R: Read + Seek + Send + 'static> DsdSource for DffReader<R> {
     fn container(&self) -> &'static str {
         "DSDIFF"
     }
@@ -181,6 +185,16 @@ impl<R: Read + Send + 'static> DsdSource for DffReader<R> {
         }
         self.emitted += count as u64;
         Ok(count)
+    }
+
+    /// DSDIFF interleaves the channels byte by byte, so every byte offset is a position.
+    fn seek(&mut self, bytes_per_channel: u64) -> Result<u64> {
+        let target = bytes_per_channel.min(self.audio_bytes_per_channel);
+        let channels = u64::from(self.format.channels);
+        self.inner
+            .seek(SeekFrom::Start(self.data_start + target * channels))?;
+        self.emitted = target;
+        Ok(target)
     }
 }
 
@@ -245,6 +259,35 @@ mod tests {
             planes[1][..32],
             samples[1..].iter().copied().step_by(2).collect::<Vec<_>>()[..]
         );
+        assert_eq!(reader.read(&mut planes).expect("reads"), 0);
+    }
+
+    #[test]
+    fn a_seek_lands_on_the_exact_byte_and_reads_on_from_there() {
+        let samples: Vec<u8> = (0..64_u8).collect();
+        let mut reader = DffReader::new(Cursor::new(dff_file(&samples))).expect("parses");
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; reader.chunk_bytes()].into(); 2];
+
+        let reached = reader.seek(10).expect("seeks");
+
+        assert_eq!(reached, 10);
+        let count = reader.read(&mut planes).expect("reads");
+        assert_eq!(count, 22);
+        assert_eq!(
+            planes[0][..count],
+            samples[20..].iter().copied().step_by(2).collect::<Vec<_>>()[..]
+        );
+    }
+
+    #[test]
+    fn a_seek_past_the_end_stops_at_the_end_of_the_audio() {
+        let samples: Vec<u8> = (0..64_u8).collect();
+        let mut reader = DffReader::new(Cursor::new(dff_file(&samples))).expect("parses");
+        let mut planes: Vec<Box<[u8]>> = vec![vec![0; reader.chunk_bytes()].into(); 2];
+
+        let reached = reader.seek(u64::MAX).expect("seeks");
+
+        assert_eq!(reached, 32);
         assert_eq!(reader.read(&mut planes).expect("reads"), 0);
     }
 
