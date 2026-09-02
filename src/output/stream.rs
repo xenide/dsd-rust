@@ -180,6 +180,10 @@ const FORMAT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long the virtual format gets to follow a non-mixable physical format.
 const VIRTUAL_FORMAT_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a probe waits for a rate the device does not advertise. Short, because a rate
+/// the hardware really takes lands as fast as one it advertises, and a probe runs before
+/// playback rather than during it.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The DSD rates a DoP link can carry, as PCM frame rates.
 pub const DOP_PCM_RATES: [u32; 4] = [176_400, 352_800, 705_600, 1_411_200];
@@ -254,6 +258,9 @@ pub struct Request {
     pub channels: u16,
     pub exclusive: bool,
     pub buffer_frames: Option<u32>,
+    /// Set when `pcm_rate` came from [`probe_dop_rate`] rather than from the advertised
+    /// format list, so the stream choice has to look past what the device advertises.
+    pub allow_unadvertised_rate: bool,
 }
 
 /// A running DoP output: device settings taken over on open and restored on drop.
@@ -282,6 +289,7 @@ impl Output {
             channels,
             exclusive,
             buffer_frames,
+            ..
         } = *request;
         let choice = choose_stream(&device, request)?;
         let (stream_index, stream) = (choice.index, choice.stream);
@@ -338,7 +346,7 @@ impl Output {
         if let Err(error) = device.set_nominal_sample_rate(f64::from(pcm_rate)) {
             debug!("nominal sample rate not settable directly: {error}");
         }
-        let format = adopt_format(&stream, &choice.formats, pcm_rate)
+        let format = adopt_format(&stream, &choice.formats, pcm_rate, FORMAT_TIMEOUT)
             .with_context(|| format!("device rejected every {pcm_rate} Hz format"))?;
         output.format_changed = true;
         output.publish_claim();
@@ -489,7 +497,7 @@ fn restore(reclaim: &Reclaim) {
     if let Some(format) = reclaim.format {
         if let Err(error) = reclaim.stream.set_physical_format(&format) {
             warn!("could not restore the stream format: {error}");
-        } else if let Err(error) = settle(&reclaim.stream, format.mSampleRate) {
+        } else if let Err(error) = settle(&reclaim.stream, format.mSampleRate, FORMAT_TIMEOUT) {
             debug!("stream format did not settle back: {error}");
         }
     }
@@ -539,6 +547,7 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
         pcm_rate,
         channels,
         exclusive,
+        allow_unadvertised_rate,
         ..
     } = *request;
     let mut best: Option<StreamChoice> = None;
@@ -546,7 +555,13 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
         let mut scored = Vec::new();
         for ranged in stream.available_physical_formats()? {
             let format = ranged.mFormat;
-            if !carries_rate(&ranged, pcm_rate) || format.mChannelsPerFrame < u32::from(channels) {
+            if format.mChannelsPerFrame < u32::from(channels) {
+                continue;
+            }
+            // A probed rate is one the device takes without advertising it, so the rate a
+            // candidate is listed at says nothing about it: what matters is the sample
+            // layout, and `adopt_format` writes the rate onto whichever layout sticks.
+            if !allow_unadvertised_rate && !carries_rate(&ranged, pcm_rate) {
                 continue;
             }
             let Ok(encoding) = Encoding::from_format(&format) else {
@@ -561,11 +576,13 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
         let Some((top_score, _)) = scored.first().copied() else {
             continue;
         };
+        let mut formats: Vec<_> = scored.into_iter().map(|(_, format)| format).collect();
+        keep_distinct_layouts(&mut formats);
         if best.as_ref().is_none_or(|best| top_score > best.top_score) {
             best = Some(StreamChoice {
                 index,
                 stream: *stream,
-                formats: scored.into_iter().map(|(_, format)| format).collect(),
+                formats,
                 top_score,
             });
         }
@@ -575,11 +592,87 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
     })
 }
 
+/// Drop every format whose sample layout an earlier, higher scoring one already covers.
+///
+/// The advertised list enumerates rates against layouts, so it repeats each layout once per
+/// rate. `adopt_format` overwrites the rate anyway, so a repeat is a format that has already
+/// been tried, and trying it again costs another timeout for the same answer.
+fn keep_distinct_layouts(formats: &mut Vec<AudioStreamBasicDescription>) {
+    let mut seen = Vec::new();
+    formats.retain(|format| {
+        let layout = (
+            format.mFormatFlags,
+            format.mBitsPerChannel,
+            format.mBytesPerFrame,
+            format.mChannelsPerFrame,
+        );
+        if seen.contains(&layout) {
+            return false;
+        }
+        seen.push(layout);
+        true
+    });
+}
+
+/// Try a DoP carrier rate the device does not advertise, and report whether it stuck.
+///
+/// `kAudioStreamPropertyAvailablePhysicalFormats` is the intersection of the streaming
+/// alternate settings with the clock ranges, and that intersection is sometimes narrower
+/// than what the hardware accepts. Setting the rate and reading it back is the only way to
+/// tell, so the stream goes back to the format it was on whatever the answer.
+pub fn probe_dop_rate(device: &Device, rate: u32) -> bool {
+    let Ok(streams) = device.output_streams() else {
+        return false;
+    };
+    for stream in streams {
+        let Ok(original) = stream.physical_format() else {
+            continue;
+        };
+        let original_rate = device.nominal_sample_rate().unwrap_or(original.mSampleRate);
+        let candidates = probe_candidates(&stream, original.mChannelsPerFrame);
+        let _ = device.set_nominal_sample_rate(f64::from(rate));
+        let adopted = adopt_format(&stream, &candidates, rate, PROBE_TIMEOUT);
+        let _ = stream.set_physical_format(&original);
+        let _ = device.set_nominal_sample_rate(original_rate);
+        let _ = settle(&stream, original.mSampleRate, PROBE_TIMEOUT);
+        match adopted {
+            Ok(_) => return true,
+            Err(error) => debug!("device would not take an unadvertised {rate} Hz: {error}"),
+        }
+    }
+    false
+}
+
+/// The distinct DoP-capable layouts one stream offers, best first, at its current channel
+/// count. A probe changes only the rate, so a layout with a different channel count would
+/// be asking the device two questions at once.
+fn probe_candidates(stream: &Stream, channels: u32) -> Vec<AudioStreamBasicDescription> {
+    let Ok(formats) = stream.available_physical_formats() else {
+        return Vec::new();
+    };
+    let mut scored = Vec::new();
+    for ranged in formats {
+        let format = ranged.mFormat;
+        if format.mChannelsPerFrame != channels {
+            continue;
+        }
+        let Ok(encoding) = Encoding::from_format(&format) else {
+            continue;
+        };
+        scored.push((score(&format, encoding, channels, true), format));
+    }
+    scored.sort_by_key(|(score, _)| Reverse(*score));
+    let mut candidates: Vec<_> = scored.into_iter().map(|(_, format)| format).collect();
+    keep_distinct_layouts(&mut candidates);
+    candidates
+}
+
 /// Adopt the best format the device actually accepts, at the requested rate.
 fn adopt_format(
     stream: &Stream,
     candidates: &[AudioStreamBasicDescription],
     pcm_rate: u32,
+    timeout: Duration,
 ) -> Result<AudioStreamBasicDescription> {
     let mut last = None;
     for format in candidates {
@@ -587,7 +680,7 @@ fn adopt_format(
         format.mSampleRate = f64::from(pcm_rate);
         match stream
             .set_physical_format(&format)
-            .and_then(|()| settle(stream, f64::from(pcm_rate)))
+            .and_then(|()| settle(stream, f64::from(pcm_rate), timeout))
         {
             Ok(()) => return Ok(format),
             Err(error) => {
@@ -603,14 +696,14 @@ fn adopt_format(
 }
 
 /// Changing the hardware format is asynchronous; wait for the device to settle.
-fn settle(stream: &Stream, rate: f64) -> Result<()> {
-    let deadline = Instant::now() + FORMAT_TIMEOUT;
+fn settle(stream: &Stream, rate: f64, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     loop {
         if stream.physical_format()?.mSampleRate == rate {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("device did not switch to {rate} Hz within {FORMAT_TIMEOUT:?}");
+            bail!("device did not switch to {rate} Hz within {timeout:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -659,9 +752,11 @@ mod tests {
 
     use rtrb::RingBuffer;
 
+    use coreaudio_sys::AudioStreamBasicDescription;
+
     use crate::dop::{MARKER_A, MARKER_B, SILENCE_PAYLOAD, pack_planes, split_word};
     use crate::output::encoding::Encoding;
-    use crate::output::stream::{IoContext, Marker, PlaybackState};
+    use crate::output::stream::{IoContext, Marker, PlaybackState, keep_distinct_layouts};
     use crate::reader::DsdSource;
     use crate::reader::dsf::DsfReader;
     use crate::reader::dsf::tests::{BLOCK, dsf_file};
@@ -671,6 +766,34 @@ mod tests {
         shift: 0,
         big_endian: false,
     };
+
+    /// One advertised format, as the device would list it at `rate`.
+    fn advertised(rate: f64, bits: u32, bytes: u32) -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription {
+            mSampleRate: rate,
+            mBitsPerChannel: bits,
+            mBytesPerFrame: bytes * 2,
+            mChannelsPerFrame: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_layout_listed_at_several_rates_is_only_worth_trying_once() {
+        let mut formats = vec![
+            advertised(352_800.0, 24, 3),
+            advertised(352_800.0, 32, 4),
+            advertised(176_400.0, 24, 3),
+            advertised(44_100.0, 32, 4),
+        ];
+        keep_distinct_layouts(&mut formats);
+
+        // The first of each layout survives, and the rate it was listed at is not what
+        // distinguishes them: `adopt_format` overwrites that.
+        assert_eq!(formats.len(), 2);
+        assert_eq!(formats[0].mBitsPerChannel, 24);
+        assert_eq!(formats[1].mBitsPerChannel, 32);
+    }
 
     /// Pull a whole file through the reader and the DoP packer.
     fn payloads_of(file: Vec<u8>) -> (Vec<u16>, Vec<Vec<u8>>) {

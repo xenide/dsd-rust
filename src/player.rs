@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 use crate::dop;
 use crate::dsd::DsdFormat;
 use crate::dsd::DsdRate;
-use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
-use crate::output::usb::device::Held;
+use crate::output::stream::{
+    DOP_PCM_RATES, DeviceBusy, Output, Request, probe_dop_rate, supported_dop_rates,
+};
+use crate::output::usb::device::{Dac, Held};
 use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
 use crate::reader::tags::TrackTags;
@@ -56,6 +58,13 @@ pub struct Target {
     /// Read once, because `device` goes stale while the DAC is held natively and the rates
     /// are a property of the DAC rather than of the `AudioDeviceID` it happens to have.
     dop_rates: Vec<u32>,
+    /// DoP carrier rates the DAC's own clock claims that Core Audio does not advertise,
+    /// waiting to be probed. A rate leaves this list the first time it is tried, so one the
+    /// device turns down does not cost a probe again on every track.
+    unprobed_rates: Vec<u32>,
+    /// Unadvertised rates a probe proved the device accepts, which the stream choice has to
+    /// be told about because they are in no format list it can read.
+    probed_rates: Vec<u32>,
     /// The DAC claimed for native DSD, held between tracks. Handing it back re-enumerates
     /// it, and the next claim would then have to race `usbaudiod` for a window that the
     /// re-enumeration has already closed.
@@ -68,8 +77,11 @@ pub struct Target {
 impl Target {
     pub fn resolve(query: Option<&str>) -> Result<Self> {
         let (device, name) = output::find_device(query)?;
+        let dop_rates = supported_dop_rates(&device);
         Ok(Self {
-            dop_rates: supported_dop_rates(&device),
+            unprobed_rates: unadvertised_dop_rates(&name, &dop_rates),
+            probed_rates: Vec::new(),
+            dop_rates,
             device,
             name,
             query: query.map(str::to_owned),
@@ -78,9 +90,33 @@ impl Target {
         })
     }
 
-    /// True when this device advertises a PCM rate able to carry the file as DoP.
-    fn carries_dop(&self, rate: DsdRate) -> bool {
-        self.dop_rates.contains(&rate.dop_pcm_rate())
+    /// True when this device can carry the file as DoP.
+    ///
+    /// A rate Core Audio does not advertise is not one the DAC has refused: the advertised
+    /// list is an intersection that is sometimes narrower than the hardware. Where the DAC's
+    /// clock claims the rate regardless, setting it and reading it back settles the question,
+    /// and a DAC that answers yes skips the native path and the interface race behind it.
+    fn carries_dop(&mut self, rate: DsdRate) -> Result<bool> {
+        let pcm_rate = rate.dop_pcm_rate();
+        if self.dop_rates.contains(&pcm_rate) {
+            return Ok(true);
+        }
+        if !self.unprobed_rates.contains(&pcm_rate) {
+            return Ok(false);
+        }
+        self.unprobed_rates.retain(|unprobed| *unprobed != pcm_rate);
+        // The probe goes through Core Audio, which cannot see a DAC this process is holding
+        // for native DSD, so a claim carried over from an earlier track ends before it.
+        self.restore_core_audio()?;
+        if !probe_dop_rate(&self.device, pcm_rate) {
+            return Ok(false);
+        }
+        debug!(
+            "{}: takes an unadvertised {pcm_rate} Hz DoP carrier",
+            self.name
+        );
+        self.probed_rates.push(pcm_rate);
+        Ok(true)
     }
 
     /// Hand a natively held DAC back to `usbaudiod`. Instant, because picking the device up
@@ -119,6 +155,36 @@ impl Target {
             thread::sleep(SETTLE);
         }
     }
+}
+
+/// DoP carrier rates the DAC's clock reports that Core Audio does not advertise.
+///
+/// `kAudioStreamPropertyAvailablePhysicalFormats` is derived from the intersection of the
+/// streaming alternate settings with the clock ranges, and a DAC that lists no PCM alternate
+/// setting at a rate its clock reaches drops out of that intersection. The clock's own RANGE
+/// report is the second opinion, and the only rates worth the cost of a probe are the ones
+/// the two disagree on.
+fn unadvertised_dop_rates(name: &str, advertised: &[u32]) -> Vec<u32> {
+    let Ok(dacs) = Dac::discover() else {
+        return Vec::new();
+    };
+    let Some(dac) = dacs.iter().find(|dac| dac.matches(name)) else {
+        return Vec::new();
+    };
+    let clock = match dac.clock_rates() {
+        Ok(clock) => clock,
+        Err(error) => {
+            debug!("{name}: cannot read the clock range, so no rate is probed: {error}");
+            return Vec::new();
+        }
+    };
+    let mut rates = Vec::new();
+    for rate in DOP_PCM_RATES {
+        if clock.contains(&rate) && !advertised.contains(&rate) {
+            rates.push(rate);
+        }
+    }
+    rates
 }
 
 #[derive(Debug, Default)]
@@ -220,6 +286,7 @@ impl Session {
             channels: format.channels,
             exclusive: options.exclusive,
             buffer_frames: options.buffer_frames,
+            allow_unadvertised_rate: target.probed_rates.contains(&pcm_rate),
         };
         let mut output = Output::open(device, &request, consumer)
             .with_context(|| format!("{} cannot play {}", target.name, format.rate))?;
@@ -415,7 +482,7 @@ impl Playback {
         stop: &Arc<AtomicBool>,
     ) -> Result<Self> {
         let rate = reader::open(path)?.format().rate;
-        if target.carries_dop(rate) {
+        if target.carries_dop(rate)? {
             // DoP goes through Core Audio, which cannot see a DAC this process is holding
             // for native DSD, so a claim carried over from an earlier track ends here.
             target.restore_core_audio()?;
