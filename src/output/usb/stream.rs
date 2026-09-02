@@ -333,7 +333,7 @@ unsafe extern "C" fn on_feedback(refcon: *mut c_void, result: sys::IOReturn, _ar
 /// A running native DSD stream. Dropping it stops the engine and hands the DAC back.
 pub struct NativeStream {
     stop: Arc<AtomicBool>,
-    engine: Option<JoinHandle<()>>,
+    engine: Option<JoinHandle<Held>>,
 }
 
 impl NativeStream {
@@ -375,7 +375,7 @@ impl NativeStream {
                     frame_bytes,
                     nominal,
                     max_packet,
-                );
+                )
             })?;
 
         Ok(Self {
@@ -384,21 +384,23 @@ impl NativeStream {
         })
     }
 
-    pub fn stop(&mut self) {
+    /// Stop the engine and take the DAC back, still claimed, so the next track does not have
+    /// to race `usbaudiod` for it again. `None` once it has already been taken.
+    pub fn stop(&mut self) -> Option<Held> {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(engine) = self.engine.take() {
-            let _ = engine.join();
-        }
+        self.engine.take()?.join().ok()
     }
 }
 
 impl Drop for NativeStream {
     fn drop(&mut self) {
-        self.stop();
+        // Nobody asked for the DAC, so dropping it here hands it back to `usbaudiod`.
+        drop(self.stop());
     }
 }
 
-/// The engine thread: owns the run loop, the buffers, and the DAC.
+/// The engine thread: owns the run loop and the buffers, and holds the DAC until it returns
+/// it to whoever stopped the stream.
 #[allow(clippy::too_many_arguments)]
 fn run(
     held: Held,
@@ -410,7 +412,7 @@ fn run(
     frame_bytes: usize,
     nominal: f64,
     max_packet: usize,
-) {
+) -> Held {
     let streaming = held.streaming();
     let mut engine = Box::new(Engine {
         held,
@@ -437,7 +439,7 @@ fn run(
             let Some(slot) = create_slot(streaming, UFRAMES_PER_XFER * max_packet, false) else {
                 debug!("native DSD: cannot allocate transfer buffers");
                 destroy_slots(streaming, &mut engine);
-                return;
+                return engine.held;
             };
             engine.slots.push(slot);
         }
@@ -456,7 +458,7 @@ fn run(
         )) {
             debug!("native DSD: cannot create an async event source");
             destroy_slots(streaming, &mut engine);
-            return;
+            return engine.held;
         }
         sys::CFRunLoopAddSource(
             sys::CFRunLoopGetCurrent(),
@@ -495,6 +497,7 @@ fn run(
         destroy_slots(streaming, &mut engine);
     }
     thread::sleep(Duration::from_millis(1));
+    engine.held
 }
 
 unsafe fn create_slot(

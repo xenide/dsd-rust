@@ -2,12 +2,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dop;
 use crate::dsd::DsdFormat;
 use crate::dsd::DsdRate;
 use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
+use crate::output::usb::device::Held;
 use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
 use crate::reader::{self, DsdSource};
@@ -21,6 +22,8 @@ const POLL: Duration = Duration::from_millis(20);
 /// A track gets this many goes at claiming a device that is still switching rate.
 const SETUP_ATTEMPTS: u32 = 4;
 const SETTLE: Duration = Duration::from_millis(300);
+/// How long to wait for a DAC to reappear in Core Audio after a native claim is released.
+const REATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct PlayOptions {
     pub exclusive: bool,
@@ -36,21 +39,71 @@ pub struct Target {
     /// Kept so the native USB path can resolve the same DAC: Core Audio and USB report
     /// different names for one device, so only the user's own query matches both.
     pub query: Option<String>,
+    /// Read once, because `device` goes stale while the DAC is held natively and the rates
+    /// are a property of the DAC rather than of the `AudioDeviceID` it happens to have.
+    dop_rates: Vec<u32>,
+    /// The DAC claimed for native DSD, held between tracks. Handing it back re-enumerates
+    /// it, and the next claim would then have to race `usbaudiod` for a window that the
+    /// re-enumeration has already closed.
+    pub dac: Option<Held>,
+    /// Set once the native path has been taken, because claiming a DAC re-enumerates it and
+    /// that retires the `AudioDeviceID` `device` names.
+    stale: bool,
 }
 
 impl Target {
     pub fn resolve(query: Option<&str>) -> Result<Self> {
         let (device, name) = output::find_device(query)?;
         Ok(Self {
+            dop_rates: supported_dop_rates(&device),
             device,
             name,
             query: query.map(str::to_owned),
+            dac: None,
+            stale: false,
         })
     }
 
     /// True when this device advertises a PCM rate able to carry the file as DoP.
     fn carries_dop(&self, rate: DsdRate) -> bool {
-        supported_dop_rates(&self.device).contains(&rate.dop_pcm_rate())
+        self.dop_rates.contains(&rate.dop_pcm_rate())
+    }
+
+    /// Hand a natively held DAC back to `usbaudiod`. Instant, because picking the device up
+    /// again is left to whoever next needs it through Core Audio.
+    pub fn release_dac(&mut self) {
+        self.dac = None;
+    }
+
+    /// Hand back any native claim and point `device` at the DAC again, ready for Core Audio.
+    ///
+    /// Core Audio cannot see a device whose interfaces this process holds, and claiming one
+    /// re-enumerates it, which retires the `AudioDeviceID` that `device` names. The device is
+    /// looked up by name rather than by the user's query, because a query of `None` means the
+    /// system default, which a device that has just come back is not yet.
+    fn restore_core_audio(&mut self) -> Result<()> {
+        self.release_dac();
+        if !self.stale {
+            return Ok(());
+        }
+        let name = self.name.clone();
+        let deadline = Instant::now() + REATTACH_TIMEOUT;
+        loop {
+            // A device on its way out is still listed for a moment, but its streams are
+            // already gone, so the rates it reports are what says it is really back.
+            if let Ok((device, found)) = output::find_device(Some(&name))
+                && !supported_dop_rates(&device).is_empty()
+            {
+                self.device = device;
+                self.name = found;
+                self.stale = false;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("{name} has not come back to Core Audio since it was handed back");
+            }
+            thread::sleep(SETTLE);
+        }
     }
 }
 
@@ -280,12 +333,15 @@ impl Playback {
     /// it natively, where 32 DSD bits ride in each frame instead of 16.
     pub fn open(
         path: &Path,
-        target: &Target,
+        target: &mut Target,
         options: &PlayOptions,
         stop: &Arc<AtomicBool>,
     ) -> Result<Self> {
         let rate = reader::open(path)?.format().rate;
         if target.carries_dop(rate) {
+            // DoP goes through Core Audio, which cannot see a DAC this process is holding
+            // for native DSD, so a claim carried over from an earlier track ends here.
+            target.restore_core_audio()?;
             let session = Session::open_retrying(path, target, options, stop)?;
             return Ok(Self::Dop(Box::new(session)));
         }
@@ -302,13 +358,10 @@ impl Playback {
         if options.buffer_frames.is_some() {
             warn!("--buffer-frames sizes the Core Audio buffer, so it does not apply natively");
         }
-        let session = NativeSession::open(
-            path,
-            target.query.as_deref(),
-            &target.name,
-            options.buffer_ms,
-            stop,
-        )?;
+        // Even a claim that fails may have re-enumerated the DAC, so Core Audio has to look
+        // it up again before anything goes back over DoP.
+        target.stale = true;
+        let session = NativeSession::open(path, target, options.buffer_ms, stop)?;
         Ok(Self::Native(Box::new(session)))
     }
 
@@ -363,10 +416,15 @@ impl Playback {
         }
     }
 
-    pub fn finish(self) -> Result<()> {
+    /// Stop playing and give the target its DAC back, so the next track finds it held.
+    pub fn finish(self, target: &mut Target) -> Result<()> {
         match self {
             Self::Dop(session) => session.finish(),
-            Self::Native(session) => session.finish(),
+            Self::Native(session) => {
+                let (dac, result) = session.finish();
+                target.dac = dac;
+                result
+            }
         }
     }
 }
@@ -374,7 +432,7 @@ impl Playback {
 /// Play one file, printing progress until it ends or `stop` is set.
 pub fn play(
     path: &Path,
-    target: &Target,
+    target: &mut Target,
     options: &PlayOptions,
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -428,7 +486,7 @@ pub fn play(
     }
 
     let frame_rate = device.pcm_rate;
-    session.finish()?;
+    session.finish(target)?;
     print_progress(duration, duration);
     println!();
 

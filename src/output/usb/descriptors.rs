@@ -6,6 +6,8 @@
 
 use anyhow::{Result, bail};
 
+use crate::dsd::DsdFormat;
+
 /// Class-specific interface descriptor.
 const CS_INTERFACE: u8 = 0x24;
 const DESC_INTERFACE: u8 = 0x04;
@@ -53,6 +55,29 @@ impl NativeDsd {
         // 8000 microframes per second, 8 DSD bits per byte.
         let subslots = self.max_packet as u32 / self.channels as u32;
         (subslots / NATIVE_SUBSLOT_BYTES as u32) * 32 * 8000
+    }
+
+    /// Whether this alternate setting can carry `format` as it stands. The caller names the
+    /// DAC, so the message reads as one sentence about that device.
+    pub fn accepts(self, format: DsdFormat) -> Result<()> {
+        // The alternate setting has a fixed channel count. Sending any other count would put
+        // each channel's subslots where the DAC expects a different channel's.
+        if format.channels != u16::from(self.channels) {
+            bail!(
+                "its native DSD path carries {} channels, but this file has {}",
+                self.channels,
+                format.channels
+            );
+        }
+        let max = self.max_dsd_rate();
+        if format.rate.hz() > max {
+            bail!(
+                "its native endpoint carries at most {:.4} MHz per channel, but this file is {}",
+                f64::from(max) / 1_000_000.0,
+                format.rate
+            );
+        }
+        Ok(())
     }
 }
 
@@ -245,6 +270,7 @@ fn read_endpoint(body: &[u8], candidate: &mut Candidate) {
 
 #[cfg(test)]
 mod tests {
+    use crate::dsd::{DsdFormat, DsdRate};
     use crate::output::usb::descriptors::{NativeDsd, find_native_dsd};
 
     fn interface(number: u8, alt: u8, endpoints: u8, subclass: u8) -> Vec<u8> {
@@ -310,6 +336,32 @@ mod tests {
                 channels: 2,
             }
         );
+    }
+
+    #[test]
+    fn a_stereo_endpoint_carries_dsd256_but_not_a_rate_or_channel_count_past_it() {
+        let found = find_native_dsd(&ru7()).expect("RU7 advertises native DSD");
+
+        found
+            .accepts(DsdFormat {
+                rate: DsdRate::new(11_289_600),
+                channels: 2,
+            })
+            .expect("DSD256 stereo fits the RU7 endpoint");
+        let too_many = found
+            .accepts(DsdFormat {
+                rate: DsdRate::new(11_289_600),
+                channels: 6,
+            })
+            .expect_err("six channels do not fit a two channel alternate setting");
+        assert!(too_many.to_string().contains("carries 2 channels"));
+        let too_fast = found
+            .accepts(DsdFormat {
+                rate: DsdRate::new(45_158_400),
+                channels: 2,
+            })
+            .expect_err("DSD1024 is past what 776 bytes per microframe carry");
+        assert!(too_fast.to_string().contains("24.8320 MHz"));
     }
 
     #[test]

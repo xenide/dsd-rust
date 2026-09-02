@@ -5,14 +5,19 @@
 //! that daemon holds them, but the daemon has to re-acquire them after the device
 //! re-enumerates, and that leaves a window of roughly 20 ms. This module forces a
 //! re-enumeration, wins that race, and then simply never lets go: the interfaces stay open
-//! for the life of the session, which keeps the daemon out.
+//! for as long as anything holds the `Held`, which keeps the daemon out.
+//!
+//! Winning is not guaranteed on the first go. Handing a DAC back re-enumerates it too, so a
+//! claim that follows one closely finds its own request swallowed by a re-enumeration
+//! already in flight and races a window that has been and gone. `acquire` therefore forces
+//! several re-enumerations rather than polling one that will not come.
 
 use std::ffi::{CString, c_void};
 use std::ptr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::debug;
 
 use crate::output::usb::descriptors::{NativeDsd, find_native_dsd};
@@ -21,8 +26,14 @@ use crate::output::usb::sys;
 type DeviceRef = *mut *mut sys::IOUSBDeviceInterface500;
 type InterfaceRef = *mut *mut sys::IOUSBInterfaceInterface500;
 
-/// How long to keep racing before giving up on a re-enumeration.
-const RACE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one re-enumeration's window is worth waiting for. The DAC is back on the bus
+/// within a few hundred milliseconds, so a race still empty after this missed the window or
+/// never had one, and the answer is another re-enumeration rather than more polling.
+const RACE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Re-enumerations to force before giving up on the DAC.
+const RACE_ATTEMPTS: u32 = 4;
+/// How long to wait for the DAC to be on the bus at all before asking it to re-enumerate.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const RACE_POLL: Duration = Duration::from_micros(500);
 
 /// UAC2 class request: set the current value of a control.
@@ -182,26 +193,66 @@ impl Dac {
     }
 
     /// Force a re-enumeration, win the race for both audio interfaces, and hold them.
+    ///
+    /// A re-enumeration already in flight -- because this or another process has just handed
+    /// the DAC back -- swallows the request, and `usbaudiod` then takes the interfaces during
+    /// a window this process never saw. Polling harder does not help, because nothing will
+    /// open that window again, so a race that comes up empty forces another re-enumeration.
     pub fn acquire(self) -> Result<Held> {
-        // SAFETY: every raw pointer below is checked before use and released on every path.
-        unsafe {
-            let Some(device) = device_interface(self.service) else {
-                bail!("{}: cannot open a USB device interface", self.name);
-            };
-
-            // Opening the device itself is allowed even while usbaudiod holds the
-            // interfaces, and that is enough to ask for a re-enumeration.
-            match reenumerate(device) {
-                Some(result) => ok(result, "USBDeviceReEnumerate")?,
-                None => debug!(
+        let mut last = None;
+        for attempt in 1..=RACE_ATTEMPTS {
+            if !self.force_reenumeration()? {
+                debug!(
                     "{}: cannot re-enumerate; racing on the current device",
                     self.name
-                ),
+                );
             }
-            call!(device, Release);
+            match self.race() {
+                Ok(held) => return Ok(held),
+                Err(error) => {
+                    debug!(
+                        "{}: race attempt {attempt} came up empty: {error}",
+                        self.name
+                    );
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.expect("the loop runs at least once")).with_context(|| {
+            format!(
+                "{}: {RACE_ATTEMPTS} re-enumerations all lost its audio interfaces to another \
+                 process",
+                self.name
+            )
+        })
+    }
 
-            let held = self.race()?;
-            Ok(held)
+    /// Ask the DAC to re-enumerate, waiting for it to be on the bus first because a previous
+    /// attempt may still have it off.
+    ///
+    /// `Ok(false)` when it is there but would not re-enumerate, which leaves the race to run
+    /// on the device as it stands.
+    fn force_reenumeration(&self) -> Result<bool> {
+        let deadline = Instant::now() + ATTACH_TIMEOUT;
+        loop {
+            // SAFETY: the device ref is released before this leaves the block, on every path.
+            // Opening the device itself is allowed even while usbaudiod holds the interfaces,
+            // and that is enough to ask for a re-enumeration.
+            let asked = unsafe {
+                find_device_interface(self.vendor, self.product).map(|device| {
+                    let result = reenumerate(device);
+                    call!(device, Release);
+                    result
+                })
+            };
+            match asked {
+                Some(Some(result)) => return ok(result, "USBDeviceReEnumerate").map(|()| true),
+                Some(None) => return Ok(false),
+                None if Instant::now() >= deadline => {
+                    bail!("{} is not on the USB bus", self.name)
+                }
+                None => std::thread::sleep(RACE_POLL),
+            }
         }
     }
 
@@ -211,8 +262,10 @@ impl Dac {
         let mut control: Option<InterfaceRef> = None;
         let mut streaming: Option<InterfaceRef> = None;
         let started = Instant::now();
+        let mut polls = 0_u32;
 
         while Instant::now() < deadline && !(control.is_some() && streaming.is_some()) {
+            polls += 1;
             // SAFETY: interfaces are released below on every exit path.
             unsafe {
                 let Some(device) = find_device_interface(self.vendor, self.product) else {
@@ -226,6 +279,11 @@ impl Dac {
                     streaming = open_interface(device, self.native.streaming_interface);
                 }
                 if let (Some(control), Some(streaming)) = (control, streaming) {
+                    debug!(
+                        "{}: won the race in {polls} polls over {:.1} ms",
+                        self.name,
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
                     return Ok(Held::claim(
                         device,
                         control,
@@ -247,9 +305,7 @@ impl Dac {
             }
         }
         bail!(
-            "{}: lost the race for its audio interfaces after {:.1} s; another process \
-             claimed them first. Try again.",
-            self.name,
+            "still held after {:.1} s and {polls} polls",
             started.elapsed().as_secs_f64()
         )
     }
@@ -545,12 +601,63 @@ unsafe fn device_interface(service: sys::io_service_t) -> Option<DeviceRef> {
     }
 }
 
+/// A CoreFoundation number holding one 32-bit value, or null if it could not be made.
+///
+/// SAFETY: the caller owns the result and must release it.
+unsafe fn cf_number(value: i32) -> sys::CFNumberRef {
+    unsafe {
+        sys::CFNumberCreate(
+            sys::kCFAllocatorDefault,
+            sys::kCFNumberSInt32Type as sys::CFNumberType,
+            ptr::from_ref(&value).cast::<c_void>(),
+        )
+    }
+}
+
+/// A matching dictionary for one USB device, keyed by its vendor and product id.
+///
+/// The ids go into the dictionary rather than being compared afterwards because the race
+/// runs this every poll: matching in the kernel returns one service, where matching on the
+/// class alone returns every attached USB device and costs a plugin interface for each.
+///
+/// SAFETY: the result is consumed by `IOServiceGetMatchingServices`, or must be released.
+unsafe fn matching_device(vendor: u16, product: u16) -> sys::CFMutableDictionaryRef {
+    unsafe {
+        let class = CString::new("IOUSBHostDevice").expect("literal has no interior nul");
+        let matching = sys::IOServiceMatching(class.as_ptr());
+        if matching.is_null() {
+            return matching;
+        }
+        for (name, value) in [("idVendor", vendor), ("idProduct", product)] {
+            let Ok(name) = CString::new(name) else {
+                continue;
+            };
+            let key = sys::CFStringCreateWithCString(
+                sys::kCFAllocatorDefault,
+                name.as_ptr(),
+                sys::kCFStringEncodingUTF8,
+            );
+            let number = cf_number(i32::from(value));
+            if !key.is_null() && !number.is_null() {
+                // The dictionary retains both, so the refs made here are released either way.
+                sys::CFDictionarySetValue(matching, key.cast(), number.cast());
+            }
+            if !key.is_null() {
+                sys::CFRelease(key.cast());
+            }
+            if !number.is_null() {
+                sys::CFRelease(number.cast());
+            }
+        }
+        matching
+    }
+}
+
 /// Find a device by vendor and product id, returning an opened device interface.
 unsafe fn find_device_interface(vendor: u16, product: u16) -> Option<DeviceRef> {
     // SAFETY: the matching dictionary is consumed; every service is released.
     unsafe {
-        let class = CString::new("IOUSBHostDevice").expect("literal has no interior nul");
-        let matching = sys::IOServiceMatching(class.as_ptr());
+        let matching = matching_device(vendor, product);
         if matching.is_null() {
             return None;
         }
@@ -566,18 +673,8 @@ unsafe fn find_device_interface(vendor: u16, product: u16) -> Option<DeviceRef> 
             if service == 0 {
                 break;
             }
-            if result.is_none()
-                && let Some(device) = device_interface(service)
-            {
-                let mut this_vendor = 0;
-                let mut this_product = 0;
-                call!(device, GetDeviceVendor, &raw mut this_vendor);
-                call!(device, GetDeviceProduct, &raw mut this_product);
-                if this_vendor == vendor && this_product == product {
-                    result = Some(device);
-                } else {
-                    call!(device, Release);
-                }
+            if result.is_none() {
+                result = device_interface(service);
             }
             sys::IOObjectRelease(service);
         }

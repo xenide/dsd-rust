@@ -153,7 +153,7 @@ impl Worker {
             self.advance_if_complete();
             self.publish();
         }
-        self.end_session();
+        self.stop_playback();
     }
 
     fn handle(&mut self, command: Command) {
@@ -166,7 +166,7 @@ impl Worker {
                 Some(session) => session.set_paused(!session.is_paused()),
                 None => self.start(self.index),
             },
-            Command::Stop => self.end_session(),
+            Command::Stop => self.stop_playback(),
             Command::Skip(delta) => {
                 let next = self.index as i32 + delta;
                 if next >= 0 && (next as usize) < self.playlist.len() {
@@ -185,7 +185,7 @@ impl Worker {
         };
         self.index = index;
         self.set_error(None);
-        match Playback::open(&path, &self.target, &self.options, &self.stop) {
+        match Playback::open(&path, &mut self.target, &self.options, &self.stop) {
             Ok(session) => self.session = Some(session),
             Err(error) => self.set_error(Some(format!("{path:?}: {error:#}"))),
         }
@@ -200,17 +200,25 @@ impl Worker {
         if next < self.playlist.len() {
             self.start(next);
         } else {
-            self.end_session();
+            self.stop_playback();
         }
     }
 
+    /// End the current track, leaving a natively claimed DAC held for the next one.
     fn end_session(&mut self) {
         let Some(session) = self.session.take() else {
             return;
         };
-        if let Err(error) = session.finish() {
+        if let Err(error) = session.finish(&mut self.target) {
             self.set_error(Some(format!("{error:#}")));
         }
+    }
+
+    /// Stop playing altogether and give a natively claimed DAC back, so the rest of the
+    /// system can use it again while nothing is playing.
+    fn stop_playback(&mut self) {
+        self.end_session();
+        self.target.release_dac();
     }
 
     fn set_error(&self, error: Option<String>) {
