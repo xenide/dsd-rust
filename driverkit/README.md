@@ -105,6 +105,14 @@ period of the allocation while a driver using the whole allocation sweeps past i
 plays a whole in-flight window later, and the host writes barely ahead of what is playing, so
 reading where the engine is queueing reads what the host has not written yet.
 
+**The default format is the head of the published list, and it has to be asserted twice.**
+Everything the OS plays goes out at whatever width the device defaults to, so building the
+list in descriptor order handed the whole machine the narrowest format the DAC accepts -- this
+one lists 16 bit first. `BuildFormats` leads with the widest subslot instead, which is also
+what an application that takes the first format it is offered gets. Setting it on the stream
+before `AddObject` is not enough on its own: it comes back as the narrowest published once
+Core Audio picks the device up, so it is set again afterwards and both values logged.
+
 ## Layout
 
 | file | what it is |

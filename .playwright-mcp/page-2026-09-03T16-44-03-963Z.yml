@@ -1,0 +1,852 @@
+- generic [ref=e73]:
+  - banner [ref=e75]:
+    - generic [ref=e77]:
+      - generic [ref=e78]:
+        - button "Guide" [ref=e80] [cursor=pointer]
+        - generic [ref=e84]:
+          - link "YouTube Home" [ref=e85] [cursor=pointer]:
+            - /url: /
+          - generic [ref=e91]: FR
+        - button "Skip navigation" [ref=e95] [cursor=pointer]
+      - search [ref=e100]:
+        - generic [ref=e102]:
+          - combobox "Search" [expanded] [ref=e105]
+          - button "Search" [ref=e106] [cursor=pointer]
+      - generic [ref=e111]:
+        - button "Settings" [ref=e116] [cursor=pointer]
+        - link "Sign in" [ref=e122] [cursor=pointer]:
+          - /url: https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26hl%3Den%26next%3Dhttps%253A%252F%252Fwww.youtube.com%252Fwatch%253Fv%253DjNQXAC9IVRw&hl=en&ec=65620
+  - main [ref=e127]:
+    - generic [ref=e128]:
+      - generic [ref=e130]:
+        - generic [ref=e133]:
+          - generic [aria-hidden] [ref=e136] [cursor=pointer]
+          - complementary [ref=e137]:
+            - generic "YouTube Video Player" [active] [ref=e5]:
+              - button [ref=e12] [cursor=pointer]:
+                - img "Channel watermark" [ref=e13]
+              - generic: really really long trunks
+              - generic [ref=e14]:
+                - generic [ref=e15] [cursor=pointer]:
+                  - slider "Seek slider" [ref=e16]
+                  - generic:
+                    - generic:
+                      - generic:
+                        - slider "Click or scroll the panel for the precise seeking."
+                - generic [ref=e25]:
+                  - generic [ref=e26]:
+                    - button "Pause (k)" [ref=e27] [cursor=pointer]
+                    - generic [ref=e28]:
+                      - button "Mute (m)" [ref=e30] [cursor=pointer]
+                      - slider "Volume":
+                        - generic [ref=e31] [cursor=pointer]
+                    - button "0 Minutes 10 Seconds of 0 Minutes 19 Seconds" [ref=e160] [cursor=pointer]: 0:10 / 0:19
+                    - button "The cool thing" [ref=e162] [cursor=pointer]
+                  - generic [ref=e35]:
+                    - generic [ref=e36]:
+                      - button "Autoplay is on" [ref=e165] [cursor=pointer]
+                      - button "Subtitles/closed captions unavailable" [pressed] [ref=e37] [cursor=pointer]
+                      - button "Settings" [ref=e39] [cursor=pointer]
+                    - generic [ref=e40]:
+                      - button "Theater mode (t)" [ref=e41] [cursor=pointer]
+                      - button "Full screen (f)" [ref=e42] [cursor=pointer]
+        - generic [ref=e168]:
+          - generic [ref=e169]:
+            - generic [ref=e171]:
+              - heading "Me at the zoo" [level=1] [ref=e174]
+              - generic [ref=e175]:
+                - generic [ref=e176]:
+                  - generic [ref=e177]:
+                    - link [ref=e178] [cursor=pointer]:
+                      - /url: /@jawed
+                      - img "jawed" [ref=e180]
+                    - generic [ref=e181]:
+                      - generic [ref=e182]:
+                        - generic "jawed" [ref=e185]:
+                          - link "jawed" [ref=e186] [cursor=pointer]:
+                            - /url: /@jawed
+                        - img "Verified" [ref=e191]
+                      - generic "6.5 million subscribers" [ref=e195]: 6.5M subscribers
+                  - button "Subscribe to jawed." [ref=e201] [cursor=pointer]:
+                    - generic: Subscribe
+                - generic [ref=e208]:
+                  - generic [ref=e209]:
+                    - generic [ref=e213]:
+                      - button "like this video along with 19,579,479 other people" [ref=e217] [cursor=pointer]:
+                        - generic:
+                          - generic [aria-hidden]:
+                            - generic:
+                              - generic: "1"
+                              - generic: "2"
+                              - generic: "3"
+                              - generic: "4"
+                              - generic: "5"
+                              - generic: "6"
+                              - generic: "7"
+                              - generic: "8"
+                              - generic: "9"
+                              - generic: "0"
+                              - generic: "1"
+                              - generic: "2"
+                              - generic: "3"
+                              - generic: "4"
+                              - generic: "5"
+                              - generic: "6"
+                              - generic: "7"
+                              - generic: "8"
+                              - generic: "9"
+                              - generic: "0"
+                              - generic: "1"
+                              - generic: "2"
+                              - generic: "3"
+                              - generic: "4"
+                              - generic: "5"
+                              - generic: "6"
+                              - generic: "7"
+                              - generic: "8"
+                              - generic: "9"
+                            - generic:
+                              - generic: "1"
+                              - generic: "2"
+                              - generic: "3"
+                              - generic: "4"
+                              - generic: "5"
+                              - generic: "6"
+                              - generic: "7"
+                              - generic: "8"
+                              - generic: "9"
+                              - generic: "0"
+                              - generic: "1"
+                              - generic: "2"
+                              - generic: "3"
+                              - generic: "4"
+                              - generic: "5"
+                              - generic: "6"
+                              - generic: "7"
+                              - generic: "8"
+                              - generic: "9"
+                              - generic: "0"
+                              - generic: "1"
+                              - generic: "2"
+                              - generic: "3"
+                              - generic: "4"
+                              - generic: "5"
+                              - generic: "6"
+                              - generic: "7"
+                              - generic: "8"
+                              - generic: "9"
+                            - generic: M
+                      - button "Dislike this video" [ref=e224] [cursor=pointer]
+                    - button "Share" [ref=e230] [cursor=pointer]
+                  - button "Save to playlist" [ref=e237] [cursor=pointer]:
+                    - generic: Save
+                  - button "More actions" [ref=e242] [cursor=pointer]
+              - generic [ref=e248]:
+                - generic [ref=e250]:
+                  - generic "415,119,187 views" [ref=e251]:
+                    - generic [aria-hidden] [ref=e252]:
+                      - generic [ref=e253]:
+                        - generic [ref=e255]: "1"
+                        - generic [ref=e256]: "2"
+                        - generic [ref=e257]: "3"
+                        - generic [ref=e258]: "4"
+                        - generic [ref=e259]: "5"
+                        - generic [ref=e260]: "6"
+                        - generic [ref=e261]: "7"
+                        - generic [ref=e262]: "8"
+                        - generic [ref=e263]: "9"
+                        - generic [ref=e264]: "0"
+                        - generic [ref=e265]: "1"
+                        - generic [ref=e266]: "2"
+                        - generic [ref=e267]: "3"
+                        - generic [ref=e268]: "4"
+                        - generic [ref=e269]: "5"
+                        - generic [ref=e270]: "6"
+                        - generic [ref=e271]: "7"
+                        - generic [ref=e272]: "8"
+                        - generic [ref=e273]: "9"
+                        - generic [ref=e274]: "0"
+                        - generic [ref=e275]: "1"
+                        - generic [ref=e276]: "2"
+                        - generic [ref=e277]: "3"
+                        - generic [ref=e278]: "4"
+                        - generic [ref=e279]: "5"
+                        - generic [ref=e280]: "6"
+                        - generic [ref=e281]: "7"
+                        - generic [ref=e282]: "8"
+                        - generic [ref=e283]: "9"
+                      - generic [ref=e285]:
+                        - generic [ref=e287]: "1"
+                        - generic [ref=e288]: "2"
+                        - generic [ref=e289]: "3"
+                        - generic [ref=e290]: "4"
+                        - generic [ref=e291]: "5"
+                        - generic [ref=e292]: "6"
+                        - generic [ref=e293]: "7"
+                        - generic [ref=e294]: "8"
+                        - generic [ref=e295]: "9"
+                        - generic [ref=e296]: "0"
+                        - generic [ref=e297]: "1"
+                        - generic [ref=e298]: "2"
+                        - generic [ref=e299]: "3"
+                        - generic [ref=e300]: "4"
+                        - generic [ref=e301]: "5"
+                        - generic [ref=e302]: "6"
+                        - generic [ref=e303]: "7"
+                        - generic [ref=e304]: "8"
+                        - generic [ref=e305]: "9"
+                        - generic [ref=e306]: "0"
+                        - generic [ref=e307]: "1"
+                        - generic [ref=e308]: "2"
+                        - generic [ref=e309]: "3"
+                        - generic [ref=e310]: "4"
+                        - generic [ref=e311]: "5"
+                        - generic [ref=e312]: "6"
+                        - generic [ref=e313]: "7"
+                        - generic [ref=e314]: "8"
+                        - generic [ref=e315]: "9"
+                      - generic [ref=e317]:
+                        - generic [ref=e319]: "1"
+                        - generic [ref=e320]: "2"
+                        - generic [ref=e321]: "3"
+                        - generic [ref=e322]: "4"
+                        - generic [ref=e323]: "5"
+                        - generic [ref=e324]: "6"
+                        - generic [ref=e325]: "7"
+                        - generic [ref=e326]: "8"
+                        - generic [ref=e327]: "9"
+                        - generic [ref=e328]: "0"
+                        - generic [ref=e329]: "1"
+                        - generic [ref=e330]: "2"
+                        - generic [ref=e331]: "3"
+                        - generic [ref=e332]: "4"
+                        - generic [ref=e333]: "5"
+                        - generic [ref=e334]: "6"
+                        - generic [ref=e335]: "7"
+                        - generic [ref=e336]: "8"
+                        - generic [ref=e337]: "9"
+                        - generic [ref=e338]: "0"
+                        - generic [ref=e339]: "1"
+                        - generic [ref=e340]: "2"
+                        - generic [ref=e341]: "3"
+                        - generic [ref=e342]: "4"
+                        - generic [ref=e343]: "5"
+                        - generic [ref=e344]: "6"
+                        - generic [ref=e345]: "7"
+                        - generic [ref=e346]: "8"
+                        - generic [ref=e347]: "9"
+                      - generic [ref=e349]: ","
+                      - generic [ref=e353]:
+                        - generic [ref=e355]: "1"
+                        - generic [ref=e356]: "2"
+                        - generic [ref=e357]: "3"
+                        - generic [ref=e358]: "4"
+                        - generic [ref=e359]: "5"
+                        - generic [ref=e360]: "6"
+                        - generic [ref=e361]: "7"
+                        - generic [ref=e362]: "8"
+                        - generic [ref=e363]: "9"
+                        - generic [ref=e364]: "0"
+                        - generic [ref=e365]: "1"
+                        - generic [ref=e366]: "2"
+                        - generic [ref=e367]: "3"
+                        - generic [ref=e368]: "4"
+                        - generic [ref=e369]: "5"
+                        - generic [ref=e370]: "6"
+                        - generic [ref=e371]: "7"
+                        - generic [ref=e372]: "8"
+                        - generic [ref=e373]: "9"
+                        - generic [ref=e374]: "0"
+                        - generic [ref=e375]: "1"
+                        - generic [ref=e376]: "2"
+                        - generic [ref=e377]: "3"
+                        - generic [ref=e378]: "4"
+                        - generic [ref=e379]: "5"
+                        - generic [ref=e380]: "6"
+                        - generic [ref=e381]: "7"
+                        - generic [ref=e382]: "8"
+                        - generic [ref=e383]: "9"
+                      - generic [ref=e385]:
+                        - generic [ref=e387]: "1"
+                        - generic [ref=e388]: "2"
+                        - generic [ref=e389]: "3"
+                        - generic [ref=e390]: "4"
+                        - generic [ref=e391]: "5"
+                        - generic [ref=e392]: "6"
+                        - generic [ref=e393]: "7"
+                        - generic [ref=e394]: "8"
+                        - generic [ref=e395]: "9"
+                        - generic [ref=e396]: "0"
+                        - generic [ref=e397]: "1"
+                        - generic [ref=e398]: "2"
+                        - generic [ref=e399]: "3"
+                        - generic [ref=e400]: "4"
+                        - generic [ref=e401]: "5"
+                        - generic [ref=e402]: "6"
+                        - generic [ref=e403]: "7"
+                        - generic [ref=e404]: "8"
+                        - generic [ref=e405]: "9"
+                        - generic [ref=e406]: "0"
+                        - generic [ref=e407]: "1"
+                        - generic [ref=e408]: "2"
+                        - generic [ref=e409]: "3"
+                        - generic [ref=e410]: "4"
+                        - generic [ref=e411]: "5"
+                        - generic [ref=e412]: "6"
+                        - generic [ref=e413]: "7"
+                        - generic [ref=e414]: "8"
+                        - generic [ref=e415]: "9"
+                      - generic [ref=e417]:
+                        - generic [ref=e419]: "1"
+                        - generic [ref=e420]: "2"
+                        - generic [ref=e421]: "3"
+                        - generic [ref=e422]: "4"
+                        - generic [ref=e423]: "5"
+                        - generic [ref=e424]: "6"
+                        - generic [ref=e425]: "7"
+                        - generic [ref=e426]: "8"
+                        - generic [ref=e427]: "9"
+                        - generic [ref=e428]: "0"
+                        - generic [ref=e429]: "1"
+                        - generic [ref=e430]: "2"
+                        - generic [ref=e431]: "3"
+                        - generic [ref=e432]: "4"
+                        - generic [ref=e433]: "5"
+                        - generic [ref=e434]: "6"
+                        - generic [ref=e435]: "7"
+                        - generic [ref=e436]: "8"
+                        - generic [ref=e437]: "9"
+                        - generic [ref=e438]: "0"
+                        - generic [ref=e439]: "1"
+                        - generic [ref=e440]: "2"
+                        - generic [ref=e441]: "3"
+                        - generic [ref=e442]: "4"
+                        - generic [ref=e443]: "5"
+                        - generic [ref=e444]: "6"
+                        - generic [ref=e445]: "7"
+                        - generic [ref=e446]: "8"
+                        - generic [ref=e447]: "9"
+                      - generic [ref=e449]: ","
+                      - generic [ref=e453]:
+                        - generic [ref=e455]: "1"
+                        - generic [ref=e456]: "2"
+                        - generic [ref=e457]: "3"
+                        - generic [ref=e458]: "4"
+                        - generic [ref=e459]: "5"
+                        - generic [ref=e460]: "6"
+                        - generic [ref=e461]: "7"
+                        - generic [ref=e462]: "8"
+                        - generic [ref=e463]: "9"
+                        - generic [ref=e464]: "0"
+                        - generic [ref=e465]: "1"
+                        - generic [ref=e466]: "2"
+                        - generic [ref=e467]: "3"
+                        - generic [ref=e468]: "4"
+                        - generic [ref=e469]: "5"
+                        - generic [ref=e470]: "6"
+                        - generic [ref=e471]: "7"
+                        - generic [ref=e472]: "8"
+                        - generic [ref=e473]: "9"
+                        - generic [ref=e474]: "0"
+                        - generic [ref=e475]: "1"
+                        - generic [ref=e476]: "2"
+                        - generic [ref=e477]: "3"
+                        - generic [ref=e478]: "4"
+                        - generic [ref=e479]: "5"
+                        - generic [ref=e480]: "6"
+                        - generic [ref=e481]: "7"
+                        - generic [ref=e482]: "8"
+                        - generic [ref=e483]: "9"
+                      - generic [ref=e485]:
+                        - generic [ref=e487]: "1"
+                        - generic [ref=e488]: "2"
+                        - generic [ref=e489]: "3"
+                        - generic [ref=e490]: "4"
+                        - generic [ref=e491]: "5"
+                        - generic [ref=e492]: "6"
+                        - generic [ref=e493]: "7"
+                        - generic [ref=e494]: "8"
+                        - generic [ref=e495]: "9"
+                        - generic [ref=e496]: "0"
+                        - generic [ref=e497]: "1"
+                        - generic [ref=e498]: "2"
+                        - generic [ref=e499]: "3"
+                        - generic [ref=e500]: "4"
+                        - generic [ref=e501]: "5"
+                        - generic [ref=e502]: "6"
+                        - generic [ref=e503]: "7"
+                        - generic [ref=e504]: "8"
+                        - generic [ref=e505]: "9"
+                        - generic [ref=e506]: "0"
+                        - generic [ref=e507]: "1"
+                        - generic [ref=e508]: "2"
+                        - generic [ref=e509]: "3"
+                        - generic [ref=e510]: "4"
+                        - generic [ref=e511]: "5"
+                        - generic [ref=e512]: "6"
+                        - generic [ref=e513]: "7"
+                        - generic [ref=e514]: "8"
+                        - generic [ref=e515]: "9"
+                      - generic [ref=e517]:
+                        - generic [ref=e519]: "1"
+                        - generic [ref=e520]: "2"
+                        - generic [ref=e521]: "3"
+                        - generic [ref=e522]: "4"
+                        - generic [ref=e523]: "5"
+                        - generic [ref=e524]: "6"
+                        - generic [ref=e525]: "7"
+                        - generic [ref=e526]: "8"
+                        - generic [ref=e527]: "9"
+                        - generic [ref=e528]: "0"
+                        - generic [ref=e529]: "1"
+                        - generic [ref=e530]: "2"
+                        - generic [ref=e531]: "3"
+                        - generic [ref=e532]: "4"
+                        - generic [ref=e533]: "5"
+                        - generic [ref=e534]: "6"
+                        - generic [ref=e535]: "7"
+                        - generic [ref=e536]: "8"
+                        - generic [ref=e537]: "9"
+                        - generic [ref=e538]: "0"
+                        - generic [ref=e539]: "1"
+                        - generic [ref=e540]: "2"
+                        - generic [ref=e541]: "3"
+                        - generic [ref=e542]: "4"
+                        - generic [ref=e543]: "5"
+                        - generic [ref=e544]: "6"
+                        - generic [ref=e545]: "7"
+                        - generic [ref=e546]: "8"
+                        - generic [ref=e547]: "9"
+                    - generic [aria-hidden] [ref=e549]: views
+                  - generic [ref=e550]:
+                    - text: Apr 23, 2005
+                    - link "SAN DIEGO ZOO" [ref=e551] [cursor=pointer]:
+                      - /url: /results?search_query=San+Diego+Zoo&sp=EiG4AQHCARtDaElKeVlCX1NaVlUyWUFSUi1JMUpqZjA4RjA%253D
+                - generic [ref=e552]:
+                  - generic [ref=e555]:
+                    - text: Microplastics are accumulating in human brains at an alarming rate
+                    - 'link "YouTube Channel Link: Microplastics are accumulating in human brains at an alarming rate" [ref=e558] [cursor=pointer]':
+                      - /url: /watch?v=0PT5c1z3LL8
+                      - text: • Microplastics are accumulating in human br...
+                    - text: “Nanoplastics and Human Health” with Matthew J Campen, PhD, MSPH
+                    - 'link "YouTube Channel Link: “Nanoplastics and Human Health” with Matthew J Campen, PhD, MSPH" [ref=e562] [cursor=pointer]':
+                      - /url: /watch?v=RRBN_4L09Mg
+                      - text: • “Nanoplastics and Human Health” with Matth...
+                    - link "0 seconds" [ref=e565] [cursor=pointer]:
+                      - /url: /watch?v=jNQXAC9IVRw
+                      - text: 00:00
+                    - text: Intro
+                    - link "5 seconds" [ref=e567] [cursor=pointer]:
+                      - /url: /watch?v=jNQXAC9IVRw&t=5s
+                      - text: 00:05
+                    - text: The cool thing
+                    - link "17 seconds" [ref=e569] [cursor=pointer]:
+                      - /url: /watch?v=jNQXAC9IVRw&t=17s
+                      - text: 00:17
+                    - text: End
+                  - generic [ref=e572]:
+                    - generic [ref=e574]:
+                      - heading "Chapters View all" [level=2] [ref=e576]:
+                        - generic [ref=e578]:
+                          - generic [ref=e579]: Chapters
+                          - button "View all" [ref=e584] [cursor=pointer]
+                      - generic [ref=e590]:
+                        - link "Intro 0:00" [ref=e592] [cursor=pointer]:
+                          - /url: /watch?v=jNQXAC9IVRw
+                          - generic [ref=e595]:
+                            - heading "Intro" [level=3] [ref=e596]
+                            - generic [ref=e597]: 0:00
+                        - link "The cool thing 0:05" [ref=e599] [cursor=pointer]:
+                          - /url: /watch?v=jNQXAC9IVRw&t=5s
+                          - generic [ref=e602]:
+                            - heading "The cool thing" [level=3] [ref=e603]
+                            - generic [ref=e604]: 0:05
+                        - link "End 0:17" [ref=e606] [cursor=pointer]:
+                          - /url: /watch?v=jNQXAC9IVRw&t=17s
+                          - generic [ref=e609]:
+                            - heading "End" [level=3] [ref=e610]
+                            - generic [ref=e611]: 0:17
+                    - generic [ref=e612]:
+                      - generic [ref=e613]: Transcript
+                      - paragraph [ref=e616]: Follow along using the transcript.
+                      - button "Show transcript" [ref=e621] [cursor=pointer]
+                    - generic [ref=e625]:
+                      - link "jawed 6.5M subscribers" [ref=e626] [cursor=pointer]:
+                        - /url: /@jawed
+                        - generic [ref=e628]:
+                          - heading "jawed" [level=3] [ref=e629]
+                          - generic [ref=e630]: 6.5M subscribers
+                      - generic [ref=e633]:
+                        - link "Videos" [ref=e636] [cursor=pointer]:
+                          - /url: /channel/UC4QobU6STFB0P71PMvOGN5A/videos
+                        - link "About" [ref=e642] [cursor=pointer]:
+                          - /url: /channel/UC4QobU6STFB0P71PMvOGN5A/about
+                  - button "Show less" [ref=e646] [cursor=pointer]
+            - text: •
+          - heading "Comments" [level=2] [ref=e653]
+      - generic [ref=e732]:
+        - generic [ref=e734] [cursor=pointer]:
+          - link [aria-hidden] [ref=e735]:
+            - /url: /watch?v=9qbuGWftOVw
+            - img [ref=e741]:
+              - generic [ref=e742]: 22:11
+          - generic [ref=e744]:
+            - generic [ref=e745]:
+              - heading "School Stories That Sound Fake But Actually Happened" [level=3] [ref=e746]:
+                - link "School Stories That Sound Fake But Actually Happened 22 minutes" [ref=e747]:
+                  - /url: /watch?v=9qbuGWftOVw
+                  - text: School Stories That Sound Fake But Actually Happened
+              - generic [ref=e749]:
+                - group [ref=e750]:
+                  - generic [ref=e751]: C Daily
+                - group [ref=e757]:
+                  - generic "266 thousand views" [ref=e761]: 266K
+                  - generic "3 weeks ago" [ref=e762]: 3w ago
+            - button "More actions" [ref=e765]
+        - generic [ref=e770] [cursor=pointer]:
+          - link [aria-hidden] [ref=e771]:
+            - /url: /watch?v=bRxjG0xyNmE
+            - img [ref=e777]:
+              - generic [ref=e778]: 22:53
+          - generic [ref=e780]:
+            - generic [ref=e781]:
+              - heading "When Animals Think No One’s Watching 😂 Backyard Edition" [level=3] [ref=e782]:
+                - link "When Animals Think No One’s Watching 😂 Backyard Edition 22 minutes" [ref=e783]:
+                  - /url: /watch?v=bRxjG0xyNmE
+                  - text: When Animals Think No One’s Watching 😂 Backyard Edition
+              - generic [ref=e785]:
+                - group [ref=e786]:
+                  - generic [ref=e787]: Novella
+                - group [ref=e793]:
+                  - generic "601 thousand views" [ref=e797]: 601K
+                  - generic "5 months ago" [ref=e798]: 5mo ago
+            - button "More actions" [ref=e801]
+        - generic [ref=e806] [cursor=pointer]:
+          - link [aria-hidden] [ref=e807]:
+            - /url: /watch?v=Kf5N5baXp7k&pp=ugUEEgJlbg%3D%3D
+            - img [ref=e813]:
+              - generic [ref=e814]: 14:09
+          - generic [ref=e816]:
+            - generic [ref=e817]:
+              - heading "I Tried The FREAKIEST Verity Mod in Minecraft..." [level=3] [ref=e818]:
+                - link "I Tried The FREAKIEST Verity Mod in Minecraft... 14 minutes, 9 seconds" [ref=e819]:
+                  - /url: /watch?v=Kf5N5baXp7k&pp=ugUEEgJlbg%3D%3D
+                  - text: I Tried The FREAKIEST Verity Mod in Minecraft...
+              - generic [ref=e821]:
+                - group [ref=e822]:
+                  - generic [ref=e823]: The Enchanted Stick
+                - group [ref=e824]:
+                  - generic "664 thousand views" [ref=e828]: 664K
+                  - generic "3 weeks ago" [ref=e829]: 3w ago
+            - button "More actions" [ref=e832]
+        - generic [ref=e837] [cursor=pointer]:
+          - link [aria-hidden] [ref=e838]:
+            - /url: /watch?v=gfEZCDFQYNk
+            - img [ref=e844]:
+              - generic [ref=e845]: 4:01
+          - generic [ref=e847]:
+            - generic [ref=e848]:
+              - heading "KPoop (YTP) KPop Demon Hunters Parody 2" [level=3] [ref=e849]:
+                - link "KPoop (YTP) KPop Demon Hunters Parody 2 4 minutes, 1 second" [ref=e850]:
+                  - /url: /watch?v=gfEZCDFQYNk
+                  - text: KPoop (YTP) KPop Demon Hunters Parody 2
+              - generic [ref=e852]:
+                - group [ref=e853]:
+                  - generic [ref=e854]: PoopSicle
+                - group [ref=e855]:
+                  - generic "3.7 million views" [ref=e859]: 3.7M
+                  - generic "6 months ago" [ref=e860]: 6mo ago
+            - button "More actions" [ref=e863]
+        - generic [ref=e868] [cursor=pointer]:
+          - link [aria-hidden] [ref=e869]:
+            - /url: /watch?v=C3GM18M3rss
+            - img [ref=e875]:
+              - generic [ref=e876]: 4:29
+          - generic [ref=e878]:
+            - generic [ref=e879]:
+              - 'heading "UNCUT: Saddam Hussain''s Live Reaction to His Death Sentence." [level=3] [ref=e880]':
+                - 'link "UNCUT: Saddam Hussain''s Live Reaction to His Death Sentence. 4 minutes, 29 seconds" [ref=e881]':
+                  - /url: /watch?v=C3GM18M3rss
+                  - text: "UNCUT: Saddam Hussain's Live Reaction to His Death Sentence."
+              - generic [ref=e883]:
+                - group [ref=e884]:
+                  - generic [ref=e885]: History City 4K
+                - group [ref=e886]:
+                  - generic "12 million views" [ref=e890]: 12M
+                  - generic "2 years ago" [ref=e891]: 2y ago
+            - button "More actions" [ref=e894]
+        - generic [ref=e899] [cursor=pointer]:
+          - link [aria-hidden] [ref=e900]:
+            - /url: /watch?v=W5v_IrhO-1w&pp=ugUHEgVlbi1VUw%3D%3D
+            - img [ref=e906]:
+              - generic [ref=e907]: 32:22
+          - generic [ref=e909]:
+            - generic [ref=e910]:
+              - heading "Why the Mariana Trench Still Terrifies Scientists" [level=3] [ref=e911]:
+                - link "Why the Mariana Trench Still Terrifies Scientists 32 minutes" [ref=e912]:
+                  - /url: /watch?v=W5v_IrhO-1w&pp=ugUHEgVlbi1VUw%3D%3D
+                  - text: Why the Mariana Trench Still Terrifies Scientists
+              - generic [ref=e914]:
+                - group [ref=e915]:
+                  - generic [ref=e916]: YESTERDAY
+                - group [ref=e917]:
+                  - generic "2 million views" [ref=e921]: 2M
+                  - generic "3 weeks ago" [ref=e922]: 3w ago
+            - button "More actions" [ref=e925]
+        - generic [ref=e930] [cursor=pointer]:
+          - link [aria-hidden] [ref=e931]:
+            - /url: /watch?v=Eec3P8rFpQg&pp=ugUHEgVlbi1VUw%3D%3D
+            - img [ref=e937]:
+              - generic [ref=e938]: 28:06
+          - generic [ref=e940]:
+            - generic [ref=e941]:
+              - heading "I Asked 100 Girls to Rank Their Own Attractiveness" [level=3] [ref=e942]:
+                - link "I Asked 100 Girls to Rank Their Own Attractiveness 28 minutes" [ref=e943]:
+                  - /url: /watch?v=Eec3P8rFpQg&pp=ugUHEgVlbi1VUw%3D%3D
+                  - text: I Asked 100 Girls to Rank Their Own Attractiveness
+              - generic [ref=e945]:
+                - group [ref=e946]:
+                  - generic [ref=e947]: Sayko
+                - group [ref=e948]:
+                  - generic "737 thousand views" [ref=e952]: 737K
+                  - generic "1 month ago" [ref=e953]: 1mo ago
+            - button "More actions" [ref=e956]
+        - generic [ref=e961] [cursor=pointer]:
+          - link [aria-hidden] [ref=e962]:
+            - /url: /watch?v=R2Bvsswxhko&pp=ugUEEgJlbg%3D%3D
+            - img [ref=e968]:
+              - generic [ref=e969]: 17:20
+          - generic [ref=e971]:
+            - generic [ref=e972]:
+              - heading "Top 7 Wildest Live Trading Losses With Reactions" [level=3] [ref=e973]:
+                - link "Top 7 Wildest Live Trading Losses With Reactions 17 minutes" [ref=e974]:
+                  - /url: /watch?v=R2Bvsswxhko&pp=ugUEEgJlbg%3D%3D
+                  - text: Top 7 Wildest Live Trading Losses With Reactions
+              - generic [ref=e976]:
+                - group [ref=e977]:
+                  - generic [ref=e978]: Gas Fee TV
+                - group [ref=e979]:
+                  - generic "1.4 million views" [ref=e983]: 1.4M
+                  - generic "10 months ago" [ref=e984]: 10mo ago
+            - button "More actions" [ref=e987]
+        - generic [ref=e992] [cursor=pointer]:
+          - link [aria-hidden] [ref=e993]:
+            - /url: /watch?v=mH4NmqSl2FE
+            - img [ref=e999]:
+              - generic [ref=e1000]: 8:49
+          - generic [ref=e1002]:
+            - generic [ref=e1003]:
+              - heading "10 Times AI Said Things That Scientists Still Can't Explain" [level=3] [ref=e1004]:
+                - link "10 Times AI Said Things That Scientists Still Can't Explain 8 minutes, 49 seconds" [ref=e1005]:
+                  - /url: /watch?v=mH4NmqSl2FE
+                  - text: 10 Times AI Said Things That Scientists Still Can't Explain
+              - generic [ref=e1007]:
+                - group [ref=e1008]:
+                  - generic [ref=e1009]: MostAmazingTop10
+                - group [ref=e1015]:
+                  - generic "741 thousand views" [ref=e1019]: 741K
+                  - generic "1 month ago" [ref=e1020]: 1mo ago
+            - button "More actions" [ref=e1023]
+        - generic [ref=e1028] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1029]:
+            - /url: /watch?v=JAOfcx4cUaE
+            - img [ref=e1035]:
+              - generic [ref=e1036]: 17:09
+          - generic [ref=e1038]:
+            - generic [ref=e1039]:
+              - heading "Why Hitler Was Impossible To Kill" [level=3] [ref=e1040]:
+                - link "Why Hitler Was Impossible To Kill 17 minutes" [ref=e1041]:
+                  - /url: /watch?v=JAOfcx4cUaE
+                  - text: Why Hitler Was Impossible To Kill
+              - generic [ref=e1043]:
+                - group [ref=e1044]:
+                  - generic [ref=e1045]: Atrium
+                - group [ref=e1051]:
+                  - generic "978 thousand views" [ref=e1055]: 978K
+                  - generic "2 months ago" [ref=e1056]: 2mo ago
+            - button "More actions" [ref=e1059]
+        - generic [ref=e1064] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1065]:
+            - /url: /watch?v=jgsA06VCB24&pp=ugUEEgJlbtIHCQkaDAGHKiGM7w%3D%3D
+            - img [ref=e1071]:
+              - generic [ref=e1072]: 10:15
+          - generic [ref=e1074]:
+            - generic [ref=e1075]:
+              - heading "Can Average Men Beat A Professional Woman?" [level=3] [ref=e1076]:
+                - link "Can Average Men Beat A Professional Woman? 10 minutes, 15 seconds" [ref=e1077]:
+                  - /url: /watch?v=jgsA06VCB24&pp=ugUEEgJlbtIHCQkaDAGHKiGM7w%3D%3D
+                  - text: Can Average Men Beat A Professional Woman?
+              - generic [ref=e1079]:
+                - group [ref=e1080]:
+                  - generic [ref=e1081]: Brandon William
+                - group [ref=e1087]:
+                  - generic "551 thousand views" [ref=e1091]: 551K
+                  - generic "1 month ago" [ref=e1092]: 1mo ago
+            - button "More actions" [ref=e1095]
+        - generic [ref=e1100] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1101]:
+            - /url: /watch?v=HEyqytq0-is
+            - img [ref=e1107]:
+              - generic [ref=e1108]: 6:14
+          - generic [ref=e1110]:
+            - generic [ref=e1111]:
+              - heading "iShowSpeed in Peppa Pig" [level=3] [ref=e1112]:
+                - link "iShowSpeed in Peppa Pig 6 minutes, 14 seconds" [ref=e1113]:
+                  - /url: /watch?v=HEyqytq0-is
+                  - text: iShowSpeed in Peppa Pig
+              - generic [ref=e1115]:
+                - group [ref=e1116]:
+                  - generic [ref=e1117]: Peppa Pig Parodies
+                - group [ref=e1123]:
+                  - generic "168 million views" [ref=e1127]: 168M
+                  - generic "3 years ago" [ref=e1128]: 3y ago
+            - button "More actions" [ref=e1131]
+        - generic [ref=e1136] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1137]:
+            - /url: /watch?v=mPoSJyglrlE
+            - img [ref=e1143]:
+              - generic [ref=e1144]: 19:15
+          - generic [ref=e1146]:
+            - generic [ref=e1147]:
+              - heading "A Chaque Crash ma Manette devient Plus Bizarre ! (BeamNG)" [level=3] [ref=e1148]:
+                - link "A Chaque Crash ma Manette devient Plus Bizarre ! (BeamNG) 19 minutes" [ref=e1149]:
+                  - /url: /watch?v=mPoSJyglrlE
+                  - text: A Chaque Crash ma Manette devient Plus Bizarre ! (BeamNG)
+              - generic [ref=e1151]:
+                - group [ref=e1152]:
+                  - generic [ref=e1153]: StundZow Gaming
+                - group [ref=e1154]:
+                  - generic "509 thousand views" [ref=e1158]: 509K
+                  - generic "3 days ago" [ref=e1159]: 3d ago
+                - group [ref=e1160]:
+                  - generic [ref=e1161]: New
+            - button "More actions" [ref=e1167]
+        - generic [ref=e1172] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1173]:
+            - /url: /watch?v=rJYy0pHZDxA&pp=ugUEEgJlbg%3D%3D
+            - img [ref=e1179]:
+              - generic [ref=e1180]: 41:40
+          - generic [ref=e1182]:
+            - generic [ref=e1183]:
+              - heading "“Friendly” Cop Has No Idea Police Already Matched Her DNA After 23 Years" [level=3] [ref=e1184]:
+                - link "“Friendly” Cop Has No Idea Police Already Matched Her DNA After 23 Years 41 minutes" [ref=e1185]:
+                  - /url: /watch?v=rJYy0pHZDxA&pp=ugUEEgJlbg%3D%3D
+                  - text: “Friendly” Cop Has No Idea Police Already Matched Her DNA After 23 Years
+              - generic [ref=e1187]:
+                - group [ref=e1188]:
+                  - generic [ref=e1189]: Red File
+                - group [ref=e1190]:
+                  - generic "8.9 million views" [ref=e1194]: 8.9M
+                  - generic "3 weeks ago" [ref=e1195]: 3w ago
+            - button "More actions" [ref=e1198]
+        - generic [ref=e1203] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1204]:
+            - /url: /watch?v=IVCjC3A06hs
+            - img [ref=e1210]:
+              - generic [ref=e1211]: 1:19
+          - generic [ref=e1213]:
+            - generic [ref=e1214]:
+              - 'heading "YouTube’un İlk Videosu: “Me at the zoo” Hikayesi 🐘 | Bölüm 2" [level=3] [ref=e1215]':
+                - 'link "YouTube’un İlk Videosu: “Me at the zoo” Hikayesi 🐘 | Bölüm 2 1 minute, 19 seconds" [ref=e1216]':
+                  - /url: /watch?v=IVCjC3A06hs
+                  - text: "YouTube’un İlk Videosu: “Me at the zoo” Hikayesi 🐘 | Bölüm 2"
+              - generic [ref=e1218]:
+                - group [ref=e1219]:
+                  - generic [ref=e1220]: PixLab
+                - group [ref=e1221]:
+                  - generic "122 views" [ref=e1225]: "122"
+                  - generic "5 months ago" [ref=e1226]: 5mo ago
+            - button "More actions" [ref=e1229]
+        - generic [ref=e1234] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1235]:
+            - /url: /watch?v=DHxVLTMudIo&pp=ugUEEgJlbg%3D%3D
+            - img [ref=e1241]:
+              - generic [ref=e1242]: 16:41
+          - generic [ref=e1244]:
+            - generic [ref=e1245]:
+              - heading "Nobody Makes Tom Holland LAUGH Like Zendaya" [level=3] [ref=e1246]:
+                - link "Nobody Makes Tom Holland LAUGH Like Zendaya 16 minutes" [ref=e1247]:
+                  - /url: /watch?v=DHxVLTMudIo&pp=ugUEEgJlbg%3D%3D
+                  - text: Nobody Makes Tom Holland LAUGH Like Zendaya
+              - generic [ref=e1249]:
+                - group [ref=e1250]:
+                  - generic [ref=e1251]: Dunker Goat and Celebs Goat
+                - group [ref=e1252]:
+                  - generic "1.4 million views" [ref=e1256]: 1.4M
+                  - generic "3 weeks ago" [ref=e1257]: 3w ago
+            - button "More actions" [ref=e1260]
+        - generic [ref=e1265] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1266]:
+            - /url: /watch?v=-IFtTSyeFcE&pp=ugUEEgJlbg%3D%3D
+            - img [ref=e1272]:
+              - generic [ref=e1273]: 34:19
+          - generic [ref=e1275]:
+            - generic [ref=e1276]:
+              - heading "I Investigated Epstein’s Underground Tunnels" [level=3] [ref=e1277]:
+                - link "I Investigated Epstein’s Underground Tunnels 34 minutes" [ref=e1278]:
+                  - /url: /watch?v=-IFtTSyeFcE&pp=ugUEEgJlbg%3D%3D
+                  - text: I Investigated Epstein’s Underground Tunnels
+              - generic [ref=e1280]:
+                - group [ref=e1281]:
+                  - generic [ref=e1282]: SideQuest Drew
+                - group [ref=e1288]:
+                  - generic "6.2 million views" [ref=e1292]: 6.2M
+                  - generic "2 months ago" [ref=e1293]: 2mo ago
+            - button "More actions" [ref=e1296]
+        - generic [ref=e1301] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1302]:
+            - /url: /watch?v=YbNPrGLyJW0
+            - img [ref=e1308]:
+              - generic [ref=e1309]: 4:59
+          - generic [ref=e1311]:
+            - generic [ref=e1312]:
+              - heading "What if WW2 was a Group Chat" [level=3] [ref=e1313]:
+                - link "What if WW2 was a Group Chat 4 minutes, 59 seconds" [ref=e1314]:
+                  - /url: /watch?v=YbNPrGLyJW0
+                  - text: What if WW2 was a Group Chat
+              - generic [ref=e1316]:
+                - group [ref=e1317]:
+                  - generic [ref=e1318]: The Taker
+                - group [ref=e1319]:
+                  - generic "1.5 million views" [ref=e1323]: 1.5M
+                  - generic "1 year ago" [ref=e1324]: 1y ago
+            - button "More actions" [ref=e1327]
+        - generic [ref=e1332] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1333]:
+            - /url: /watch?v=FTlOd2nTjAg&pp=ugUHEgVlbi1VUw%3D%3D
+            - img [ref=e1339]:
+              - generic [ref=e1340]: 16:24
+          - generic [ref=e1342]:
+            - generic [ref=e1343]:
+              - heading "Kevko COACHES Me On STEAL AN EGG !" [level=3] [ref=e1344]:
+                - link "Kevko COACHES Me On STEAL AN EGG ! 16 minutes" [ref=e1345]:
+                  - /url: /watch?v=FTlOd2nTjAg&pp=ugUHEgVlbi1VUw%3D%3D
+                  - text: Kevko COACHES Me On STEAL AN EGG !
+              - generic [ref=e1347]:
+                - group [ref=e1348]:
+                  - generic [ref=e1349]: ChocolatAndVanillah
+                - group [ref=e1355]:
+                  - generic "12 thousand views" [ref=e1359]: 12K
+                  - generic "1 hour ago" [ref=e1360]: 1h ago
+                - group [ref=e1361]:
+                  - generic [ref=e1362]: New
+                  - generic [ref=e1366]: Auto-dubbed
+            - button "More actions" [ref=e1375]
+        - generic [ref=e1380] [cursor=pointer]:
+          - link [aria-hidden] [ref=e1381]:
+            - /url: /watch?v=566jt19bzHA&pp=ugUEEgJlbg%3D%3D
+            - img [ref=e1387]:
+              - generic [ref=e1388]: 28:53
+          - generic [ref=e1390]:
+            - generic [ref=e1391]:
+              - heading "28 Minutes of Hell - Volunteer Fighters Ambush Russian Advance in Heavy Close Combat @International Legionnaires | Ukraine" [level=3] [ref=e1392]:
+                - link "28 Minutes of Hell - Volunteer Fighters Ambush Russian Advance in Heavy Close Combat @International Legionnaires | Ukraine 28 minutes" [ref=e1393]:
+                  - /url: /watch?v=566jt19bzHA&pp=ugUEEgJlbg%3D%3D
+                  - text: 28 Minutes of Hell - Volunteer Fighters Ambush Russian Advance in Heavy Close Combat @International Legionnaires | Ukraine
+              - generic [ref=e1395]:
+                - group [ref=e1396]:
+                  - generic [ref=e1397]: Sinyor Military
+                - group [ref=e1403]:
+                  - generic "2.6 million views" [ref=e1407]: 2.6M
+                  - generic "4 months ago" [ref=e1408]: 4mo ago
+            - button "More actions" [ref=e1411]

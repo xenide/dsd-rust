@@ -141,7 +141,13 @@ int main() {
     Check(written > 0, "the RU7 publishes formats");
     Check(!formats[0].native_dsd, "PCM leads the format list, not native DSD");
     Check(formats[0].sample_rate == 44100.0, "the list starts at the lowest rate");
+    // The head of the list is what the device defaults to, so everything the OS plays goes
+    // out at this width. The RU7's descriptor lists 16 bit first; the widest is 32.
+    Check(formats[0].subslot_bytes == 4 && formats[0].bit_resolution == 32,
+          "the widest PCM subslot leads, not the one the descriptor lists first");
 
+    bool narrower_seen = false;
+    bool widened_again = false;
     bool trailing_native = false;
     bool pcm_after_native = false;
     bool native_at_1411200 = false;
@@ -156,8 +162,14 @@ int main() {
         if (trailing_native) {
             pcm_after_native = true;
         }
+        if (formats[index].subslot_bytes < formats[0].subslot_bytes) {
+            narrower_seen = true;
+        } else if (narrower_seen) {
+            widened_again = true;
+        }
     }
     Check(!pcm_after_native, "no PCM format follows a native one");
+    Check(!widened_again, "PCM subslots only ever narrow down the list");
     // 1411200 Hz needs 1416 bytes a microframe in four-byte subslots, past the 776 the
     // endpoint carries, so DSD512 is not on this DAC's native list.
     Check(!native_at_1411200, "DSD512 exceeds the native endpoint and is not published");

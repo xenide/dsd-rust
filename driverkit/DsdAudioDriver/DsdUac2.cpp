@@ -103,6 +103,13 @@ size_t ParseClockRange(const uint8_t* report, size_t length, uint32_t* out, size
 
 size_t BuildFormats(const Uac2Layout& layout, const uint32_t* rates, size_t rate_count,
                     FormatEntry* out, size_t capacity) {
+    uint8_t widest = 0;
+    for (size_t index = 0; index < layout.alt_count; index++) {
+        if (layout.alts[index].subslot_bytes > widest) {
+            widest = layout.alts[index].subslot_bytes;
+        }
+    }
+
     size_t written = 0;
     // Two passes so every PCM format precedes every native DSD one. Core Audio has no way
     // to say "this is DSD": native goes out as big endian non-mixable integer PCM, which is
@@ -110,30 +117,37 @@ size_t BuildFormats(const Uac2Layout& layout, const uint32_t* rates, size_t rate
     // native first and such an application picks it and writes PCM into a DSD stream, which
     // the DAC renders as ticks. Last, it is still there for anything that knows to look.
     for (int native_pass = 0; native_pass <= 1; native_pass++) {
-        for (size_t index = 0; index < layout.alt_count; index++) {
-            const AltSetting& alt = layout.alts[index];
-            const bool native = IsNativeDsd(alt);
-            if (native != (native_pass == 1)) {
-                continue;
-            }
-            for (size_t rate_index = 0; rate_index < rate_count && written < capacity;
-                 rate_index++) {
-                const uint32_t rate = rates[rate_index];
-                if (!AltCarriesRate(alt, rate)) {
+        // Widest subslot first inside each pass. The head of this list is the format the
+        // device defaults to, and the one an application that takes the first it is offered
+        // gets, so leading with the narrowest sends everything the OS plays out at that
+        // width. Descriptor order is no guide: this DAC lists 16 bit first.
+        for (uint8_t width = widest; width >= 1; width--) {
+            for (size_t index = 0; index < layout.alt_count; index++) {
+                const AltSetting& alt = layout.alts[index];
+                const bool native = IsNativeDsd(alt);
+                if (native != (native_pass == 1) || alt.subslot_bytes != width) {
                     continue;
                 }
-                FormatEntry& entry = out[written++];
-                entry.sample_rate = static_cast<double>(rate);
-                entry.alt_setting = alt.alt_setting;
-                entry.channels = alt.channels;
-                entry.bit_resolution = alt.bit_resolution;
-                entry.subslot_bytes = alt.subslot_bytes;
-                entry.native_dsd = native;
+                for (size_t rate_index = 0; rate_index < rate_count && written < capacity;
+                     rate_index++) {
+                    const uint32_t rate = rates[rate_index];
+                    if (!AltCarriesRate(alt, rate)) {
+                        continue;
+                    }
+                    FormatEntry& entry = out[written++];
+                    entry.sample_rate = static_cast<double>(rate);
+                    entry.alt_setting = alt.alt_setting;
+                    entry.channels = alt.channels;
+                    entry.bit_resolution = alt.bit_resolution;
+                    entry.subslot_bytes = alt.subslot_bytes;
+                    entry.native_dsd = native;
+                }
             }
         }
     }
     return written;
 }
+
 
 namespace {
 

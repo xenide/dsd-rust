@@ -554,11 +554,17 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
             rates[rate_count++] = entry.sample_rate;
         }
     }
-    Log("publishing %zu stream formats over %zu rates", published, rate_count);
+    // The head of the list is the default: the widest PCM the DAC accepts, at the lowest rate
+    // it reports. Everything the OS plays goes out at this width until something changes it,
+    // and the narrowest is a poor thing to hand a DAC by default.
+    const IOUserAudioStreamBasicDescription& fallback = formats[0];
+    Log("publishing %zu stream formats over %zu rates, default %.0f Hz %u bit in %u bytes",
+        published, rate_count, fallback.mSampleRate, fallback.mBitsPerChannel,
+        fallback.mBytesPerFrame / (fallback.mChannelsPerFrame != 0 ? fallback.mChannelsPerFrame : 1));
     ivars->stream->SetAvailableStreamFormats(formats, static_cast<uint32_t>(published));
-    ivars->stream->SetCurrentStreamFormat(&formats[0]);
+    ivars->stream->SetCurrentStreamFormat(&fallback);
     ivars->device->SetAvailableSampleRates(rates, rate_count);
-    ivars->device->SetSampleRate(formats[0].mSampleRate);
+    ivars->device->SetSampleRate(fallback.mSampleRate);
 
     result = ivars->device->AddStream(ivars->stream.get());
     if (result != kIOReturnSuccess) {
@@ -589,7 +595,16 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     result = AddObject(ivars->device.get());
     if (result != kIOReturnSuccess) {
         Log("AddObject failed: 0x%08x", result);
+        return result;
     }
+    // Again, now the device is registered. Set before that, the format does not survive
+    // Core Audio picking the device up: it comes back as the narrowest the DAC publishes,
+    // whatever the stream was told beforehand.
+    ivars->stream->SetCurrentStreamFormat(&fallback);
+    const IOUserAudioStreamBasicDescription settled = ivars->stream->GetCurrentStreamFormat();
+    Log("stream settled on %.0f Hz %u bit in %u bytes", settled.mSampleRate,
+        settled.mBitsPerChannel,
+        settled.mBytesPerFrame / (settled.mChannelsPerFrame != 0 ? settled.mChannelsPerFrame : 1));
     return result;
 }
 
