@@ -41,19 +41,33 @@ Both interfaces sit unmatched under the driver, which is the point: `usbaudiod` 
 them. The DAC then appears to every application, `dsd-rust devices` included, under the
 driver's own UID rather than `AppleUSBAudioEngine`.
 
-Audio plays. A file played to the DAC through the driver comes out of it, continuously, with
-no clock resets from Core Audio.
+Audio plays, as PCM and as native DSD. A file played to the DAC through the driver comes out
+of it, continuously, with no clock resets from Core Audio.
 
 ```
 DsdAudioDriver: host asked for 44100 Hz PCM, alternate setting 1, in-flight window 1411 frames
 DsdAudioDriver: host wrote 512 frames at sample 521028 (ring slot 836); engine reads at sample 520556 (slot 364)
 ```
 
-What is left is the feedback endpoint. The output endpoint is asynchronous: it runs on the
-DAC's clock and says how many samples per microframe it wants through a second endpoint. The
-driver opens that endpoint, submits a read, and the read never completes, so it falls back to
-sending the nominal count and runs open loop. Whether that drifts audibly over a long track
-is untested; over a minute it does not.
+```
+DsdAudioDriver: host asked for 352800 Hz native DSD, alternate setting 4, in-flight window 11289 frames
+DsdAudioDriver: streaming 352800 Hz on alt 4: ring 32768 frames of 8 bytes, feedback endpoint 0x81 pipe open
+```
+
+Native DSD is what the alternate setting exists for, and it is what Core Audio cannot reach
+on its own. `dsd-rust play` takes it whenever the file's rate has no PCM carrier: DSD256
+needs a 705600 Hz DoP carrier the DAC does not offer, and goes down alternate setting 4 at
+352800 frames a second instead.
+
+**The timestamp period is sized for the fastest rate, not the slowest.** Two things scale
+with it and both get worse as the rate rises. The host writes a safety offset ahead of the
+timeline while the driver reads an in-flight window behind it, so the pair sit more than
+twice that window apart in a ring exactly one period long: at 4096 frames and 352800 Hz they
+wrapped past each other several times a second. And a timestamp has to land on an exact
+multiple of the period, interpolated between two isochronous completions, so a period
+covering few transfers inherits the jitter of individual ones -- three transfers at 352800
+against twenty-three at 44100, and Core Audio read a rate 7% out and spent a minute and a
+half walking back from it. 32768 frames covers twenty-three transfers at 352800 again.
 
 A glitch every few seconds during development turned out not to be drift at all: it was a
 diagnostic that scanned the whole ring inside the isochronous completion handler. Work on
@@ -253,11 +267,13 @@ when the action carries no reference storage, which is the case for the action a
 back to an isochronous completion. Guard the IO path and identify transfers by comparing
 action pointers rather than through a reference.
 
-**A failed start pins the old copy.** A dext whose `Start` returns an error leaves its server
-process running, and that holds the previous staged bundle, so the next `activate` lands in
-`terminating for upgrade via delegate` and the kernel tries to launch a bundle that is being
-deleted. `pkill -f "SystemExtensions.*DsdAudioDriver"` between iterations avoids a confusing
-half hour.
+**`activate` alone does not swap the running code.** A dext with a live provider keeps its
+server process, and that process holds the bundle it launched from, so a rebuild stages and
+enables and then keeps serving the old code: `systemextensionsctl list` shows the new copy
+`activated enabled` beside the old one `terminating for upgrade via delegate`, and nothing
+changes until the old server exits. Either `sudo pkill -f "SystemExtensions.*DsdAudioDriver"`
+or unplug and replug the DAC. The same thing pins a dext whose `Start` returned an error,
+where the next `activate` then tries to launch a bundle that is being deleted.
 
 **Native DSD looks exactly like good PCM.** Core Audio has no DSD format, so native goes out
 as big endian non-mixable integer PCM. Anything hunting for a bit-perfect format will choose

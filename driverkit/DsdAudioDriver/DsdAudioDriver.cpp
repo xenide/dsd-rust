@@ -26,8 +26,23 @@ constexpr uint32_t kTransfersInFlight = 8;
 constexpr uint64_t kMicroframesPerFrame = 8;
 /// Bus frames to schedule the first transfer ahead of now.
 constexpr uint64_t kStartLead = 10;
-/// Sample frames between the timestamps the host reads to build its timeline.
-constexpr uint32_t kZeroTimestampPeriod = 4096;
+/// Sample frames between the timestamps the host reads to build its timeline, which is also
+/// the length of the ring the two share.
+///
+/// Sized for the fastest rate any DAC here publishes, not for the slowest, because both
+/// things that depend on it get worse as the rate rises.
+///
+/// The host writes a safety offset ahead of the timeline and the driver reads an in-flight
+/// window behind it, so the two are more than twice that window apart in the ring. At 384000
+/// frames a second the window alone is 12288 frames, and a ring of 4096 wrapped the pair past
+/// each other several times a second.
+///
+/// A timestamp also has to land on an exact multiple of this period, interpolated between two
+/// isochronous completions, so a period spanning few transfers inherits the jitter of
+/// individual ones. At 44100 a period of 4096 frames covered 23 transfers; at 352800 it
+/// covered three, and Core Audio read a rate 7% out and spent a minute and a half walking
+/// back from it. 32768 frames covers 23 transfers again at 352800.
+constexpr uint32_t kZeroTimestampPeriod = 32768;
 
 /// Widest sample frame any published format uses: two channels of four byte subslots.
 constexpr uint32_t kWidestFrameBytes = 8;
