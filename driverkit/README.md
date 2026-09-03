@@ -41,9 +41,29 @@ Both interfaces sit unmatched under the driver, which is the point: `usbaudiod` 
 them. The DAC then appears to every application, `dsd-rust devices` included, under the
 driver's own UID rather than `AppleUSBAudioEngine`.
 
-What is still unexercised is the isochronous data path. Nothing has been played through the
-driver: `StartDevice`, the alternate setting selection, the clock rate request and transfer
-submission have never run.
+The isochronous path runs. Playing a DSD64 file through `dsd-rust` selects an alternate
+setting, sets the clock, opens the pipe and streams transfers continuously, and the DAC locks
+to the carrier:
+
+```
+DsdAudioDriver: host asked for 176400 Hz PCM, using alternate setting 2
+DsdAudioDriver: streaming 176400 Hz on alt 2: ring 43690 frames of 6 bytes, 22.050 samples per microframe
+DsdAudioDriver: posted zero timestamp 4233 at host time 24051968285
+```
+
+Audio is not right yet, and two things are known wrong.
+
+**The ring goes quiet after about two seconds.** The host writes real audio into the stream
+buffer and the driver reads it -- for roughly two seconds, after which every transfer reads
+zeroes while transfers keep completing and the DAC stays locked. Something in the handshake
+between the timeline the driver publishes through `UpdateCurrentZeroTimestamp` and the
+position the host writes at comes apart. One candidate: the ring is `kRingFrames` times the
+widest frame, which is not a whole number of frames at every frame width -- 262144 bytes over
+six byte frames is 43690.67 -- so driver and host may disagree about where it wraps.
+
+**Only a client that opens the device explicitly starts IO.** `dsd-rust` reaches
+`StartDevice`; `afplay` against the same device as default output plays without error and
+Core Audio never starts IO on it at all.
 
 The descriptor parser is the part that carries the domain knowledge, and it has no DriverKit
 dependency for exactly that reason. It is checked two ways, neither of which needs the dext
@@ -240,5 +260,10 @@ process running, and that holds the previous staged bundle, so the next `activat
 deleted. `pkill -f "SystemExtensions.*DsdAudioDriver"` between iterations avoids a confusing
 half hour.
 
-**What is untested.** Everything past `Start`: alternate setting selection, the clock rate
-request, transfer submission, and the timestamps.
+**Native DSD looks exactly like good PCM.** Core Audio has no DSD format, so native goes out
+as big endian non-mixable integer PCM. Anything hunting for a bit-perfect format will choose
+it and write PCM into it, and the DAC renders that as ticks at twice the nominal rate. Two
+things keep that from happening by accident: PCM formats come first in the list, and they are
+non-mixable too, so a player looking for a non-mixable format finds one that is not DSD. The
+only thing separating the two is the big endian flag, which is what `StartDevice` reads to
+choose an alternate setting.

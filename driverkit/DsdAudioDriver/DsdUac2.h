@@ -76,8 +76,9 @@ bool ParseLayout(const uint8_t* config, size_t length, Uac2Layout* out);
 /// Whether `alt` can carry `rate` within one microframe.
 bool AltCarriesRate(const AltSetting& alt, uint32_t rate);
 
-/// Every (rate, alternate setting) pair the interface can carry, native DSD first so the
-/// bit-perfect path is what an application sees at the head of the list.
+/// Every (rate, alternate setting) pair the interface can carry, PCM first and native DSD
+/// last: native is indistinguishable from non-mixable integer PCM through Core Audio, so
+/// leading with it hands a DSD stream to applications that will fill it with PCM.
 ///
 /// Returns the number written, which is capped at `capacity`.
 size_t BuildFormats(const Uac2Layout& layout, const uint32_t* rates, size_t rate_count,

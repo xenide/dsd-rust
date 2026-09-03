@@ -104,9 +104,12 @@ size_t ParseClockRange(const uint8_t* report, size_t length, uint32_t* out, size
 size_t BuildFormats(const Uac2Layout& layout, const uint32_t* rates, size_t rate_count,
                     FormatEntry* out, size_t capacity) {
     size_t written = 0;
-    // Two passes so every native DSD format precedes every PCM one: an application that
-    // takes the first format it recognises then gets the bit-perfect path.
-    for (int native_pass = 1; native_pass >= 0; native_pass--) {
+    // Two passes so every PCM format precedes every native DSD one. Core Audio has no way
+    // to say "this is DSD": native goes out as big endian non-mixable integer PCM, which is
+    // exactly the shape an application hunting for a bit-perfect PCM format will choose. Put
+    // native first and such an application picks it and writes PCM into a DSD stream, which
+    // the DAC renders as ticks. Last, it is still there for anything that knows to look.
+    for (int native_pass = 0; native_pass <= 1; native_pass++) {
         for (size_t index = 0; index < layout.alt_count; index++) {
             const AltSetting& alt = layout.alts[index];
             const bool native = IsNativeDsd(alt);

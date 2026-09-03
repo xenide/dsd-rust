@@ -139,25 +139,25 @@ int main() {
     const size_t written =
         dsd::BuildFormats(layout, publish, 4, formats, sizeof(formats) / sizeof(formats[0]));
     Check(written > 0, "the RU7 publishes formats");
-    Check(formats[0].native_dsd, "native DSD leads the format list");
-    Check(formats[0].sample_rate == 44100.0, "the native list starts at the lowest rate");
+    Check(!formats[0].native_dsd, "PCM leads the format list, not native DSD");
+    Check(formats[0].sample_rate == 44100.0, "the list starts at the lowest rate");
 
-    bool trailing_pcm = false;
-    bool native_after_pcm = false;
+    bool trailing_native = false;
+    bool pcm_after_native = false;
     bool native_at_1411200 = false;
     for (size_t index = 0; index < written; index++) {
-        if (!formats[index].native_dsd) {
-            trailing_pcm = true;
+        if (formats[index].native_dsd) {
+            trailing_native = true;
+            if (formats[index].sample_rate == 1411200.0) {
+                native_at_1411200 = true;
+            }
             continue;
         }
-        if (trailing_pcm) {
-            native_after_pcm = true;
-        }
-        if (formats[index].sample_rate == 1411200.0) {
-            native_at_1411200 = true;
+        if (trailing_native) {
+            pcm_after_native = true;
         }
     }
-    Check(!native_after_pcm, "no native format follows a PCM one");
+    Check(!pcm_after_native, "no PCM format follows a native one");
     // 1411200 Hz needs 1416 bytes a microframe in four-byte subslots, past the 776 the
     // endpoint carries, so DSD512 is not on this DAC's native list.
     Check(!native_at_1411200, "DSD512 exceeds the native endpoint and is not published");
