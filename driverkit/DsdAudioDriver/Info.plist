@@ -22,6 +22,12 @@
 	<string>Plays DSD to a USB DAC without going through the system USB audio daemon.</string>
 	<key>OSMinimumDriverKitVersion</key>
 	<string>21.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>DriverKit</string>
+	</array>
+	<key>DTPlatformName</key>
+	<string>driverkit</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>DsdAudioDriver</key>
@@ -37,24 +43,7 @@
 			<key>IOUserServerName</key>
 			<string>com.github.xenide.dsdrust.driver</string>
 			<key>IOProviderClass</key>
-			<string>IOUSBHostInterface</string>
-			<key>IOMatchCategory</key>
-			<string>com.github.xenide.dsdrust.driver</string>
-			<!-- Keyed to one DAC on purpose. Matching every UAC2 streaming interface would
-			     take usbaudiod's place for every USB audio device on the machine, which is
-			     not what anyone installing this asked for. Fill both in from
-			     `dsd-rust devices` or `ioreg -p IOUSB -l`, in decimal. -->
-			<key>idVendor</key>
-			<integer>11655</integer>
-			<key>idProduct</key>
-			<integer>49154</integer>
-			<key>bInterfaceClass</key>
-			<integer>1</integer>
-			<key>bInterfaceSubClass</key>
-			<integer>2</integer>
-			<!-- Above usbaudiod, which is what wins the interface today. -->
-			<key>IOProbeScore</key>
-			<integer>100000</integer>
+			<string>IOUSBHostDevice</string>
 			<key>IOUserAudioDriverUserClientProperties</key>
 			<dict>
 				<key>IOClass</key>
@@ -62,6 +51,12 @@
 				<key>IOUserClass</key>
 				<string>IOUserAudioDriverUserClient</string>
 			</dict>
+			<key>idVendor</key>
+			<integer>11655</integer>
+			<key>idProduct</key>
+			<integer>49154</integer>
+			<key>IOProbeScore</key>
+			<integer>100000</integer>
 		</dict>
 	</dict>
 </dict>

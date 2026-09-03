@@ -21,10 +21,29 @@ correct.
 
 ## Status
 
-The dext compiles and links against the DriverKit 25.5 SDK, and every symbol it imports is
-exported by the SDK. `./build.sh app` packages it inside its installer and signs both. It has
-never been loaded, because an ad-hoc signature cannot carry DriverKit entitlements; the
-section below has the two ways past that. Treat the data path as unverified.
+The driver loads, matches a Cayin RU7, and publishes it as a Core Audio device. On a machine
+with the checks off (below), against real hardware:
+
+```
+DsdAudioDriver: 32 formats over 4 alternate settings
+DsdAudioDriver: published, registering
+DK: DsdAudioDriver::start(Cayin RU7) ok
+```
+
+```
++-o Cayin RU7 <IOUSBHostDevice>
+  +-o DsdAudioDriver          <IOUserService, registered, matched, active>
+  +-o Cayin RU7@0             <IOUSBHostInterface, !registered, !matched>
+  +-o Cayin RU7 Playback@1    <IOUSBHostInterface, !registered, !matched>
+```
+
+Both interfaces sit unmatched under the driver, which is the point: `usbaudiod` never sees
+them. The DAC then appears to every application, `dsd-rust devices` included, under the
+driver's own UID rather than `AppleUSBAudioEngine`.
+
+What is still unexercised is the isochronous data path. Nothing has been played through the
+driver: `StartDevice`, the alternate setting selection, the clock rate request and transfer
+submission have never run.
 
 The descriptor parser is the part that carries the domain knowledge, and it has no DriverKit
 dependency for exactly that reason. It is checked two ways, neither of which needs the dext
@@ -189,11 +208,29 @@ report and builds its format list from that, rather than inheriting the intersec
 Audio derives, which is sometimes narrower. This is the same reading that item A1 of issue #8
 added to the CLI.
 
-**What is untested.** Everything past `Start`: alternate setting selection, the clock rate
-request, transfer submission, and the timestamps. The first run against real hardware should
-expect to find bugs there.
+**Match the device, not the interface.** macOS will not hand a third party driver a USB
+audio class interface; `usbaudiod` is published against those before anyone else can match
+them, and a personality with `IOProviderClass` of `IOUSBHostInterface` is simply never
+considered. The driver matches `IOUSBHostDevice` instead and calls
+`SetConfiguration(value, false)`. Not registering the interfaces for matching is what
+excludes the daemon: the nubs exist for `CopyInterface` to hand back, but nothing else ever
+sees them published.
 
-One to look at first: completions arrive on their own dispatch queue, and
-`UpdateCurrentZeroTimestamp` is called from there rather than from the device's work queue.
-Apple's own samples post timestamps from the work queue. If timing misbehaves, that is the
-first thing to change.
+**Build for arm64e.** Dexts on Apple silicon are arm64e, not arm64. A plain arm64 binary
+stages and enables without complaint and then fails to launch with `Exec format error`, which
+reaches the log as a matching failure rather than a link one.
+
+**Two plist keys are load bearing.** `IOUserAudioDriverUserClientProperties` is what lets the
+Core Audio host open the driver's user client; without it the driver starts, publishes its
+device, and no application ever sees it. `SetDispatchQueue` only accepts a name some method
+declares with `QUEUENAME`, so completions run on the default queue, which is also where
+Apple's samples post timestamps from.
+
+**A failed start pins the old copy.** A dext whose `Start` returns an error leaves its server
+process running, and that holds the previous staged bundle, so the next `activate` lands in
+`terminating for upgrade via delegate` and the kernel tries to launch a bundle that is being
+deleted. `pkill -f "SystemExtensions.*DsdAudioDriver"` between iterations avoids a confusing
+half hour.
+
+**What is untested.** Everything past `Start`: alternate setting selection, the clock rate
+request, transfer submission, and the timestamps.

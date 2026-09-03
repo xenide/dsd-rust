@@ -72,7 +72,7 @@ build_dext() {
 
   local flags=(
     -isysroot "${sdk}"
-    -target arm64-apple-driverkit21.0
+    -target arm64e-apple-driverkit21.0
     -std=gnu++17 -fno-exceptions -fno-rtti -fbuiltin
     -Wall -Wextra -Werror -Wno-unused-parameter
     -I"${gen}" -I"${src}"
@@ -86,7 +86,7 @@ build_dext() {
   done
 
   "${toolchain}/clang++" \
-    -isysroot "${sdk}" -target arm64-apple-driverkit21.0 \
+    -isysroot "${sdk}" -target arm64e-apple-driverkit21.0 \
     -F"${sdk}/System/DriverKit/System/Library/Frameworks" \
     -L"${sdk}/System/DriverKit/usr/lib" \
     -framework DriverKit -framework USBDriverKit -framework AudioDriverKit \

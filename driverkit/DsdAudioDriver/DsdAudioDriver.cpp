@@ -7,7 +7,6 @@
 #include <AudioDriverKit/AudioDriverKit.h>
 #include <DriverKit/DriverKit.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
-#include <DriverKit/IODispatchQueue.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOMemoryMap.h>
 #include <DriverKit/OSSharedPtr.h>
@@ -62,9 +61,10 @@ struct Transfer {
 }  // namespace
 
 struct DsdAudioDriver_IVars {
+    IOUSBHostDevice* device_usb;
     IOUSBHostInterface* interface;
+    uint8_t configuration_value;
     IOUSBHostPipe* pipe;
-    IODispatchQueue* isoc_queue;
 
     OSSharedPtr<IOUserAudioDevice> device;
     OSSharedPtr<IOUserAudioStream> stream;
@@ -269,7 +269,7 @@ void DsdAudioDriver::free() {
         ivars->ring_map.reset();
         OSSafeReleaseNULL(ivars->pipe);
         OSSafeReleaseNULL(ivars->interface);
-        OSSafeReleaseNULL(ivars->isoc_queue);
+        OSSafeReleaseNULL(ivars->device_usb);
     }
     IOSafeDeleteNULL(ivars, DsdAudioDriver_IVars, 1);
     super::free();
@@ -277,22 +277,75 @@ void DsdAudioDriver::free() {
 
 namespace {
 
-/// Read the interface's descriptors and the clock's rates, and turn the two into the format
-/// list the device publishes.
+/// Read the device's configuration descriptor and find its streaming interface in it.
 bool ReadUsbLayout(DsdAudioDriver_IVars* ivars) {
-    const IOUSBConfigurationDescriptor* config = ivars->interface->CopyConfigurationDescriptor();
+    const IOUSBConfigurationDescriptor* config = ivars->device_usb->CopyConfigurationDescriptor(static_cast<uint8_t>(0));
     if (config == nullptr) {
         Log("no configuration descriptor");
         return false;
     }
+    ivars->configuration_value = config->bConfigurationValue;
     const bool parsed = dsd::ParseLayout(reinterpret_cast<const uint8_t*>(config),
                                          config->wTotalLength, &ivars->layout);
     IOUSBHostFreeDescriptor(config);
     if (!parsed) {
-        Log("interface carries no streaming alternate setting with a clock");
+        Log("device carries no streaming alternate setting with a clock");
+        return false;
+    }
+    return true;
+}
+
+/// Take the streaming interface for ourselves.
+///
+/// Setting the configuration without registering its interfaces for matching is what
+/// excludes usbaudiod: the nubs exist for us to iterate, but the daemon never sees them
+/// published, so there is no window to race and nothing to take away from it afterwards.
+bool ClaimStreamingInterface(DsdAudioDriver* driver, DsdAudioDriver_IVars* ivars) {
+    kern_return_t result = ivars->device_usb->SetConfiguration(ivars->configuration_value, false);
+    if (result != kIOReturnSuccess) {
+        Log("cannot set configuration %u: 0x%08x", ivars->configuration_value, result);
         return false;
     }
 
+    uintptr_t iterator = 0;
+    result = ivars->device_usb->CreateInterfaceIterator(&iterator);
+    if (result != kIOReturnSuccess) {
+        Log("cannot iterate interfaces: 0x%08x", result);
+        return false;
+    }
+    IOUSBHostInterface* candidate = nullptr;
+    while (ivars->device_usb->CopyInterface(iterator, &candidate) == kIOReturnSuccess &&
+           candidate != nullptr) {
+        const IOUSBConfigurationDescriptor* config = candidate->CopyConfigurationDescriptor();
+        const IOUSBInterfaceDescriptor* descriptor =
+            config != nullptr ? candidate->GetInterfaceDescriptor(config) : nullptr;
+        const bool wanted =
+            descriptor != nullptr && descriptor->bInterfaceNumber == ivars->layout.streaming_interface;
+        if (config != nullptr) {
+            IOUSBHostFreeDescriptor(config);
+        }
+        if (wanted) {
+            ivars->interface = candidate;
+            break;
+        }
+        OSSafeReleaseNULL(candidate);
+    }
+    ivars->device_usb->DestroyInterfaceIterator(iterator);
+
+    if (ivars->interface == nullptr) {
+        Log("device has no interface numbered %u", ivars->layout.streaming_interface);
+        return false;
+    }
+    result = ivars->interface->Open(driver, 0, nullptr);
+    if (result != kIOReturnSuccess) {
+        Log("cannot open the streaming interface: 0x%08x", result);
+        return false;
+    }
+    return true;
+}
+
+/// Read the clock's rates and turn them, with the alternate settings, into the format list.
+bool ReadRatesAndFormats(DsdAudioDriver_IVars* ivars) {
     uint32_t rates[dsd::kMaxSampleRates] = {};
     const size_t rate_count =
         ReadClockRates(ivars->interface, ivars->layout, rates, dsd::kMaxSampleRates);
@@ -333,38 +386,33 @@ kern_return_t IMPL(DsdAudioDriver, Start) {
         return result;
     }
 
-    ivars->interface = OSDynamicCast(IOUSBHostInterface, provider);
-    if (ivars->interface == nullptr) {
-        Log("provider is not an IOUSBHostInterface");
+    // The provider is the whole device, not one interface. macOS will not hand a third
+    // party driver an audio class interface -- usbaudiod is published against those before
+    // anyone else can match them -- so the driver takes the device and configures it itself.
+    ivars->device_usb = OSDynamicCast(IOUSBHostDevice, provider);
+    if (ivars->device_usb == nullptr) {
+        Log("provider is not an IOUSBHostDevice");
         return kIOReturnNoDevice;
     }
-    ivars->interface->retain();
+    ivars->device_usb->retain();
 
-    result = ivars->interface->Open(this, 0, nullptr);
+    result = ivars->device_usb->Open(this, 0, 0);
     if (result != kIOReturnSuccess) {
-        Log("cannot open the streaming interface: 0x%08x", result);
+        Log("cannot open the device: 0x%08x", result);
         return result;
     }
-    if (!ReadUsbLayout(ivars)) {
+    if (!ReadUsbLayout(ivars) || !ClaimStreamingInterface(this, ivars) ||
+        !ReadRatesAndFormats(ivars)) {
         return kIOReturnUnsupported;
-    }
-
-    IODispatchQueue* queue = nullptr;
-    result = IODispatchQueue::Create("IsochComplete", 0, 0, &queue);
-    if (result != kIOReturnSuccess) {
-        return result;
-    }
-    ivars->isoc_queue = queue;
-    result = SetDispatchQueue("IsochComplete", queue);
-    if (result != kIOReturnSuccess) {
-        return result;
     }
 
     result = PublishAudioObjects();
     if (result != kIOReturnSuccess) {
+        Log("publishing the audio device failed: 0x%08x", result);
         return result;
     }
 
+    Log("published, registering");
     RegisterService();
     return kIOReturnSuccess;
 }
@@ -377,6 +425,9 @@ kern_return_t IMPL(DsdAudioDriver, Stop) {
     if (ivars->interface != nullptr) {
         ivars->interface->SelectAlternateSetting(0);
         ivars->interface->Close(this, 0);
+    }
+    if (ivars->device_usb != nullptr) {
+        ivars->device_usb->Close(this, 0);
     }
     return Stop(provider, SUPERDISPATCH);
 }
@@ -399,6 +450,7 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     ivars->device = IOUserAudioDevice::Create(this, false, device_uid.get(), model_uid.get(),
                                               manufacturer.get(), kZeroTimestampPeriod);
     if (!ivars->device) {
+        Log("IOUserAudioDevice::Create failed");
         return kIOReturnNoMemory;
     }
     OSSharedPtr<OSString> device_name = OSSharedPtr(OSString::withCString(name), OSNoRetain);
@@ -412,6 +464,7 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     kern_return_t result = IOBufferMemoryDescriptor::Create(
         kIOMemoryDirectionInOut, static_cast<uint64_t>(kRingFrames) * widest, 4096, &ring);
     if (result != kIOReturnSuccess) {
+        Log("ring allocation failed: 0x%08x", result);
         return result;
     }
     ivars->ring.reset(ring, OSNoRetain);
@@ -419,6 +472,7 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     IOMemoryMap* ring_map = nullptr;
     result = ivars->ring->CreateMapping(0, 0, 0, 0, 0, &ring_map);
     if (result != kIOReturnSuccess) {
+        Log("ring mapping failed: 0x%08x", result);
         return result;
     }
     ivars->ring_map.reset(ring_map, OSNoRetain);
@@ -426,6 +480,7 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     ivars->stream = IOUserAudioStream::Create(this, IOUserAudioStreamDirection::Output,
                                               ivars->ring.get());
     if (!ivars->stream) {
+        Log("IOUserAudioStream::Create failed");
         return kIOReturnNoMemory;
     }
     ivars->stream->SetTerminalType(IOUserAudioStreamTerminalType::Headphones);
@@ -450,6 +505,7 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
 
     result = ivars->device->AddStream(ivars->stream.get());
     if (result != kIOReturnSuccess) {
+        Log("AddStream failed: 0x%08x", result);
         return result;
     }
     // Output IO needs no work here: the host writes into the ring the stream was created
@@ -458,7 +514,11 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         ^kern_return_t(IOUserAudioObjectID, IOUserAudioIOOperation, uint32_t, uint64_t, uint64_t) {
             return kIOReturnSuccess;
         });
-    return AddObject(ivars->device.get());
+    result = AddObject(ivars->device.get());
+    if (result != kIOReturnSuccess) {
+        Log("AddObject failed: 0x%08x", result);
+    }
+    return result;
 }
 
 namespace {
