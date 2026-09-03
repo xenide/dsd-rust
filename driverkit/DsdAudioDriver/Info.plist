@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>DsdAudioDriver</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.example.dsd-rust.DsdAudioDriver</string>
+	<string>com.github.xenide.dsdrust.driver</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -27,7 +27,7 @@
 		<key>DsdAudioDriver</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.example.dsd-rust.DsdAudioDriver</string>
+			<string>com.github.xenide.dsdrust.driver</string>
 			<key>CFBundleIdentifierKernel</key>
 			<string>com.apple.kpi.iokit</string>
 			<key>IOClass</key>
@@ -35,11 +35,11 @@
 			<key>IOUserClass</key>
 			<string>DsdAudioDriver</string>
 			<key>IOUserServerName</key>
-			<string>com.example.dsd-rust.DsdAudioDriver</string>
+			<string>com.github.xenide.dsdrust.driver</string>
 			<key>IOProviderClass</key>
 			<string>IOUSBHostInterface</string>
 			<key>IOMatchCategory</key>
-			<string>com.example.dsd-rust.DsdAudioDriver</string>
+			<string>com.github.xenide.dsdrust.driver</string>
 			<!-- Keyed to one DAC on purpose. Matching every UAC2 streaming interface would
 			     take usbaudiod's place for every USB audio device on the machine, which is
 			     not what anyone installing this asked for. Fill both in from
