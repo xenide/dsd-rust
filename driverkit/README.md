@@ -226,6 +226,14 @@ device, and no application ever sees it. `SetDispatchQueue` only accepts a name 
 declares with `QUEUENAME`, so completions run on the default queue, which is also where
 Apple's samples post timestamps from.
 
+**A crashing dext panics the machine.** DriverKit restarts a driver that dies, and after a
+few restarts the kernel gives up and panics: `Driver IOUserServer(...) has crashed too many
+times`. So an assert or a null dereference on the IO path is not a crash to iterate on, it is
+a reboot. `OSAction::GetReference` is a live example -- it asserts rather than returning null
+when the action carries no reference storage, which is the case for the action a pipe hands
+back to an isochronous completion. Guard the IO path and identify transfers by comparing
+action pointers rather than through a reference.
+
 **A failed start pins the old copy.** A dext whose `Start` returns an error leaves its server
 process running, and that holds the previous staged bundle, so the next `activate` lands in
 `terminating for upgrade via delegate` and the kernel tries to launch a bundle that is being

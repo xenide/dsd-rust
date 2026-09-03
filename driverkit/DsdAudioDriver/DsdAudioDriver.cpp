@@ -583,11 +583,14 @@ kern_return_t AllocateTransfers(DsdAudioDriver* driver, DsdAudioDriver_IVars* iv
         if (result != kIOReturnSuccess) {
             return result;
         }
-        result = driver->CreateActionIsochComplete(sizeof(uint32_t), &transfer.completion);
+        // No reference storage: the action the pipe hands back to the completion does not
+        // carry one, and OSAction::GetReference asserts rather than returning null, which
+        // takes the whole machine down through the crash-too-many-times panic. The
+        // completion identifies its transfer by matching the action instead.
+        result = driver->CreateActionIsochComplete(0, &transfer.completion);
         if (result != kIOReturnSuccess) {
             return result;
         }
-        *reinterpret_cast<uint32_t*>(transfer.completion->GetReference()) = index;
     }
     return kIOReturnSuccess;
 }
@@ -718,10 +721,14 @@ void DsdAudioDriver::StopIsoc() {
 }
 
 kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
-    if (!ivars->running || ivars->pipe == nullptr) {
+    if (!ivars->running || ivars->pipe == nullptr || index >= kTransfersInFlight) {
         return kIOReturnNotReady;
     }
     Transfer& transfer = ivars->transfers[index];
+    if (transfer.data_map == nullptr || transfer.frame_map == nullptr ||
+        !ivars->ring_map || ivars->frame_bytes == 0) {
+        return kIOReturnNotReady;
+    }
     uint8_t* data = reinterpret_cast<uint8_t*>(transfer.data_map->GetAddress());
     IOUSBIsochronousFrame* frames =
         reinterpret_cast<IOUSBIsochronousFrame*>(transfer.frame_map->GetAddress());
@@ -765,9 +772,22 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
     return kIOReturnSuccess;
 }
 
+/// Which transfer an action belongs to, or `kTransfersInFlight` for one that is not ours.
+uint32_t TransferForAction(const DsdAudioDriver_IVars* ivars, const OSAction* action) {
+    for (uint32_t index = 0; index < kTransfersInFlight; index++) {
+        if (ivars->transfers[index].completion == action) {
+            return index;
+        }
+    }
+    return kTransfersInFlight;
+}
+
 void IMPL(DsdAudioDriver, IsochComplete) {
-    const uint32_t index = *reinterpret_cast<const uint32_t*>(action->GetReference());
-    if (!ivars->running) {
+    if (ivars == nullptr || !ivars->running || action == nullptr) {
+        return;
+    }
+    const uint32_t index = TransferForAction(ivars, action);
+    if (index >= kTransfersInFlight) {
         return;
     }
     if (status != kIOReturnSuccess && status != kIOReturnUnderrun) {
@@ -779,7 +799,8 @@ void IMPL(DsdAudioDriver, IsochComplete) {
     // these completions is what removes drift: Core Audio follows the DAC rather than the
     // two running open loop against each other.
     const Transfer& transfer = ivars->transfers[index];
-    if (transfer.start_sample >= ivars->next_timestamp_at && ivars->device) {
+    if (transfer.start_sample >= ivars->next_timestamp_at && ivars->device &&
+        transfer.frame_map != nullptr) {
         const IOUSBIsochronousFrame* frames =
             reinterpret_cast<const IOUSBIsochronousFrame*>(transfer.frame_map->GetAddress());
         ivars->device->UpdateCurrentZeroTimestamp(transfer.start_sample, frames[0].timeStamp);
