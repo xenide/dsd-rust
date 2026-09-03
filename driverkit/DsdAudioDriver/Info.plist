@@ -45,9 +45,9 @@
 			     not what anyone installing this asked for. Fill both in from
 			     `dsd-rust devices` or `ioreg -p IOUSB -l`, in decimal. -->
 			<key>idVendor</key>
-			<integer>0</integer>
+			<integer>11655</integer>
 			<key>idProduct</key>
-			<integer>0</integer>
+			<integer>49154</integer>
 			<key>bInterfaceClass</key>
 			<integer>1</integer>
 			<key>bInterfaceSubClass</key>

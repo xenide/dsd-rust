@@ -2,6 +2,7 @@
 # Build the DriverKit extension, or the host tests for the parser it shares.
 #
 #   ./build.sh test    parser tests, no Xcode or entitlements needed
+#   ./build.sh probe   run the parser over attached hardware
 #   ./build.sh dext    compile and link DsdAudioDriver.dext
 #
 # Signing and installing are separate, and need an entitlement grant from Apple. See
@@ -23,6 +24,16 @@ run_tests() {
     -o "${build}/uac2_test" \
     "${here}/tests/test_dsd_uac2.cpp" "${src}/DsdUac2.cpp"
   "${build}/uac2_test"
+}
+
+run_probe() {
+  mkdir -p "${build}"
+  clang++ -std=c++17 -Wall -Wextra -Werror \
+    -I"${src}" \
+    -framework IOKit -framework CoreFoundation \
+    -o "${build}/probe" \
+    "${here}/tools/probe.cpp" "${src}/DsdUac2.cpp"
+  "${build}/probe"
 }
 
 build_dext() {
@@ -80,6 +91,7 @@ build_dext() {
 
 case "${1:-test}" in
   test) run_tests ;;
+  probe) run_probe ;;
   dext) build_dext ;;
-  *) echo "usage: $0 [test|dext]" >&2; exit 2 ;;
+  *) echo "usage: $0 [test|probe|dext]" >&2; exit 2 ;;
 esac

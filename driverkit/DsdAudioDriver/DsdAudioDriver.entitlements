@@ -10,9 +10,9 @@
 	<array>
 		<dict>
 			<key>idVendor</key>
-			<integer>0</integer>
+			<integer>11655</integer>
 			<key>idProduct</key>
-			<integer>0</integer>
+			<integer>49154</integer>
 		</dict>
 	</array>
 	<key>com.apple.developer.driverkit.allow-any-userclient-access</key>

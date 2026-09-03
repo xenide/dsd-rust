@@ -22,13 +22,20 @@ correct.
 ## Status
 
 The dext compiles and links against the DriverKit 25.5 SDK, and every symbol it imports is
-exported by the SDK. It has never been loaded, because loading it needs entitlements Apple
-grants case by case (below) and a DAC to load it against. Treat the data path as unverified.
+exported by the SDK. It has never been loaded: that needs entitlements Apple grants case by
+case, and there is no local workaround. Treat the data path as unverified.
 
 The descriptor parser is the part that carries the domain knowledge, and it has no DriverKit
-dependency for exactly that reason: `./build.sh test` builds and runs its tests on the host,
-with no Xcode, no entitlements and no DAC. Those tests are held to the same Cayin RU7
-configuration descriptor as the Rust parser in `src/output/usb/descriptors.rs`.
+dependency for exactly that reason. It is checked two ways, neither of which needs the dext
+to load:
+
+- `./build.sh test` runs its tests on the host, with no Xcode, no entitlements and no DAC,
+  against the same Cayin RU7 configuration descriptor the Rust parser in
+  `src/output/usb/descriptors.rs` is held to.
+- `./build.sh probe` runs it over whatever is plugged in, reading the real configuration
+  descriptor and the real clock `RANGE` report. Against an RU7 it finds alternate setting 4
+  as `RAW_DATA`, endpoint 0x01 with feedback on 0x81, a 776 byte packet, and the eight clock
+  rates from 44100 to 384000 that `dsd-rust devices` reports on its `native` line.
 
 ## Layout
 
@@ -40,11 +47,13 @@ configuration descriptor as the Rust parser in `src/output/usb/descriptors.rs`.
 | `DsdAudioDriver/Info.plist` | The matching personality. |
 | `DsdAudioDriver/DsdAudioDriver.entitlements` | What Apple has to grant. |
 | `tests/test_dsd_uac2.cpp` | Host tests for the parser. |
+| `tools/probe.cpp` | Runs the parser over attached hardware. |
 
 ## Building
 
 ```
 ./build.sh test    # parser tests, nothing else needed
+./build.sh probe   # run the parser over attached hardware
 ./build.sh dext    # compile and link build/DsdAudioDriver.dext
 ```
 
@@ -63,15 +72,18 @@ Three things, in order, and the first is the long pole.
 Apple Developer account, and the request takes weeks. `DsdAudioDriver.entitlements` is what to
 ask for. Nothing below works until this lands, so start it before writing any more code.
 
-**2. Fill in the DAC.** `Info.plist` and the entitlements both carry `idVendor` and
-`idProduct` set to zero. Fill both in, in decimal, from `dsd-rust devices` or
-`ioreg -p IOUSB -l`. They are deliberately not wildcards: a personality matching every UAC2
-streaming interface would displace `usbaudiod` for every USB audio device on the machine.
+**2. Point it at your DAC.** `Info.plist` and the entitlements both name the Cayin RU7,
+`idVendor` 11655 and `idProduct` 49154. Change both for another DAC; `./build.sh probe`
+prints the decimal pair to use. They are deliberately not wildcards: a personality matching
+every UAC2 streaming interface would displace `usbaudiod` for every USB audio device on the
+machine.
 
 **3. Ship it in an app.** A dext installs only from inside a notarized app bundle, through
 `OSSystemExtensionRequest`, with the user approving it in System Settings. The app is not in
-this repository. For development, `systemextensionsctl developer on` relaxes the notarization
-requirement but not the entitlement one.
+this repository. `systemextensionsctl developer on` relaxes the notarization requirement, but
+not the entitlement one: the entitlements have to arrive in a provisioning profile Apple
+issued, so a self-signed or ad-hoc signature cannot stand in, and disabling SIP does not help
+either.
 
 ## Notes for whoever picks this up
 
