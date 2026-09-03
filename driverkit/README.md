@@ -41,41 +41,35 @@ Both interfaces sit unmatched under the driver, which is the point: `usbaudiod` 
 them. The DAC then appears to every application, `dsd-rust devices` included, under the
 driver's own UID rather than `AppleUSBAudioEngine`.
 
-The isochronous path runs. Playing a DSD64 file through `dsd-rust` selects an alternate
-setting, sets the clock, opens the pipe and streams transfers continuously, and the DAC locks
-to the carrier:
+Audio plays. A file played to the DAC through the driver comes out of it, continuously, with
+no clock resets from Core Audio.
 
 ```
-DsdAudioDriver: host asked for 176400 Hz PCM, using alternate setting 2
-DsdAudioDriver: streaming 176400 Hz on alt 2: ring 43690 frames of 6 bytes, 22.050 samples per microframe
-DsdAudioDriver: posted zero timestamp 4233 at host time 24051968285
+DsdAudioDriver: host asked for 44100 Hz PCM, alternate setting 1, in-flight window 1411 frames
+DsdAudioDriver: host wrote 512 frames at sample 521028 (ring slot 836); engine reads at sample 520556 (slot 364)
 ```
 
-Audio is not right yet, and two things are known wrong.
+What is left is a glitch every seven seconds or so. The output endpoint is asynchronous: it
+runs on the DAC's clock, and the DAC says how many samples it wants through its feedback
+endpoint. The driver ignores that and sends the nominal count, so the DAC's buffer walks
+until it breaks and recovers. `src/output/usb/stream.rs` reads the feedback endpoint for
+exactly this reason; the dext does not yet.
 
-**The ring goes quiet after about two seconds.** The host writes real audio into the stream
-buffer and the driver reads it -- for roughly two seconds, after which every transfer reads
-zeroes while transfers keep completing and the DAC stays locked. Something in the handshake
-between the timeline the driver publishes through `UpdateCurrentZeroTimestamp` and the
-position the host writes at comes apart. One candidate: the ring is `kRingFrames` times the
-widest frame, which is not a whole number of frames at every frame width -- 262144 bytes over
-six byte frames is 43690.67 -- so driver and host may disagree about where it wraps.
+Three things had to be right for any of it to be audible, and each was silent when wrong:
 
-**Only a client that opens the device explicitly starts IO.** `dsd-rust` reaches
-`StartDevice`; `afplay` against the same device as default output plays without error and
-Core Audio never starts IO on it at all.
+**Zero timestamps land on exact multiples of the period.** A transfer carries `rate/250`
+samples, which divides neither evenly nor into the period, so the boundary falls inside a
+transfer and its host time is interpolated. Posting the transfer's own sample time instead
+makes Core Audio log `TimeStampOutOfLine` continuously, reset its clock, and never advance
+where it writes.
 
-The descriptor parser is the part that carries the domain knowledge, and it has no DriverKit
-dependency for exactly that reason. It is checked two ways, neither of which needs the dext
-to load:
+**The ring wraps at the zero timestamp period.** Not at the buffer length over the frame
+width, which is the obvious reading and is wrong: the host writes and rewrites the first
+period of the allocation while a driver using the whole allocation sweeps past it.
 
-- `./build.sh test` runs its tests on the host, with no Xcode, no entitlements and no DAC,
-  against the same Cayin RU7 configuration descriptor the Rust parser in
-  `src/output/usb/descriptors.rs` is held to.
-- `./build.sh probe` runs it over whatever is plugged in, reading the real configuration
-  descriptor and the real clock `RANGE` report. Against an RU7 it finds alternate setting 4
-  as `RAW_DATA`, endpoint 0x01 with feedback on 0x81, a 776 byte packet, and the eight clock
-  rates from 44100 to 384000 that `dsd-rust devices` reports on its `native` line.
+**The ring is read at the playback point, not the submission point.** What is submitted now
+plays a whole in-flight window later, and the host writes barely ahead of what is playing, so
+reading where the engine is queueing reads what the host has not written yet.
 
 ## Layout
 

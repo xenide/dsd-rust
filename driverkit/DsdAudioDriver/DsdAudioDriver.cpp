@@ -26,11 +26,19 @@ constexpr uint32_t kTransfersInFlight = 8;
 constexpr uint64_t kMicroframesPerFrame = 8;
 /// Bus frames to schedule the first transfer ahead of now.
 constexpr uint64_t kStartLead = 10;
-/// Sample frames the ring holds. Large enough for the biggest IO buffer the host asks for
-/// at the highest rate, and a power of two so the wrap is a mask.
-constexpr uint32_t kRingFrames = 32768;
 /// Sample frames between the timestamps the host reads to build its timeline.
 constexpr uint32_t kZeroTimestampPeriod = 4096;
+
+/// Widest sample frame any published format uses: two channels of four byte subslots.
+constexpr uint32_t kWidestFrameBytes = 8;
+/// Bytes the ring holds.
+///
+/// The host treats the stream buffer as exactly one zero timestamp period of frames and
+/// wraps there, whatever the buffer's length. Sizing it any other way leaves the driver
+/// reading a sweep of the whole allocation while the host writes and rewrites the first
+/// period of it, which is silence everywhere the two do not happen to coincide.
+constexpr uint64_t kRingBytes =
+    static_cast<uint64_t>(kZeroTimestampPeriod) * kWidestFrameBytes;
 
 /// DSD silence is alternating bits, not zero: a DAC fed zeroes leaves DSD lock and pops.
 constexpr uint8_t kDsdSilenceByte = 0x69;
@@ -90,8 +98,16 @@ struct DsdAudioDriver_IVars {
     /// position in the ring is it modulo the ring length.
     uint64_t sample_counter;
     uint64_t next_timestamp_at;
-    /// Transfers submitted, so a sample of them can report what they found in the ring.
-    uint32_t debug_reports;
+    /// The previous completion, so the host time of an exact period boundary between it and
+    /// the current one can be interpolated.
+    uint64_t prev_sample;
+    uint64_t prev_host;
+    /// How far behind the submission point the ring is read. What is submitted now plays a
+    /// whole in-flight window later, and the host writes just ahead of what is playing, so
+    /// reading at the submission point reads where it has not written yet.
+    uint64_t read_lag;
+    /// IO operations the host has performed, so a sample of them can be logged.
+    uint64_t io_calls;
     uint64_t timestamps_posted;
     bool running;
     uint8_t active_alt;
@@ -176,17 +192,20 @@ kern_return_t SetClockRate(IOUSBHostInterface* interface, const dsd::Uac2Layout&
 /// Native DSD has no format ID of its own, so it goes out as big-endian 32-bit integer PCM,
 /// which is the same convention ALSA calls DSD_U32_BE. The non-mixable flag is what keeps
 /// the bits intact: it stops the HAL converting or mixing anything into the stream.
-IOUserAudioStreamBasicDescription Describe(const dsd::FormatEntry& entry) {
+IOUserAudioStreamBasicDescription Describe(const dsd::FormatEntry& entry, bool mixable) {
     IOUserAudioStreamBasicDescription format{};
     format.mSampleRate = entry.sample_rate;
     format.mFormatID = IOUserAudioFormatID::LinearPCM;
 
-    // Every format is non-mixable, native and PCM alike: this driver hands the endpoint what
-    // it was given and mixes nothing. Marking only native non-mixable makes it the single
-    // candidate for any player hunting a bit-perfect format, so a DoP player picks the raw
-    // DSD setting and the DAC renders the marker bytes as ticks.
-    uint32_t flags = IOUserAudioFormatFlags::FormatFlagIsSignedInteger |
-                     IOUserAudioFormatFlags::FormatFlagIsNonMixable;
+    // Each PCM format is published twice, mixable and not. The non-mixable one is what a
+    // player after a bit-perfect path asks for. The mixable one is what the HAL needs to use
+    // the device for ordinary output at all: with only non-mixable formats Core Audio will
+    // not even keep the device as the default output, and anything that just plays to the
+    // default plays somewhere else.
+    uint32_t flags = IOUserAudioFormatFlags::FormatFlagIsSignedInteger;
+    if (!mixable) {
+        flags |= IOUserAudioFormatFlags::FormatFlagIsNonMixable;
+    }
     // Big endian is what separates native DSD from PCM of the same width, both here and in
     // the lookup StartDevice does.
     if (entry.native_dsd) {
@@ -374,19 +393,6 @@ bool ReadRatesAndFormats(DsdAudioDriver_IVars* ivars) {
     return true;
 }
 
-/// Widest sample frame any published format uses, which is what the ring must hold.
-uint32_t WidestFrameBytes(const DsdAudioDriver_IVars* ivars) {
-    uint32_t widest = 0;
-    for (size_t index = 0; index < ivars->format_count; index++) {
-        const dsd::FormatEntry& entry = ivars->formats[index];
-        const uint32_t bytes = static_cast<uint32_t>(entry.channels) * entry.subslot_bytes;
-        if (bytes > widest) {
-            widest = bytes;
-        }
-    }
-    return widest;
-}
-
 }  // namespace
 
 kern_return_t IMPL(DsdAudioDriver, Start) {
@@ -468,10 +474,9 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     ivars->device->SetCanBeDefaultOutputDevice(true);
     ivars->device->SetCanBeDefaultSystemOutputDevice(true);
 
-    const uint32_t widest = WidestFrameBytes(ivars);
     IOBufferMemoryDescriptor* ring = nullptr;
-    kern_return_t result = IOBufferMemoryDescriptor::Create(
-        kIOMemoryDirectionInOut, static_cast<uint64_t>(kRingFrames) * widest, 4096, &ring);
+    kern_return_t result =
+        IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, kRingBytes, 4096, &ring);
     if (result != kIOReturnSuccess) {
         Log("ring allocation failed: 0x%08x", result);
         return result;
@@ -493,21 +498,32 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         return kIOReturnNoMemory;
     }
     ivars->stream->SetTerminalType(IOUserAudioStreamTerminalType::Headphones);
+    // Without this the host has a device it will not do IO on: a player that opens the
+    // device itself still reaches StartDevice, but anything that just picks the default
+    // output plays into nothing.
+    ivars->stream->SetStreamIsActive(true);
 
     IOUserAudioStreamBasicDescription formats[dsd::kMaxAltSettings * dsd::kMaxSampleRates];
     double rates[dsd::kMaxSampleRates];
     size_t rate_count = 0;
+    size_t published = 0;
     for (size_t index = 0; index < ivars->format_count; index++) {
-        formats[index] = Describe(ivars->formats[index]);
+        const dsd::FormatEntry& entry = ivars->formats[index];
+        // Mixable first, so the format the device settles on is one the HAL can use.
+        if (!entry.native_dsd) {
+            formats[published++] = Describe(entry, true);
+        }
+        formats[published++] = Describe(entry, false);
         bool seen = false;
         for (size_t known = 0; known < rate_count; known++) {
-            seen = seen || rates[known] == formats[index].mSampleRate;
+            seen = seen || rates[known] == entry.sample_rate;
         }
         if (!seen && rate_count < dsd::kMaxSampleRates) {
-            rates[rate_count++] = formats[index].mSampleRate;
+            rates[rate_count++] = entry.sample_rate;
         }
     }
-    ivars->stream->SetAvailableStreamFormats(formats, static_cast<uint32_t>(ivars->format_count));
+    Log("publishing %zu stream formats over %zu rates", published, rate_count);
+    ivars->stream->SetAvailableStreamFormats(formats, static_cast<uint32_t>(published));
     ivars->stream->SetCurrentStreamFormat(&formats[0]);
     ivars->device->SetAvailableSampleRates(rates, rate_count);
     ivars->device->SetSampleRate(formats[0].mSampleRate);
@@ -518,9 +534,24 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         return result;
     }
     // Output IO needs no work here: the host writes into the ring the stream was created
-    // over, and the isochronous engine reads it at the position its own timeline names.
+    // over, and the isochronous engine reads it at the position its own timeline names. The
+    // sample time it reports is the only view of where the host thinks it is writing, so a
+    // sample of them is logged against where the engine is reading.
+    DsdAudioDriver_IVars* state = ivars;
     ivars->device->SetIOOperationHandler(
-        ^kern_return_t(IOUserAudioObjectID, IOUserAudioIOOperation, uint32_t, uint64_t, uint64_t) {
+        ^kern_return_t(IOUserAudioObjectID, IOUserAudioIOOperation in_operation,
+                       uint32_t in_frame_size, uint64_t in_sample_time, uint64_t) {
+            state->io_calls++;
+            if (state->io_calls % 250 == 0 && in_operation == IOUserAudioIOOperationWriteEnd) {
+                const uint64_t slot =
+                    state->ring_frames != 0 ? in_sample_time % state->ring_frames : 0;
+                Log("host wrote %u frames at sample %llu (ring slot %llu); engine reads at "
+                    "sample %llu (slot %llu)",
+                    in_frame_size, in_sample_time, slot, state->sample_counter - state->read_lag,
+                    state->ring_frames != 0
+                        ? (state->sample_counter - state->read_lag) % state->ring_frames
+                        : 0);
+            }
             return kIOReturnSuccess;
         });
     result = AddObject(ivars->device.get());
@@ -637,8 +668,21 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     }
 
     const uint32_t frame_bytes = static_cast<uint32_t>(entry->channels) * entry->subslot_bytes;
-    Log("host asked for %.0f Hz %s, using alternate setting %u", entry->sample_rate,
-        entry->native_dsd ? "native DSD" : "PCM", entry->alt_setting);
+    // The driver reads the ring up to a whole in-flight window ahead of what the DAC is
+    // playing, because that much audio is already handed to the controller. The host writes
+    // relative to the timeline the zero timestamps describe, so unless it is told to stay
+    // that far ahead it writes behind the read point and the DAC gets an empty ring.
+    // Twice the in-flight window, not once. At exactly one window the host's writes land
+    // level with the read point and every transfer picks up whatever was there before, so
+    // the margin has to cover the whole window again plus the host's own IO buffer.
+    const uint32_t window_frames = static_cast<uint32_t>(
+        kTransfersInFlight * kMicroframesPerTransfer * entry->sample_rate / 8000.0);
+    ivars->read_lag = window_frames;
+    ivars->device->SetOutputSafetyOffset(window_frames);
+    ivars->device->SetOutputLatency(window_frames);
+    Log("host asked for %.0f Hz %{public}s, alternate setting %u, in-flight window %u frames",
+        entry->sample_rate, entry->native_dsd ? "native DSD" : "PCM", entry->alt_setting,
+        window_frames);
     const kern_return_t result = StartIsoc(static_cast<uint32_t>(entry->sample_rate),
                                            entry->alt_setting, frame_bytes);
     if (result != kIOReturnSuccess) {
@@ -692,12 +736,16 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
         return kIOReturnBadArgument;
     }
     ivars->frame_bytes = frame_bytes;
-    ivars->ring_frames = ivars->ring_map->GetLength() / frame_bytes;
+    // Not the mapping length over the frame width: the host wraps at the zero timestamp
+    // period regardless of how much memory the buffer actually holds.
+    ivars->ring_frames = kZeroTimestampPeriod;
     ivars->samples_per_microframe = static_cast<double>(rate) / 8000.0;
     ivars->carry = 0.0;
     ivars->sample_counter = 0;
     ivars->next_timestamp_at = kZeroTimestampPeriod;
-    ivars->debug_reports = 0;
+    ivars->prev_sample = 0;
+    ivars->prev_host = 0;
+    ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->running = true;
     // A DSD DAC fed zeroes leaves lock and pops, so the ring starts out holding DSD silence
@@ -777,8 +825,11 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
         if (samples * stride > packet) {
             samples = packet / stride;
         }
-        CopyFromRing(ring, ivars->ring_frames, ivars->sample_counter, samples, stride,
-                     data + offset);
+        // Read where the audio will be heard, not where it is being queued.
+        const uint64_t at = ivars->sample_counter >= ivars->read_lag
+                                ? ivars->sample_counter - ivars->read_lag
+                                : 0;
+        CopyFromRing(ring, ivars->ring_frames, at, samples, stride, data + offset);
         ivars->sample_counter += samples;
 
         frames[microframe].status = kIOReturnInvalid;
@@ -793,17 +844,6 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
 
     // Roughly one report a second: the first handful are pre-roll submitted before the host
     // has written anything, so they say nothing about whether audio is arriving.
-    ivars->debug_reports++;
-    if (ivars->debug_reports % 250 == 0) {
-        uint32_t nonzero = 0;
-        for (uint32_t byte = 0; byte < offset; byte++) {
-            nonzero += data[byte] != 0 ? 1 : 0;
-        }
-        Log("transfer %u at sample %llu (ring slot %llu): %u of %u bytes non-zero",
-            ivars->debug_reports, transfer.start_sample,
-            transfer.start_sample % ivars->ring_frames, nonzero, offset);
-    }
-
     const kern_return_t result = ivars->pipe->IsochIO(transfer.data, transfer.frames,
                                                       ivars->next_bus_frame, transfer.completion);
     if (result != kIOReturnSuccess) {
@@ -840,18 +880,40 @@ void IMPL(DsdAudioDriver, IsochComplete) {
     // The DAC's own clock decides when a frame goes out, so timing the host's timeline off
     // these completions is what removes drift: Core Audio follows the DAC rather than the
     // two running open loop against each other.
+    //
+    // The sample times have to land on exact multiples of the zero timestamp period, which
+    // is what the device promised the host when it was created. A transfer carries
+    // rate/250 samples, which is not a whole number at most rates and never divides the
+    // period, so the boundary falls inside a transfer and its host time is interpolated
+    // between this completion and the one before. Posting the transfer's own sample time
+    // instead makes Core Audio reject every timestamp as TimeStampOutOfLine, reset its
+    // clock, and never advance where it writes.
     const Transfer& transfer = ivars->transfers[index];
-    if (transfer.start_sample >= ivars->next_timestamp_at && ivars->device &&
-        transfer.frame_map != nullptr) {
+    if (transfer.frame_map != nullptr) {
         const IOUSBIsochronousFrame* frames =
             reinterpret_cast<const IOUSBIsochronousFrame*>(transfer.frame_map->GetAddress());
-        ivars->device->UpdateCurrentZeroTimestamp(transfer.start_sample, frames[0].timeStamp);
-        ivars->next_timestamp_at = transfer.start_sample + kZeroTimestampPeriod;
-        if (ivars->timestamps_posted < 3) {
-            Log("posted zero timestamp %llu at host time %llu", transfer.start_sample,
-                frames[0].timeStamp);
+        const uint64_t sample = transfer.start_sample;
+        const uint64_t host = frames[0].timeStamp;
+        if (ivars->prev_host != 0 && sample > ivars->prev_sample && ivars->device) {
+            const double per_sample = static_cast<double>(host - ivars->prev_host) /
+                                      static_cast<double>(sample - ivars->prev_sample);
+            while (ivars->next_timestamp_at <= sample &&
+                   ivars->next_timestamp_at >= ivars->prev_sample) {
+                const uint64_t at = ivars->next_timestamp_at;
+                const uint64_t when =
+                    ivars->prev_host +
+                    static_cast<uint64_t>(static_cast<double>(at - ivars->prev_sample) *
+                                          per_sample);
+                ivars->device->UpdateCurrentZeroTimestamp(at, when);
+                if (ivars->timestamps_posted < 3) {
+                    Log("posted zero timestamp %llu at host time %llu", at, when);
+                }
+                ivars->timestamps_posted++;
+                ivars->next_timestamp_at += kZeroTimestampPeriod;
+            }
         }
-        ivars->timestamps_posted++;
+        ivars->prev_sample = sample;
+        ivars->prev_host = host;
     }
     SubmitTransfer(index);
 }
