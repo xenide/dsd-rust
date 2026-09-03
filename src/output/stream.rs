@@ -15,7 +15,10 @@ use rtrb::Consumer;
 use tracing::{debug, warn};
 
 use crate::dop::{self, Marker, SILENCE_PAYLOAD};
-use crate::output::encoding::Encoding;
+use crate::dsd::DsdRate;
+use crate::native::BYTES_PER_SUBSLOT;
+use crate::output::FormatLine;
+use crate::output::encoding::{Carrier, Encoding, is_native_dsd};
 use crate::output::hal::{self, Device, Stream};
 
 /// Counters the render callback publishes for the transport display.
@@ -56,10 +59,17 @@ impl PlaybackState {
     }
 }
 
+/// Payloads one native frame takes from the queue at the widest file the readers accept:
+/// two DSD byte pairs for each of six channels.
+const MAX_NATIVE_PAYLOADS: usize = 12;
+
 struct IoContext {
     consumer: Consumer<u16>,
     channels: usize,
     stream_index: usize,
+    carrier: Carrier,
+    /// How a DoP word sits in one sample of the stream format. Native DSD writes its bytes
+    /// straight out, so it never consults this.
     encoding: Encoding,
     marker: Marker,
     state: Arc<PlaybackState>,
@@ -70,6 +80,7 @@ impl IoContext {
         let Self {
             consumer,
             channels,
+            carrier,
             encoding,
             marker,
             state,
@@ -82,44 +93,50 @@ impl IoContext {
             }
         }
 
-        let sample_bytes = encoding.bytes_per_sample();
+        let sample_bytes = match carrier {
+            Carrier::Dop => encoding.bytes_per_sample(),
+            Carrier::NativeDsd => BYTES_PER_SUBSLOT,
+        };
         let frame_bytes = sample_bytes * stream_channels;
         if frame_bytes == 0 || stream_channels == 0 {
             return;
         }
         let frames = out.len() / frame_bytes;
+        // Native DSD packs twice the DSD bits into a frame, so one frame drains two payloads
+        // per channel rather than one. Everything else about the queue is the same.
+        let per_frame = *channels * carrier.payloads_per_frame();
         let silenced = state.silence.load(Ordering::Relaxed)
             || state.paused.load(Ordering::Relaxed)
             || state.seeking.load(Ordering::Relaxed);
-        let ready = if silenced {
+        let ready = if silenced || per_frame == 0 {
             0
         } else {
-            (consumer.slots() / *channels).min(frames)
+            (consumer.slots() / per_frame).min(frames)
         };
         let chunk = consumer
-            .read_chunk(ready * *channels)
+            .read_chunk(ready * per_frame)
             .expect("counted slots are available");
         let (head, tail) = chunk.as_slices();
         let mut payloads = head.iter().chain(tail).copied();
 
-        let mut cursor = 0;
-        for _ in 0..frames {
-            let marker = marker.next();
-            for channel in 0..stream_channels {
-                let payload = if channel < *channels {
-                    payloads.next().unwrap_or(SILENCE_PAYLOAD)
-                } else {
-                    SILENCE_PAYLOAD
-                };
-                encoding.write(
-                    dop::word(marker, payload),
-                    &mut out[cursor..cursor + sample_bytes],
-                );
-                cursor += sample_bytes;
+        match carrier {
+            Carrier::Dop => write_dop(
+                &mut payloads,
+                *encoding,
+                marker,
+                *channels,
+                stream_channels,
+                frames,
+                out,
+            ),
+            Carrier::NativeDsd => {
+                write_native(&mut payloads, *channels, stream_channels, frames, out);
             }
         }
         chunk.commit_all();
 
+        // Counted in device frames, which is what the queue is measured in too: a native
+        // frame carries two payloads per channel, and the reader accounts for it the same way.
         state
             .frames_played
             .fetch_add(ready as u64, Ordering::Relaxed);
@@ -127,6 +144,74 @@ impl IoContext {
             state
                 .underrun_frames
                 .fetch_add((frames - ready) as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Write `frames` DoP frames: an alternating marker and 16 DSD bits per channel.
+fn write_dop(
+    payloads: &mut impl Iterator<Item = u16>,
+    encoding: Encoding,
+    marker: &mut Marker,
+    channels: usize,
+    stream_channels: usize,
+    frames: usize,
+    out: &mut [u8],
+) {
+    let sample_bytes = encoding.bytes_per_sample();
+    let mut cursor = 0;
+    for _ in 0..frames {
+        let marker = marker.next();
+        for channel in 0..stream_channels {
+            let payload = if channel < channels {
+                payloads.next().unwrap_or(SILENCE_PAYLOAD)
+            } else {
+                SILENCE_PAYLOAD
+            };
+            encoding.write(
+                dop::word(marker, payload),
+                &mut out[cursor..cursor + sample_bytes],
+            );
+            cursor += sample_bytes;
+        }
+    }
+}
+
+/// Write `frames` native frames: four raw DSD bytes per channel, earliest byte first.
+///
+/// The queue interleaves one payload per channel per DoP frame, so a native frame's two
+/// payloads for one channel sit `channels` apart rather than side by side. They are staged
+/// for the whole frame first, because the iterator only moves forward.
+fn write_native(
+    payloads: &mut impl Iterator<Item = u16>,
+    channels: usize,
+    stream_channels: usize,
+    frames: usize,
+    out: &mut [u8],
+) {
+    let mut staged = [SILENCE_PAYLOAD; MAX_NATIVE_PAYLOADS];
+    let wanted = (channels * 2).min(MAX_NATIVE_PAYLOADS);
+    let mut cursor = 0;
+    for _ in 0..frames {
+        for slot in staged.iter_mut().take(wanted) {
+            *slot = payloads.next().unwrap_or(SILENCE_PAYLOAD);
+        }
+        for channel in 0..stream_channels {
+            // A channel the file does not carry gets DSD silence, as it does under DoP.
+            let (early, late) = if channel < channels {
+                (
+                    staged.get(channel).copied().unwrap_or(SILENCE_PAYLOAD),
+                    staged
+                        .get(channels + channel)
+                        .copied()
+                        .unwrap_or(SILENCE_PAYLOAD),
+                )
+            } else {
+                (SILENCE_PAYLOAD, SILENCE_PAYLOAD)
+            };
+            out[cursor..cursor + 2].copy_from_slice(&early.to_be_bytes());
+            out[cursor + 2..cursor + BYTES_PER_SUBSLOT].copy_from_slice(&late.to_be_bytes());
+            cursor += BYTES_PER_SUBSLOT;
         }
     }
 }
@@ -237,6 +322,9 @@ pub fn supported_dop_rates(device: &Device) -> Vec<u32> {
             let usable = formats.iter().any(|ranged| {
                 carries_rate(ranged, rate)
                     && ranged.mFormat.mFormatID == kAudioFormatLinearPCM
+                    // A native DSD format is 32-bit integer PCM as far as this test can
+                    // tell, and DoP words written into it reach the DAC as raw DSD bits.
+                    && !is_native_dsd(&ranged.mFormat)
                     && Encoding::from_format(&ranged.mFormat).is_ok()
             });
             if usable && !rates.contains(&rate) {
@@ -248,10 +336,43 @@ pub fn supported_dop_rates(device: &Device) -> Vec<u32> {
     rates
 }
 
+/// DSD rates this device carries natively through Core Audio, in DSD bits per second.
+///
+/// Only a driver that owns the DAC's streaming interface can publish these: Core Audio never
+/// selects a `RAW_DATA` alternate setting on its own, so a DAC left to `usbaudiod` offers
+/// nothing here however willing the hardware is. The frame rate is a thirty-second of the DSD
+/// rate, and a frame rate counts only when that lands on a real DSD tier, which is what
+/// separates 352800 Hz carrying DSD256 from 352800 Hz carrying PCM.
+pub fn supported_native_rates(device: &Device) -> Vec<u32> {
+    let mut rates = Vec::new();
+    let Ok(streams) = device.output_streams() else {
+        return rates;
+    };
+    for stream in streams {
+        let Ok(formats) = stream.available_physical_formats() else {
+            continue;
+        };
+        for ranged in formats {
+            if !is_native_dsd(&ranged.mFormat) || ranged.mFormat.mSampleRate <= 0.0 {
+                continue;
+            }
+            let hz = (ranged.mFormat.mSampleRate as u32).saturating_mul(32);
+            if DsdRate::new(hz).multiplier().is_some_and(|n| n >= 64) && !rates.contains(&hz) {
+                rates.push(hz);
+            }
+        }
+    }
+    rates.sort_unstable();
+    rates
+}
+
 /// What the player asks of a device.
 pub struct Request {
-    pub pcm_rate: u32,
+    /// Frames a second the device runs at, which is the DoP carrier rate or, natively, a
+    /// thirty-second of the DSD rate.
+    pub frame_rate: u32,
     pub channels: u16,
+    pub carrier: Carrier,
     pub exclusive: bool,
     pub buffer_frames: Option<u32>,
 }
@@ -270,6 +391,7 @@ pub struct Output {
     format_changed: bool,
     /// Set when this device was the system output before exclusive use moved it away.
     was_default_output: bool,
+    pub carrier: Carrier,
     pub encoding: Encoding,
     pub buffer_frames: u32,
     pub state: Arc<PlaybackState>,
@@ -278,8 +400,9 @@ pub struct Output {
 impl Output {
     pub fn open(device: Device, request: &Request, consumer: Consumer<u16>) -> Result<Self> {
         let Request {
-            pcm_rate,
+            frame_rate,
             channels,
+            carrier,
             exclusive,
             buffer_frames,
         } = *request;
@@ -330,24 +453,35 @@ impl Output {
             running: false,
             format_changed: false,
             was_default_output,
+            carrier,
             encoding: Encoding::Float32,
             buffer_frames: 0,
             state: Arc::new(PlaybackState::default()),
         };
 
-        if let Err(error) = device.set_nominal_sample_rate(f64::from(pcm_rate)) {
+        if let Err(error) = device.set_nominal_sample_rate(f64::from(frame_rate)) {
             debug!("nominal sample rate not settable directly: {error}");
         }
-        let format = adopt_format(&stream, &choice.formats, pcm_rate)
-            .with_context(|| format!("device rejected every {pcm_rate} Hz format"))?;
+        let format = adopt_format(&stream, &choice.formats, frame_rate)
+            .with_context(|| format!("device rejected every {frame_rate} Hz format"))?;
         output.format_changed = true;
         output.publish_claim();
 
-        let virtual_format = negotiate_virtual_format(&stream, &format, exclusive)?;
-        if virtual_format.mSampleRate != f64::from(pcm_rate) {
+        let virtual_format = negotiate_virtual_format(&stream, &format, carrier, exclusive)?;
+        if virtual_format.mSampleRate != f64::from(frame_rate) {
             bail!(
-                "device settled on {} Hz instead of {pcm_rate} Hz",
+                "device settled on {} Hz instead of {frame_rate} Hz",
                 virtual_format.mSampleRate
+            );
+        }
+        // Native DSD only survives while the mixer is out of the path and the bits go out
+        // unconverted. A virtual format that fell back to anything else would send the DAC
+        // PCM through its DSD alternate setting, which is loud noise rather than a fault.
+        if carrier == Carrier::NativeDsd && !is_native_dsd(&virtual_format) {
+            bail!(
+                "device would not keep the native DSD format at {frame_rate} Hz; it settled on \
+                 {}",
+                FormatLine(virtual_format)
             );
         }
         output.encoding = Encoding::from_format(&virtual_format)?;
@@ -360,6 +494,7 @@ impl Output {
             consumer,
             channels: channels as usize,
             stream_index,
+            carrier,
             encoding: output.encoding,
             marker: Marker::new(),
             state: Arc::clone(&output.state),
@@ -452,6 +587,15 @@ impl Output {
     pub fn mixing_disabled(&self) -> bool {
         self.mixing_disabled
     }
+
+    /// True when the samples reach the device exactly as written. Native DSD always does:
+    /// it only exists over a non-mixable format the HAL leaves alone.
+    pub fn is_integer(&self) -> bool {
+        match self.carrier {
+            Carrier::Dop => self.encoding.is_integer(),
+            Carrier::NativeDsd => true,
+        }
+    }
 }
 
 impl Drop for Output {
@@ -536,8 +680,9 @@ struct StreamChoice {
 
 fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
     let Request {
-        pcm_rate,
+        frame_rate,
         channels,
+        carrier,
         exclusive,
         ..
     } = *request;
@@ -546,7 +691,20 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
         let mut scored = Vec::new();
         for ranged in stream.available_physical_formats()? {
             let format = ranged.mFormat;
-            if !carries_rate(&ranged, pcm_rate) || format.mChannelsPerFrame < u32::from(channels) {
+            if !carries_rate(&ranged, frame_rate) || format.mChannelsPerFrame < u32::from(channels)
+            {
+                continue;
+            }
+            // The two carriers want disjoint sets of formats, and each is wrong for the
+            // other: DoP written into the native format reaches the DAC as raw DSD, and
+            // native bits written into a PCM format reach it as a PCM square wave.
+            if carrier == Carrier::NativeDsd {
+                if is_native_dsd(&format) {
+                    scored.push((0, format));
+                }
+                continue;
+            }
+            if is_native_dsd(&format) {
                 continue;
             }
             let Ok(encoding) = Encoding::from_format(&format) else {
@@ -570,8 +728,13 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
             });
         }
     }
-    best.with_context(|| {
-        format!("device has no {pcm_rate} Hz, {channels} channel, 24 bit or better output format")
+    best.with_context(|| match carrier {
+        Carrier::Dop => format!(
+            "device has no {frame_rate} Hz, {channels} channel, 24 bit or better output format"
+        ),
+        Carrier::NativeDsd => format!(
+            "device publishes no native DSD format at {frame_rate} Hz for {channels} channels"
+        ),
     })
 }
 
@@ -579,15 +742,15 @@ fn choose_stream(device: &Device, request: &Request) -> Result<StreamChoice> {
 fn adopt_format(
     stream: &Stream,
     candidates: &[AudioStreamBasicDescription],
-    pcm_rate: u32,
+    frame_rate: u32,
 ) -> Result<AudioStreamBasicDescription> {
     let mut last = None;
     for format in candidates {
         let mut format = *format;
-        format.mSampleRate = f64::from(pcm_rate);
+        format.mSampleRate = f64::from(frame_rate);
         match stream
             .set_physical_format(&format)
-            .and_then(|()| settle(stream, f64::from(pcm_rate)))
+            .and_then(|()| settle(stream, f64::from(frame_rate)))
         {
             Ok(()) => return Ok(format),
             Err(error) => {
@@ -599,7 +762,7 @@ fn adopt_format(
             }
         }
     }
-    Err(last.unwrap_or_else(|| anyhow!("device offers no usable format at {pcm_rate} Hz")))
+    Err(last.unwrap_or_else(|| anyhow!("device offers no usable format at {frame_rate} Hz")))
 }
 
 /// Changing the hardware format is asynchronous; wait for the device to settle.
@@ -624,13 +787,21 @@ fn settle(stream: &Stream, rate: f64) -> Result<()> {
 fn negotiate_virtual_format(
     stream: &Stream,
     physical: &AudioStreamBasicDescription,
+    carrier: Carrier,
     exclusive: bool,
 ) -> Result<AudioStreamBasicDescription> {
     if is_non_mixable(physical) {
         let deadline = Instant::now() + VIRTUAL_FORMAT_TIMEOUT;
         loop {
             let current = stream.virtual_format()?;
-            if Encoding::from_format(&current).is_ok_and(Encoding::is_integer) {
+            // Native DSD needs the virtual format to be the native one, not merely an
+            // integer one: the HAL would otherwise hand the callback little-endian PCM
+            // samples while the driver streams whatever they are down the DSD endpoint.
+            let settled = match carrier {
+                Carrier::Dop => Encoding::from_format(&current).is_ok_and(Encoding::is_integer),
+                Carrier::NativeDsd => is_native_dsd(&current),
+            };
+            if settled {
                 return Ok(current);
             }
             if Instant::now() >= deadline {
@@ -660,7 +831,9 @@ mod tests {
     use rtrb::RingBuffer;
 
     use crate::dop::{MARKER_A, MARKER_B, SILENCE_PAYLOAD, pack_planes, split_word};
-    use crate::output::encoding::Encoding;
+    use crate::dsd::DSD_SILENCE_BYTE;
+    use crate::native;
+    use crate::output::encoding::{Carrier, Encoding};
     use crate::output::stream::{IoContext, Marker, PlaybackState};
     use crate::reader::DsdSource;
     use crate::reader::dsf::DsfReader;
@@ -693,6 +866,14 @@ mod tests {
     }
 
     fn context(payloads: &[u16], stream_channels: usize) -> (IoContext, Arc<PlaybackState>) {
+        carried(payloads, stream_channels, Carrier::Dop)
+    }
+
+    fn carried(
+        payloads: &[u16],
+        stream_channels: usize,
+        carrier: Carrier,
+    ) -> (IoContext, Arc<PlaybackState>) {
         let (mut producer, consumer) = RingBuffer::<u16>::new(payloads.len().max(1) * 2);
         for payload in payloads {
             producer.push(*payload).expect("ring has room");
@@ -702,6 +883,7 @@ mod tests {
             consumer,
             channels: 2,
             stream_index: 0,
+            carrier,
             encoding: ENCODING,
             marker: Marker::new(),
             state: Arc::clone(&state),
@@ -750,6 +932,90 @@ mod tests {
             state.frames_played.load(Ordering::Relaxed),
             payloads.len() as u64 / 2
         );
+    }
+
+    /// Decode a native device buffer back into per-channel DSD bytes. There is no marker to
+    /// check: the frame is four raw DSD bytes per channel, earliest byte first.
+    fn decode_native(buffer: &[u8], stream_channels: usize) -> Vec<Vec<u8>> {
+        let mut channels = vec![Vec::new(); stream_channels];
+        let stride = native::BYTES_PER_SUBSLOT;
+        for frame in buffer.chunks_exact(stride * stream_channels) {
+            for (channel, subslot) in frame.chunks_exact(stride).enumerate() {
+                channels[channel].extend_from_slice(subslot);
+            }
+        }
+        channels
+    }
+
+    #[test]
+    fn native_dsd_reaches_the_device_buffer_bit_for_bit() {
+        let (payloads, expected) = payloads_of(dsf_file(1, (BLOCK * 4 * 8) as u64, 4));
+        let (mut context, state) = carried(&payloads, 2, Carrier::NativeDsd);
+
+        // An odd buffer length makes every render cross ring and block boundaries.
+        let mut decoded = vec![Vec::new(); 2];
+        for _ in 0..12 {
+            let mut buffer = vec![0_u8; native::frame_bytes(2) * 7];
+            context.fill(&mut buffer, 2);
+            for (channel, bytes) in decode_native(&buffer, 2).into_iter().enumerate() {
+                decoded[channel].extend_from_slice(&bytes);
+            }
+        }
+
+        for channel in 0..2 {
+            let length = expected[channel].len();
+            assert_eq!(decoded[channel][..length], expected[channel][..]);
+        }
+        // Two payloads a channel to a frame, so half the frames DoP would have made.
+        assert_eq!(
+            state.frames_played.load(Ordering::Relaxed),
+            payloads.len() as u64 / 4
+        );
+    }
+
+    #[test]
+    fn a_native_frame_is_what_the_usb_packer_would_have_written() {
+        let left: Vec<u8> = (0..=63).collect();
+        let right: Vec<u8> = (0..=63).rev().collect();
+        let mut payloads = Vec::new();
+        pack_planes(&[&left, &right], &mut payloads);
+        let (mut context, _) = carried(&payloads, 2, Carrier::NativeDsd);
+        let mut expected = Vec::new();
+        native::pack_planes(&[&left, &right], &mut expected);
+
+        let mut buffer = vec![0_u8; expected.len()];
+        context.fill(&mut buffer, 2);
+
+        assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn an_empty_native_queue_renders_dsd_silence_too() {
+        let (mut context, state) = carried(&[], 2, Carrier::NativeDsd);
+        let mut buffer = vec![0_u8; native::frame_bytes(2) * 4];
+
+        context.fill(&mut buffer, 2);
+
+        assert_eq!(buffer, vec![DSD_SILENCE_BYTE; native::frame_bytes(2) * 4]);
+        assert_eq!(state.underrun_frames.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn a_native_channel_beyond_the_file_gets_dsd_silence() {
+        let left: Vec<u8> = (1..=8).collect();
+        let right: Vec<u8> = (9..=16).collect();
+        let mut payloads = Vec::new();
+        pack_planes(&[&left, &right], &mut payloads);
+        let (mut context, _) = carried(&payloads, 4, Carrier::NativeDsd);
+
+        let mut buffer = vec![0_u8; native::frame_bytes(4) * 2];
+        context.fill(&mut buffer, 4);
+
+        let decoded = decode_native(&buffer, 4);
+        assert_eq!(decoded[0], left);
+        assert_eq!(decoded[1], right);
+        assert_eq!(decoded[2], vec![DSD_SILENCE_BYTE; 8]);
+        assert_eq!(decoded[3], vec![DSD_SILENCE_BYTE; 8]);
     }
 
     #[test]
