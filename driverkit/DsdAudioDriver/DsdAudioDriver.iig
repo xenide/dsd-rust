@@ -1,0 +1,58 @@
+//
+//  DsdAudioDriver.iig
+//
+//  A DriverKit extension that matches the DAC's audio streaming interface directly.
+//
+//  Matching the interface is the whole point: IOKit gives an interface to one driver, so a
+//  dext that matches it excludes usbaudiod by construction. There is no re-enumeration to
+//  force and no window to race, and because the driver owns every alternate setting it can
+//  select the RAW_DATA one that Core Audio will not -- which puts native DSD on the system
+//  as an ordinary output device rather than behind this project's CLI.
+//
+
+#ifndef DsdAudioDriver_h
+#define DsdAudioDriver_h
+
+#include <AudioDriverKit/IOUserAudioDriver.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+
+class IOUSBHostInterface;
+class IOUserAudioDevice;
+class IOUserAudioStream;
+
+class DsdAudioDriver: public IOUserAudioDriver
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+
+    virtual kern_return_t Start(IOService* provider) override;
+    virtual kern_return_t Stop(IOService* provider) override;
+
+    virtual kern_return_t NewUserClient(uint32_t in_type, IOUserClient** out_user_client) override;
+
+    virtual kern_return_t StartDevice(IOUserAudioObjectID in_object_id,
+                                      IOUserAudioStartStopFlags in_flags) override LOCALONLY;
+    virtual kern_return_t StopDevice(IOUserAudioObjectID in_object_id,
+                                     IOUserAudioStartStopFlags in_flags) override LOCALONLY;
+
+    /// One isochronous transfer has come back. Refills its buffer from the audio ring,
+    /// resubmits it, and advances the timeline the host reads.
+    virtual void IsochComplete(OSAction* action, IOReturn status)
+        TYPE(IOUSBHostPipe::CompleteAsyncIsochIO);
+
+    /// Build the Core Audio device, its output stream, and the format list, from what the
+    /// interface descriptors and the clock reported.
+    kern_return_t PublishAudioObjects() LOCALONLY;
+
+    /// Select the alternate setting the format needs, set the clock, and fill the pipe.
+    kern_return_t StartIsoc(uint32_t rate, uint8_t alt_setting, uint32_t frame_bytes) LOCALONLY;
+
+    /// Abort what is in flight and drop the interface back to its zero bandwidth setting.
+    void StopIsoc() LOCALONLY;
+
+    /// Fill one transfer from the ring and hand it to the pipe.
+    kern_return_t SubmitTransfer(uint32_t index) LOCALONLY;
+};
+
+#endif /* DsdAudioDriver_h */

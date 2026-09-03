@@ -122,6 +122,19 @@ Playback" against "Cayin RU7" -- so whichever name contains the other counts as 
 DAC whose two names have nothing in common needs its USB name passed to `--device`, which
 `devices` lists on the `native` line.
 
+## Driver extension
+
+`driverkit/` holds a DriverKit extension that answers the same problem the other way: it
+matches the DAC's streaming interface itself, so `usbaudiod` never gets it and there is no
+race to win. Owning the interface also means the `RAW_DATA` alternate setting can be
+published as an ordinary Core Audio output device, which puts native DSD in front of every
+application rather than only this CLI.
+
+It compiles but has never been loaded: DriverKit's USB and audio entitlements are granted by
+Apple case by case, and a dext installs only from a notarized app. `driverkit/README.md` has
+the details and what is left to do. Nothing in `driverkit/` is built by `cargo`, and none of
+it is needed to use the player.
+
 ## What "bit-perfect" means here
 
 * DSD samples are never resampled, filtered, or attenuated. The player only reorders bits
