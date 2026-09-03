@@ -807,19 +807,34 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->feedback_misses = 0;
     ivars->output_completions = 0;
     ivars->carry = 0.0;
-    ivars->sample_counter = 0;
-    ivars->next_timestamp_at = kZeroTimestampPeriod;
+    // Pick the timeline up where it was left, rather than starting it again at zero.
+    //
+    // Core Audio's sample time carries across an IO stop and start, and its counter follows
+    // the timeline the driver posts rather than restarting alongside it: the sample time the
+    // host writes at on the first cycle of a track is the number of frames the track before
+    // it played. Zeroing the counter here anchors the two to different timelines, so the ring
+    // is read nowhere near where the host writes, and the HAL then walks the difference off at
+    // a few thousand frames a second -- crossing the write point, and taking the audio with
+    // it, every few seconds for the minute or more that takes.
+    //
+    // The last timestamp posted is where the host is, to within a period, and it is already a
+    // multiple of one, so it needs no rounding. Before the first track it reads back zero,
+    // which is where this used to start.
+    uint64_t resumed_sample = 0;
+    uint64_t resumed_host = 0;
+    ivars->device->GetCurrentZeroTimestamp(&resumed_sample, &resumed_host);
+    ivars->sample_counter = resumed_sample;
+    ivars->next_timestamp_at = resumed_sample + kZeroTimestampPeriod;
     ivars->prev_sample = 0;
     ivars->prev_host = 0;
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->running = true;
-    // A DSD DAC fed zeroes leaves lock and pops, so the ring starts out holding DSD silence
-    // rather than what an untouched buffer holds. Anything the host writes replaces it.
-    if (alt->raw_data) {
-        memset(reinterpret_cast<void*>(ivars->ring_map->GetAddress()), kDsdSilenceByte,
-               ivars->ring_map->GetLength());
-    }
+    // The ring is read a whole in-flight window before the host's first write of the track
+    // lands, so it starts out holding silence rather than the tail of the track before. Which
+    // byte means silence depends on the carrier: a DSD DAC fed zeroes leaves lock and pops.
+    memset(reinterpret_cast<void*>(ivars->ring_map->GetAddress()),
+           alt->raw_data ? kDsdSilenceByte : 0, ivars->ring_map->GetLength());
 
     result = AllocateTransfers(this, ivars, alt->max_packet);
     if (result != kIOReturnSuccess) {
@@ -848,10 +863,10 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     if (feedback != kIOReturnSuccess) {
         Log("feedback endpoint would not start (0x%08x), running open loop", feedback);
     }
-    Log("streaming %u Hz on alt %u: ring %llu frames of %u bytes, feedback endpoint 0x%02x "
-        "pipe %{public}s",
-        rate, alt_setting, ivars->ring_frames, ivars->frame_bytes, alt->feedback_endpoint,
-        ivars->feedback_pipe != nullptr ? "open" : "none");
+    Log("streaming %u Hz on alt %u: ring %llu frames of %u bytes, timeline resumes at %llu, "
+        "feedback endpoint 0x%02x pipe %{public}s",
+        rate, alt_setting, ivars->ring_frames, ivars->frame_bytes, ivars->sample_counter,
+        alt->feedback_endpoint, ivars->feedback_pipe != nullptr ? "open" : "none");
     return kIOReturnSuccess;
 }
 

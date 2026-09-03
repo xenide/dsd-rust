@@ -51,7 +51,7 @@ DsdAudioDriver: host wrote 512 frames at sample 521028 (ring slot 836); engine r
 
 ```
 DsdAudioDriver: host asked for 352800 Hz native DSD, alternate setting 4, in-flight window 11289 frames
-DsdAudioDriver: streaming 352800 Hz on alt 4: ring 32768 frames of 8 bytes, feedback endpoint 0x81 pipe open
+DsdAudioDriver: streaming 352800 Hz on alt 4: ring 32768 frames of 8 bytes, timeline resumes at 10431513, feedback endpoint 0x81 pipe open
 ```
 
 Native DSD is what the alternate setting exists for, and it is what Core Audio cannot reach
@@ -68,6 +68,21 @@ multiple of the period, interpolated between two isochronous completions, so a p
 covering few transfers inherits the jitter of individual ones -- three transfers at 352800
 against twenty-three at 44100, and Core Audio read a rate 7% out and spent a minute and a
 half walking back from it. 32768 frames covers twenty-three transfers at 352800 again.
+
+**Core Audio's timeline outlives an IO stop, so the driver's has to as well.** Its sample time
+carries across a stop and start, and its counter follows the timeline the driver posts rather
+than restarting alongside it: the sample time the host writes at on the first cycle of a track
+is the number of frames the track before it played. A driver that zeroes its own counter each
+time anchors the two to different timelines, so the ring is read nowhere near where the host
+writes. The HAL then walks the difference off at a few thousand frames a second, crossing the
+write point every few seconds for the minute or more that takes, which is audible as a sandy
+noise that comes and goes. It sounds like drift and is not: the rate is right throughout.
+
+`IOUserAudioDevice` inherits `GetCurrentZeroTimestamp` from `IOUserAudioClockDevice`, so
+`StartIsoc` reads back the last timestamp posted and starts there. It is already a multiple of
+the period, and it reads back zero before the first track. Resuming leaves the two aligned from
+the first transfer, and the margin between them is then the in-flight window it was meant to
+be -- 32 ms at 352800 -- rather than whatever the misalignment happened to leave.
 
 A glitch every few seconds during development turned out not to be drift at all: it was a
 diagnostic that scanned the whole ring inside the isochronous completion handler. Work on
