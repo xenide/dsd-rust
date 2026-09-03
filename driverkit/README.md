@@ -49,11 +49,16 @@ DsdAudioDriver: host asked for 44100 Hz PCM, alternate setting 1, in-flight wind
 DsdAudioDriver: host wrote 512 frames at sample 521028 (ring slot 836); engine reads at sample 520556 (slot 364)
 ```
 
-What is left is a glitch every seven seconds or so. The output endpoint is asynchronous: it
-runs on the DAC's clock, and the DAC says how many samples it wants through its feedback
-endpoint. The driver ignores that and sends the nominal count, so the DAC's buffer walks
-until it breaks and recovers. `src/output/usb/stream.rs` reads the feedback endpoint for
-exactly this reason; the dext does not yet.
+What is left is the feedback endpoint. The output endpoint is asynchronous: it runs on the
+DAC's clock and says how many samples per microframe it wants through a second endpoint. The
+driver opens that endpoint, submits a read, and the read never completes, so it falls back to
+sending the nominal count and runs open loop. Whether that drifts audibly over a long track
+is untested; over a minute it does not.
+
+A glitch every few seconds during development turned out not to be drift at all: it was a
+diagnostic that scanned the whole ring inside the isochronous completion handler. Work on
+the IO path costs a reboot to get wrong, so it is tempting to instrument heavily, but the
+completion handler is a real time context and an expensive loop there is audible.
 
 Three things had to be right for any of it to be audible, and each was silent when wrong:
 

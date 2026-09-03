@@ -40,6 +40,13 @@ constexpr uint32_t kWidestFrameBytes = 8;
 constexpr uint64_t kRingBytes =
     static_cast<uint64_t>(kZeroTimestampPeriod) * kWidestFrameBytes;
 
+/// Bytes one high-speed feedback report occupies: a 16.16 fixed point count of samples per
+/// microframe, little endian.
+constexpr uint32_t kFeedbackBytes = 4;
+/// A reported rate this far from nominal is a decoding error, not a clock, and is ignored.
+constexpr double kMinFeedbackRatio = 0.95;
+constexpr double kMaxFeedbackRatio = 1.05;
+
 /// DSD silence is alternating bits, not zero: a DAC fed zeroes leaves DSD lock and pops.
 constexpr uint8_t kDsdSilenceByte = 0x69;
 
@@ -73,6 +80,7 @@ struct DsdAudioDriver_IVars {
     IOUSBHostInterface* interface;
     uint8_t configuration_value;
     IOUSBHostPipe* pipe;
+    IOUSBHostPipe* feedback_pipe;
 
     OSSharedPtr<IOUserAudioDevice> device;
     OSSharedPtr<IOUserAudioStream> stream;
@@ -84,6 +92,14 @@ struct DsdAudioDriver_IVars {
     size_t format_count;
 
     Transfer transfers[kTransfersInFlight];
+    Transfer feedback;
+    uint64_t feedback_bus_frame;
+    /// What the rate would be if the DAC ran exactly on the nominal clock, which is what the
+    /// reported rate is sanity checked against.
+    double nominal_samples_per_microframe;
+    uint64_t feedback_reports;
+    uint64_t feedback_misses;
+    uint64_t output_completions;
     /// Bytes one sample frame occupies on the wire, from the format in force.
     uint32_t frame_bytes;
     /// Samples per microframe the current rate asks for, and the fractional carry that
@@ -296,6 +312,7 @@ void DsdAudioDriver::free() {
         ivars->ring.reset();
         ivars->ring_map.reset();
         OSSafeReleaseNULL(ivars->pipe);
+        OSSafeReleaseNULL(ivars->feedback_pipe);
         OSSafeReleaseNULL(ivars->interface);
         OSSafeReleaseNULL(ivars->device_usb);
     }
@@ -581,15 +598,40 @@ void CopyFromRing(const uint8_t* ring, uint64_t ring_frames, uint64_t position, 
     }
 }
 
+void FreeTransfer(Transfer& transfer) {
+    OSSafeReleaseNULL(transfer.completion);
+    OSSafeReleaseNULL(transfer.data_map);
+    OSSafeReleaseNULL(transfer.frame_map);
+    OSSafeReleaseNULL(transfer.data);
+    OSSafeReleaseNULL(transfer.frames);
+}
+
 void FreeTransfers(DsdAudioDriver_IVars* ivars) {
     for (uint32_t index = 0; index < kTransfersInFlight; index++) {
-        Transfer& transfer = ivars->transfers[index];
-        OSSafeReleaseNULL(transfer.completion);
-        OSSafeReleaseNULL(transfer.data_map);
-        OSSafeReleaseNULL(transfer.frame_map);
-        OSSafeReleaseNULL(transfer.data);
-        OSSafeReleaseNULL(transfer.frames);
+        FreeTransfer(ivars->transfers[index]);
     }
+    FreeTransfer(ivars->feedback);
+}
+
+/// Buffers and a frame list for one transfer, without its completion action.
+kern_return_t AllocateBuffers(Transfer& transfer, IOOptionBits direction, uint64_t data_bytes) {
+    const uint64_t frame_bytes =
+        static_cast<uint64_t>(kMicroframesPerTransfer) * sizeof(IOUSBIsochronousFrame);
+    kern_return_t result =
+        IOBufferMemoryDescriptor::Create(direction, data_bytes, 4096, &transfer.data);
+    if (result != kIOReturnSuccess) {
+        return result;
+    }
+    result = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, frame_bytes, 8,
+                                              &transfer.frames);
+    if (result != kIOReturnSuccess) {
+        return result;
+    }
+    result = transfer.data->CreateMapping(0, 0, 0, 0, 0, &transfer.data_map);
+    if (result != kIOReturnSuccess) {
+        return result;
+    }
+    return transfer.frames->CreateMapping(0, 0, 0, 0, 0, &transfer.frame_map);
 }
 
 /// Give every transfer its own data buffer, frame list and completion action.
@@ -600,26 +642,10 @@ kern_return_t AllocateTransfers(DsdAudioDriver* driver, DsdAudioDriver_IVars* iv
                                 uint32_t max_packet) {
     FreeTransfers(ivars);
     const uint64_t data_bytes = static_cast<uint64_t>(kMicroframesPerTransfer) * max_packet;
-    const uint64_t frame_bytes =
-        static_cast<uint64_t>(kMicroframesPerTransfer) * sizeof(IOUSBIsochronousFrame);
 
     for (uint32_t index = 0; index < kTransfersInFlight; index++) {
         Transfer& transfer = ivars->transfers[index];
-        kern_return_t result = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOut, data_bytes,
-                                                                4096, &transfer.data);
-        if (result != kIOReturnSuccess) {
-            return result;
-        }
-        result = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, frame_bytes, 8,
-                                                  &transfer.frames);
-        if (result != kIOReturnSuccess) {
-            return result;
-        }
-        result = transfer.data->CreateMapping(0, 0, 0, 0, 0, &transfer.data_map);
-        if (result != kIOReturnSuccess) {
-            return result;
-        }
-        result = transfer.frames->CreateMapping(0, 0, 0, 0, 0, &transfer.frame_map);
+        kern_return_t result = AllocateBuffers(transfer, kIOMemoryDirectionOut, data_bytes);
         if (result != kIOReturnSuccess) {
             return result;
         }
@@ -632,7 +658,18 @@ kern_return_t AllocateTransfers(DsdAudioDriver* driver, DsdAudioDriver_IVars* iv
             return result;
         }
     }
-    return kIOReturnSuccess;
+
+    const uint64_t feedback_bytes =
+        static_cast<uint64_t>(kMicroframesPerTransfer) * kFeedbackBytes;
+    const kern_return_t result =
+        AllocateBuffers(ivars->feedback, kIOMemoryDirectionIn, feedback_bytes);
+    if (result != kIOReturnSuccess) {
+        return result;
+    }
+    // The same action type as an output transfer. Both completions arrive through
+    // IOUSBHostPipe::CompleteAsyncIsochIO, and a second method declared with that type is
+    // never dispatched to, so one handler tells them apart by which action came back.
+    return driver->CreateActionIsochComplete(0, &ivars->feedback.completion);
 }
 
 }  // namespace
@@ -732,6 +769,16 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     OSSafeReleaseNULL(ivars->pipe);
     ivars->pipe = pipe;
 
+    OSSafeReleaseNULL(ivars->feedback_pipe);
+    if (alt->feedback_endpoint != 0) {
+        IOUSBHostPipe* feedback = nullptr;
+        if (ivars->interface->CopyPipe(alt->feedback_endpoint, &feedback) == kIOReturnSuccess) {
+            ivars->feedback_pipe = feedback;
+        } else {
+            Log("no feedback pipe on endpoint 0x%02x, running open loop", alt->feedback_endpoint);
+        }
+    }
+
     if (frame_bytes == 0) {
         return kIOReturnBadArgument;
     }
@@ -740,6 +787,10 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     // period regardless of how much memory the buffer actually holds.
     ivars->ring_frames = kZeroTimestampPeriod;
     ivars->samples_per_microframe = static_cast<double>(rate) / 8000.0;
+    ivars->nominal_samples_per_microframe = ivars->samples_per_microframe;
+    ivars->feedback_reports = 0;
+    ivars->feedback_misses = 0;
+    ivars->output_completions = 0;
     ivars->carry = 0.0;
     ivars->sample_counter = 0;
     ivars->next_timestamp_at = kZeroTimestampPeriod;
@@ -774,9 +825,18 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
             return result;
         }
     }
-    Log("streaming %u Hz on alt %u: ring %llu frames of %u bytes, %.3f samples per microframe",
-        rate, alt_setting, ivars->ring_frames, ivars->frame_bytes,
-        ivars->samples_per_microframe);
+    // After the output chain, not before: the frame the loop started on is already behind
+    // the bus by the time the last transfer is queued, and a request for a frame that has
+    // gone is refused.
+    ivars->feedback_bus_frame = ivars->next_bus_frame;
+    const kern_return_t feedback = SubmitFeedback();
+    if (feedback != kIOReturnSuccess) {
+        Log("feedback endpoint would not start (0x%08x), running open loop", feedback);
+    }
+    Log("streaming %u Hz on alt %u: ring %llu frames of %u bytes, feedback endpoint 0x%02x "
+        "pipe %{public}s",
+        rate, alt_setting, ivars->ring_frames, ivars->frame_bytes, alt->feedback_endpoint,
+        ivars->feedback_pipe != nullptr ? "open" : "none");
     return kIOReturnSuccess;
 }
 
@@ -787,6 +847,10 @@ void DsdAudioDriver::StopIsoc() {
             // Synchronous, so nothing is still holding a buffer when they are freed below.
             ivars->pipe->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, this);
             OSSafeReleaseNULL(ivars->pipe);
+        }
+        if (ivars->feedback_pipe != nullptr) {
+            ivars->feedback_pipe->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, this);
+            OSSafeReleaseNULL(ivars->feedback_pipe);
         }
         if (ivars->interface != nullptr && ivars->active_alt != 0) {
             ivars->interface->SelectAlternateSetting(0);
@@ -864,8 +928,90 @@ uint32_t TransferForAction(const DsdAudioDriver_IVars* ivars, const OSAction* ac
     return kTransfersInFlight;
 }
 
+kern_return_t DsdAudioDriver::SubmitFeedback() {
+    if (!ivars->running || ivars->feedback_pipe == nullptr ||
+        ivars->feedback.frame_map == nullptr) {
+        return kIOReturnNotReady;
+    }
+    IOUSBIsochronousFrame* frames =
+        reinterpret_cast<IOUSBIsochronousFrame*>(ivars->feedback.frame_map->GetAddress());
+    for (uint32_t microframe = 0; microframe < kMicroframesPerTransfer; microframe++) {
+        frames[microframe].status = kIOReturnInvalid;
+        frames[microframe].requestCount = kFeedbackBytes;
+        frames[microframe].completeCount = 0;
+        frames[microframe].reserved = 0;
+        frames[microframe].timeStamp = 0;
+    }
+    const kern_return_t result =
+        ivars->feedback_pipe->IsochIO(ivars->feedback.data, ivars->feedback.frames,
+                                      ivars->feedback_bus_frame, ivars->feedback.completion);
+    if (result != kIOReturnSuccess) {
+        return result;
+    }
+    ivars->feedback_bus_frame += kMicroframesPerTransfer / kMicroframesPerFrame;
+    return kIOReturnSuccess;
+}
+
+/// An asynchronous endpoint runs on the DAC's clock, not the host's, and says how many
+/// samples it wants per microframe as a 16.16 fixed point count. Sending the nominal count
+/// instead walks the DAC's buffer until it breaks, which is audible as a glitch every few
+/// seconds.
+void HandleFeedback(DsdAudioDriver_IVars* ivars, IOReturn status) {
+    if ((status == kIOReturnSuccess || status == kIOReturnUnderrun) &&
+        ivars->feedback.data_map != nullptr && ivars->feedback.frame_map != nullptr) {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(ivars->feedback.data_map->GetAddress());
+        const IOUSBIsochronousFrame* frames =
+            reinterpret_cast<const IOUSBIsochronousFrame*>(ivars->feedback.frame_map->GetAddress());
+        for (uint32_t microframe = 0; microframe < kMicroframesPerTransfer; microframe++) {
+            if (frames[microframe].completeCount < kFeedbackBytes) {
+                continue;
+            }
+            const uint8_t* report = data + microframe * kFeedbackBytes;
+            const uint32_t raw = static_cast<uint32_t>(report[0]) |
+                                 (static_cast<uint32_t>(report[1]) << 8) |
+                                 (static_cast<uint32_t>(report[2]) << 16) |
+                                 (static_cast<uint32_t>(report[3]) << 24);
+            const double samples = static_cast<double>(raw) / 65536.0;
+            const double ratio = samples / ivars->nominal_samples_per_microframe;
+            // Anything outside the band is a decoding error, not a clock.
+            if (ratio >= kMinFeedbackRatio && ratio <= kMaxFeedbackRatio) {
+                ivars->samples_per_microframe = samples;
+                ivars->feedback_reports++;
+                if (ivars->feedback_reports % 2000 == 0) {
+                    Log("DAC asks for %d.%06d samples per microframe, nominal %d.%06d",
+                        static_cast<int>(samples),
+                        static_cast<int>((samples - static_cast<int>(samples)) * 1000000),
+                        static_cast<int>(ivars->nominal_samples_per_microframe),
+                        static_cast<int>((ivars->nominal_samples_per_microframe -
+                                          static_cast<int>(ivars->nominal_samples_per_microframe)) *
+                                         1000000));
+                }
+            }
+        }
+    }
+    if (ivars->feedback_reports == 0) {
+        ivars->feedback_misses++;
+        if (ivars->feedback_misses % 200 == 1) {
+            const IOUSBIsochronousFrame* frames =
+                ivars->feedback.frame_map != nullptr
+                    ? reinterpret_cast<const IOUSBIsochronousFrame*>(
+                          ivars->feedback.frame_map->GetAddress())
+                    : nullptr;
+            Log("feedback came back 0x%08x, first frame status 0x%08x count %u", status,
+                frames != nullptr ? frames[0].status : 0,
+                frames != nullptr ? frames[0].completeCount : 0);
+        }
+    }
+}
+
 void IMPL(DsdAudioDriver, IsochComplete) {
     if (ivars == nullptr || !ivars->running || action == nullptr) {
+        return;
+    }
+    if (action == ivars->feedback.completion) {
+        HandleFeedback(ivars, status);
+        // Always resubmit: a servo that stops silently stops tracking the DAC's clock.
+        SubmitFeedback();
         return;
     }
     const uint32_t index = TransferForAction(ivars, action);
@@ -875,6 +1021,17 @@ void IMPL(DsdAudioDriver, IsochComplete) {
     if (status != kIOReturnSuccess && status != kIOReturnUnderrun) {
         Log("transfer %u came back 0x%08x, stopping", index, status);
         return;
+    }
+
+    // A feedback read that never completes takes the servo down with it, silently, because
+    // the chain only resubmits from its own completion. Re-arm it from here rather than run
+    // open loop for the rest of the track.
+    ivars->output_completions++;
+    if (ivars->feedback_pipe != nullptr && ivars->feedback_reports == 0 &&
+        ivars->feedback_misses == 0 && ivars->output_completions % 250 == 0) {
+        const kern_return_t armed = SubmitFeedback();
+        Log("feedback silent after %llu transfers, resubmit says 0x%08x",
+            ivars->output_completions, armed);
     }
 
     // The DAC's own clock decides when a frame goes out, so timing the host's timeline off

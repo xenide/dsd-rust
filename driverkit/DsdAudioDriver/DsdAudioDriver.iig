@@ -53,6 +53,9 @@ public:
 
     /// Fill one transfer from the ring and hand it to the pipe.
     kern_return_t SubmitTransfer(uint32_t index) LOCALONLY;
+
+    /// Hand the feedback endpoint a read, so the DAC keeps being asked what rate it runs at.
+    kern_return_t SubmitFeedback() LOCALONLY;
 };
 
 #endif /* DsdAudioDriver_h */
