@@ -1,3 +1,4 @@
 /target
 /.idea
 /driverkit/build
+/.playwright-mcp
