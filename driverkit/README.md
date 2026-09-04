@@ -113,6 +113,80 @@ what an application that takes the first format it is offered gets. Setting it o
 before `AddObject` is not enough on its own: it comes back as the narrowest published once
 Core Audio picks the device up, so it is set again afterwards and both values logged.
 
+## What is left: clicks during steady playback
+
+Ordinary system audio -- YouTube, Spotify, `afplay` -- works, and the stutter that used to open
+every fresh device start is gone. What remains is intermittent and smaller, and it is a
+different fault from the one that produced the stutter.
+
+**The symptom.** On some sessions the read point moves during steady playback, seconds after
+the start. Each move is a jump in the audio: a click, and in a rising sweep the pitch visibly
+steps, by roughly a fourth. Six of them in one session, spaced evenly, matched the rate limit
+on corrections exactly -- so the limiter was metering the clicks out rather than preventing
+them, and the underlying cause is that the engine drifts in front of the host during playback
+rather than staying a fixed distance behind it.
+
+**What is already ruled out.** The engine's own pacing is correct: measured against wall clock
+it advances 109,058 frames in 579 ms at 192000, which is real time to within two parts in a
+thousand. The zero timestamps are accurate too -- 32,768 frames in 4,095,991 mach ticks against
+4,096,000 exact. Isochronous completions come back clean, `status 0` and a full 144 byte first
+frame, at a steady 768 frames each. So neither the transfer chain nor the timeline arithmetic
+is drifting.
+
+**Where to look next.** Two candidates, both measurable without guessing:
+
+* The feedback servo. `samples_per_microframe` comes from the DAC's feedback endpoint and is
+  accepted anywhere within five percent of nominal, so a persistently high report would have
+  the engine draining the ring faster than the host fills it. Log the accepted value against
+  nominal over a session and see whether it sits off centre. Note that no feedback report has
+  ever been observed in the log despite the pipe opening, which is itself unexplained -- the
+  `DAC asks for` line has never appeared, and neither have the misses it would otherwise
+  report.
+* Core Audio's own convergence. Its counter follows the timeline the driver posts rather than
+  leading it, and it closes a gap at a few thousand frames a second rather than instantly. A
+  session that starts with the two far apart spends a long time converging, and the read point
+  is chasing a moving target throughout.
+
+**How to measure it.** `session ends: N read point moves, M cycles the engine had overtaken the
+host, K frames sent as silence` is logged at every `StopIsoc`. `N` is the number of audible
+clicks -- it has matched what a listener reports every time it has been checked, and it is the
+number to drive to zero. `K` is how long the opening ramp lasted.
+
+**A test signal helps.** A slow rising sine sweep makes both faults obvious where music does
+not: a repeat is heard as the pitch dropping back, and a read point move as the pitch stepping.
+Twenty seconds from 300 Hz to 1200 Hz at low amplitude is enough.
+
+**Watch for the fail-silent trap.** An earlier version waited for the host to be pacing before
+it would anchor, and sent silence until then. On sessions where that condition never arrived it
+sent silence from end to end -- no audio at all, which is worse than the artefact it was
+avoiding. Anchoring now falls back to a deadline. Any gate on the read path needs one.
+
+## Iterating on this
+
+`activate` alone does not swap the running code, so every change costs a round trip: rebuild,
+`activate`, then `sudo pkill -f "SystemExtensions.*DsdAudioDriver"` and replug the DAC.
+
+**Check the reload took before trusting a result.** A whole round of listening tests once ran
+against a build that was never loaded, because the DAC came back before `activate` completed.
+Mach-O links embed a fresh UUID, so compare the loaded binary against the copy inside the app
+bundle -- the one that gets staged -- and not against `build/…dext/…`:
+
+```
+LOADED=$(ps aux | grep -i dsdaudio | grep -v grep | head -1 |
+         grep -o '/Library/SystemExtensions/[^ ]*DsdAudioDriver')
+shasum -a 256 "$LOADED" \
+  build/DsdDriverInstaller.app/Contents/Library/SystemExtensions/\
+com.github.xenide.dsdrust.driver.dext/Contents/MacOS/DsdAudioDriver
+```
+
+If `activate` fails with `OSSystemExtensionError 4`, a previous copy is pinned:
+`systemextensionsctl list` will show one entry `activated enabled` beside another `terminating
+for upgrade via delegate`. The `pkill` clears it, and the activate then succeeds.
+
+**os_log drops lines from the IO path.** Counters that are summarised once per session are
+trustworthy; a log line emitted per cycle is not, and reading a dropped line as an absent event
+sent this work down a wrong path more than once.
+
 ## Layout
 
 | file | what it is |
