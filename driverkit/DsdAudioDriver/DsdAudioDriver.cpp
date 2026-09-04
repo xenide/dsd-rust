@@ -20,12 +20,18 @@ namespace {
 
 /// Microframes one transfer carries, so four milliseconds of audio.
 constexpr uint32_t kMicroframesPerTransfer = 32;
-/// Transfers in flight, giving thirty-two milliseconds of scheduling headroom.
-constexpr uint32_t kTransfersInFlight = 8;
+/// Transfers in flight, giving sixteen milliseconds of scheduling headroom. Fewer than
+/// this once cost the completion handler its margin; more buys nothing and costs latency,
+/// because the read point trails the queue point by the whole in-flight window.
+constexpr uint32_t kTransfersInFlight = 4;
 /// High-speed USB divides each one millisecond bus frame into eight microframes.
 constexpr uint64_t kMicroframesPerFrame = 8;
 /// Bus frames to schedule the first transfer ahead of now.
 constexpr uint64_t kStartLead = 10;
+/// Consecutive evenly spaced host writes that mean the host is running at rate rather than
+/// still closing the gap on the engine's timeline.
+constexpr uint64_t kPacedWritesBeforeAnchor = 3;
+
 /// Sample frames between the timestamps the host reads to build its timeline, which is also
 /// the length of the ring the two share.
 ///
@@ -41,8 +47,14 @@ constexpr uint64_t kStartLead = 10;
 /// isochronous completions, so a period spanning few transfers inherits the jitter of
 /// individual ones. At 44100 a period of 4096 frames covered 23 transfers; at 352800 it
 /// covered three, and Core Audio read a rate 7% out and spent a minute and a half walking
-/// back from it. 32768 frames covers 23 transfers again at 352800.
-constexpr uint32_t kZeroTimestampPeriod = 32768;
+/// back from it. This covers twelve at 352800, which is enough.
+///
+/// It is also how often Core Audio hears what the clock is doing, and it will not start
+/// cleanly without a few: at 32768 frames, which is three quarters of a second at 44100, the
+/// host limped at a tenth of rate for a second and a half before finding its feet, and
+/// everything the engine put out in the meantime had to be silence. Sizing this is a trade
+/// between the two, not a maximum.
+constexpr uint32_t kZeroTimestampPeriod = 16384;
 
 /// Widest sample frame any published format uses: two channels of four byte subslots.
 constexpr uint32_t kWidestFrameBytes = 8;
@@ -137,9 +149,37 @@ struct DsdAudioDriver_IVars {
     /// whole in-flight window later, and the host writes just ahead of what is playing, so
     /// reading at the submission point reads where it has not written yet.
     uint64_t read_lag;
+    /// Where the ring is read, relative to the submission point: the read position is the
+    /// sample counter plus this. It starts at minus the lag and is set once from the host's
+    /// first write, because only that says where the host really is.
+    int64_t read_offset;
+    bool read_anchored;
+    /// The last write the host made, and how many consecutive ones have been exactly one
+    /// buffer apart. The read point is anchored once the host is pacing rather than chasing.
+    uint64_t last_write_sample;
+    uint32_t last_write_frames;
+    /// Consecutive host writes exactly one buffer apart, and where the read point was last
+    /// set. The host running at rate is what makes an anchor hold, and every anchor after the
+    /// first is a jump in the read position, which is heard as a click.
+    uint64_t paced_writes;
+    uint64_t anchored_at;
+    /// Where the timeline stood when this session started, so waiting for the host to pace
+    /// can be given up on.
+    uint64_t started_at;
+    /// Frames sent as silence because the host had not written that far yet.
+    uint64_t starved;
+    /// The byte this carrier calls silence: DSD silence is alternating bits, not zero.
+    uint8_t silence_byte;
     /// IO operations the host has performed, so a sample of them can be logged.
     uint64_t io_calls;
     uint64_t timestamps_posted;
+    /// Times the host wrote at or behind where the engine was already reading, which is the
+    /// ring lapping and is audible. Counted rather than logged per occurrence: the IO handler
+    /// runs hundreds of times a second.
+    uint64_t crossings;
+    /// Times the read point moved. Every one of them is a jump in the audio, heard as a
+    /// click and, in a sweep, as the pitch stepping.
+    uint64_t anchors;
     bool running;
     uint8_t active_alt;
 };
@@ -580,6 +620,87 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         ^kern_return_t(IOUserAudioObjectID, IOUserAudioIOOperation in_operation,
                        uint32_t in_frame_size, uint64_t in_sample_time, uint64_t) {
             state->io_calls++;
+            const int64_t read_position =
+                static_cast<int64_t>(state->sample_counter) + state->read_offset;
+            const uint64_t read_at = read_position > 0 ? static_cast<uint64_t>(read_position) : 0;
+            // Anchor the read point to the host's first write of the session.
+            //
+            // The engine's timeline starts running the moment IO does, but Core Audio only
+            // begins writing some time later, and how much later varies -- 30 ms on one start
+            // and 144 ms on the next. Reading a fixed lag behind the engine's own counter
+            // therefore reads past where the host has got to whenever that delay exceeds the
+            // lag, and what comes out is whatever the ring held before: the same buffer over
+            // and over until the host catches up. Where the host actually is is the only
+            // thing that says where it is safe to read, and it says so on the first write.
+            if (in_operation == IOUserAudioIOOperationWriteEnd) {
+                const int64_t margin =
+                    static_cast<int64_t>(in_sample_time) - static_cast<int64_t>(read_at);
+                const bool overtaken = state->read_anchored && margin <= 0;
+                if (overtaken) {
+                    state->crossings++;
+                }
+                // Anchor on the first write, and again any time the engine gets in front of
+                // the host. Once is not enough: the engine's counter surges while the
+                // pre-rolled transfers drain, so an anchor taken on the first write is stale
+                // by the second. Each correction moves the read point further back, never
+                // forward, and it settles as soon as the two are running at the same rate.
+                // A write exactly one buffer past the last one is the host running at rate.
+                // Anything else is it still closing the gap on the engine's timeline, and an
+                // anchor taken then does not hold: the engine is in front again within a
+                // cycle or two, and each correction moves the read position, which is heard
+                // as a click. Sixteen of them in the first seconds of a track is worse than
+                // the stutter they replaced, so wait for the host to be pacing and anchor
+                // once. Until then the bound below sends silence, which is what there is.
+                if (state->last_write_frames != 0 &&
+                    in_sample_time == state->last_write_sample + state->last_write_frames) {
+                    state->paced_writes++;
+                } else {
+                    state->paced_writes = 0;
+                }
+                state->last_write_sample = in_sample_time;
+                state->last_write_frames = in_frame_size;
+                // Either the host is pacing, or it has had long enough that waiting longer
+                // is worse than anchoring on what we have. Waiting on pacing alone can wait
+                // for ever -- a session where it never came out silent from end to end,
+                // which is a worse fault than the clicks the wait was meant to avoid.
+                const bool settled =
+                    state->paced_writes >= kPacedWritesBeforeAnchor ||
+                    state->sample_counter > state->started_at + kZeroTimestampPeriod;
+                // A later correction is a backstop, not a servo: rate-limit it so a bad
+                // patch cannot turn into a stream of clicks.
+                const bool may_correct =
+                    overtaken && state->sample_counter > state->anchored_at + kZeroTimestampPeriod;
+                if ((!state->read_anchored && settled) || may_correct) {
+                    state->anchored_at = state->sample_counter;
+                    // Sit the read point a whole in-flight window plus a few of the host's
+                    // own buffers behind it. The window alone is 705 frames at 44100, which
+                    // is sixteen milliseconds, and the host's cycles do not arrive that
+                    // evenly: one grazed the read point by four frames and cost a second
+                    // correction, which is a second click. The margin is silence that never
+                    // gets played, so it is cheap; the only thing it buys back is latency.
+                    const uint64_t margin_frames =
+                        state->read_lag + static_cast<uint64_t>(in_frame_size) * 4;
+                    state->read_offset = static_cast<int64_t>(in_sample_time) -
+                                         static_cast<int64_t>(margin_frames) -
+                                         static_cast<int64_t>(state->sample_counter);
+                    state->read_anchored = true;
+                    state->anchors++;
+                    if (state->anchors <= 4) {
+                        Log("read point set from the host: it writes at %llu, engine queues at "
+                            "%llu, margin was %lld, ring now read %lld behind the queue point",
+                            in_sample_time, state->sample_counter, margin, -state->read_offset);
+                    }
+                }
+            }
+            // The first cycle of a session says whether the host and the engine agree on
+            // where the timeline is. They are on the same one only if the driver resumed
+            // where Core Audio left off, and a start that disagrees is audible.
+            if (state->io_calls == 1) {
+                Log("first IO: op %u, %u frames at sample %llu; engine queues at %llu, reads at "
+                    "%llu, so the host leads the read point by %lld",
+                    in_operation, in_frame_size, in_sample_time, state->sample_counter, read_at,
+                    static_cast<int64_t>(in_sample_time - read_at));
+            }
             if (state->io_calls % 250 == 0 && in_operation == IOUserAudioIOOperationWriteEnd) {
                 const uint64_t slot =
                     state->ring_frames != 0 ? in_sample_time % state->ring_frames : 0;
@@ -850,12 +971,23 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->prev_host = 0;
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
+    ivars->crossings = 0;
+    ivars->anchors = 0;
+    ivars->read_offset = -static_cast<int64_t>(ivars->read_lag);
+    ivars->read_anchored = false;
+    ivars->last_write_sample = 0;
+    ivars->last_write_frames = 0;
+    ivars->paced_writes = 0;
+    ivars->anchored_at = 0;
+    ivars->started_at = ivars->sample_counter;
+    ivars->starved = 0;
+    ivars->silence_byte = alt->raw_data ? kDsdSilenceByte : 0;
     ivars->running = true;
     // The ring is read a whole in-flight window before the host's first write of the track
     // lands, so it starts out holding silence rather than the tail of the track before. Which
     // byte means silence depends on the carrier: a DSD DAC fed zeroes leaves lock and pops.
-    memset(reinterpret_cast<void*>(ivars->ring_map->GetAddress()),
-           alt->raw_data ? kDsdSilenceByte : 0, ivars->ring_map->GetLength());
+    memset(reinterpret_cast<void*>(ivars->ring_map->GetAddress()), ivars->silence_byte,
+           ivars->ring_map->GetLength());
 
     result = AllocateTransfers(this, ivars, alt->max_packet);
     if (result != kIOReturnSuccess) {
@@ -893,6 +1025,11 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
 
 void DsdAudioDriver::StopIsoc() {
     if (ivars->running) {
+        if (ivars->anchors != 0 || ivars->crossings != 0 || ivars->starved != 0) {
+            Log("session ends: %llu read point moves, %llu cycles the engine had overtaken "
+                "the host, %llu frames sent as silence",
+                ivars->anchors, ivars->crossings, ivars->starved);
+        }
         ivars->running = false;
         if (ivars->pipe != nullptr) {
             // Synchronous, so nothing is still holding a buffer when they are freed below.
@@ -940,11 +1077,27 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
         if (samples * stride > packet) {
             samples = packet / stride;
         }
-        // Read where the audio will be heard, not where it is being queued.
-        const uint64_t at = ivars->sample_counter >= ivars->read_lag
-                                ? ivars->sample_counter - ivars->read_lag
-                                : 0;
-        CopyFromRing(ring, ivars->ring_frames, at, samples, stride, data + offset);
+        // Read where the audio will be heard, not where it is being queued -- and never
+        // past what the host has actually written.
+        //
+        // Core Audio writes at a fraction of real time for about a second after IO starts,
+        // while the engine runs at rate from the first transfer, so the engine gets tens of
+        // thousands of frames in front of it. The ring is one zero timestamp period long, so
+        // reading in front of the host wraps and returns audio from a moment ago, which is
+        // heard as a stutter that repeats until the host catches up. No anchor fixes this:
+        // it is not an offset that is wrong, it is that the audio does not exist yet.
+        //
+        // So bound the read by the host's own last write and send silence past it. The bound
+        // stops mattering the moment the host is running at rate, and it costs nothing then.
+        const int64_t position = static_cast<int64_t>(ivars->sample_counter) + ivars->read_offset;
+        const uint64_t at = position > 0 ? static_cast<uint64_t>(position) : 0;
+        const uint64_t written_to = ivars->last_write_sample + ivars->last_write_frames;
+        if (!ivars->read_anchored || at + samples > written_to) {
+            memset(data + offset, ivars->silence_byte, samples * stride);
+            ivars->starved += samples;
+        } else {
+            CopyFromRing(ring, ivars->ring_frames, at, samples, stride, data + offset);
+        }
         ivars->sample_counter += samples;
 
         frames[microframe].status = kIOReturnInvalid;
@@ -1073,11 +1226,21 @@ void IMPL(DsdAudioDriver, IsochComplete) {
         Log("transfer %u came back 0x%08x, stopping", index, status);
         return;
     }
+    const IOUSBIsochronousFrame* transfer_frames_for_log =
+        ivars->transfers[index].frame_map != nullptr
+            ? reinterpret_cast<const IOUSBIsochronousFrame*>(
+                  ivars->transfers[index].frame_map->GetAddress())
+            : nullptr;
 
     // A feedback read that never completes takes the servo down with it, silently, because
     // the chain only resubmits from its own completion. Re-arm it from here rather than run
     // open loop for the rest of the track.
     ivars->output_completions++;
+    if (ivars->output_completions <= 3 && transfer_frames_for_log != nullptr) {
+        Log("completion %llu: status 0x%08x, frame 0 status 0x%08x count %u, engine at %llu",
+            ivars->output_completions, status, transfer_frames_for_log[0].status,
+            transfer_frames_for_log[0].completeCount, ivars->sample_counter);
+    }
     if (ivars->feedback_pipe != nullptr && ivars->feedback_reports == 0 &&
         ivars->feedback_misses == 0 && ivars->output_completions % 250 == 0) {
         const kern_return_t armed = SubmitFeedback();
