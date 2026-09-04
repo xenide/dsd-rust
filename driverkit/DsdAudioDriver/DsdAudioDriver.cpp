@@ -745,8 +745,14 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     const uint32_t window_frames = static_cast<uint32_t>(
         kTransfersInFlight * kMicroframesPerTransfer * entry->sample_rate / 8000.0);
     ivars->read_lag = window_frames;
+    // The safety offset is how far ahead of the timeline the host has to write to stay clear
+    // of the read point, which is one window. The latency is how long a sample it writes
+    // takes to be heard, which is two: it waits for the read point to reach it, and then
+    // sits a whole in-flight window on the controller. Reporting one window for both told
+    // every player the audio was half as far behind as it is, and video sync is exactly what
+    // that number is for.
     ivars->device->SetOutputSafetyOffset(window_frames);
-    ivars->device->SetOutputLatency(window_frames);
+    ivars->device->SetOutputLatency(window_frames + static_cast<uint32_t>(ivars->read_lag));
     Log("host asked for %.0f Hz %{public}s, alternate setting %u, in-flight window %u frames",
         entry->sample_rate, entry->native_dsd ? "native DSD" : "PCM", entry->alt_setting,
         window_frames);
