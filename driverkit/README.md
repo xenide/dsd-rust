@@ -113,58 +113,88 @@ what an application that takes the first format it is offered gets. Setting it o
 before `AddObject` is not enough on its own: it comes back as the narrowest published once
 Core Audio picks the device up, so it is set again afterwards and both values logged.
 
-## What is left: clicks during steady playback
+## Anchoring the read point, and what the anchor waits for
 
-Ordinary system audio -- YouTube, Spotify, `afplay` -- works, and the stutter that used to open
-every fresh device start is gone. What remains is intermittent and smaller, and it is a
-different fault from the one that produced the stutter.
+The read point is set once per session, from a host write, and every later move is a jump in
+the audio -- a click, and in a rising sweep the pitch stepping by roughly a fourth. Putting
+that one anchor somewhere it will hold is the whole of it.
 
-**The symptom.** On some sessions the read point moves during steady playback, seconds after
-the start. Each move is a jump in the audio: a click, and in a rising sweep the pitch visibly
-steps, by roughly a fourth. Six of them in one session, spaced evenly, matched the rate limit
-on corrections exactly -- so the limiter was metering the clicks out rather than preventing
-them, and the underlying cause is that the engine drifts in front of the host during playback
-rather than staying a fixed distance behind it.
+**Core Audio does not open a session at rate.** On some starts it writes three buffers in half
+a second: 3072 frames where the engine, which runs on the bus clock, has advanced 22,000. It is
+not late by a fixed offset that could be measured and subtracted -- it runs at a seventh of
+rate while its own IO cycles settle and then over-runs to close the gap it opened, taking
+seconds to converge. In between it can sit twenty-five thousand frames behind the engine, which
+on a ring of 16,384 is more than a lap.
 
-**What is already ruled out.** The engine's own pacing is correct: measured against wall clock
-it advances 109,058 frames in 579 ms at 192000, which is real time to within two parts in a
-thousand. The zero timestamps are accurate too -- 32,768 frames in 4,095,991 mach ticks against
-4,096,000 exact. Isochronous completions come back clean, `status 0` and a full 144 byte first
-frame, at a steady 768 frames each. So neither the transfer chain nor the timeline arithmetic
-is drifting.
+**Contiguity is not pacing.** The test this replaced asked whether a write started exactly one
+buffer past the last. It always does: the host's writes are contiguous in sample time whatever
+wall clock rate they arrive at, so the condition was met by the second or third write of every
+session, including the ones running at a seventh of rate. The deadline meant to bound the wait
+ran from the start of the session and had already expired by the time the host wrote at all, so
+in practice the anchor was always taken on the first write. Taken there it sits the read point
+where the host will not be for another second or two: everything until it arrives is silence,
+and the crossing when it does is the click.
 
-**Where to look next.** Two candidates, both measurable without guessing:
+**What is measured instead.** `HostKeepsUp` compares the host's advance with the engine's over
+a window of eight host buffers and wants at least fifteen sixteenths of it, twice running. The
+engine's advance closes the window rather than the host's -- a host at a seventh of rate takes
+seven times as long to fill a window of its own writes, which is exactly the case being waited
+out. Faster than the engine passes deliberately: the over-run only moves the host's writes
+further ahead of the read point, so the margin grows rather than closing. The deadline now runs
+from the host's first write.
 
-* The feedback servo. `samples_per_microframe` comes from the DAC's feedback endpoint and is
-  accepted anywhere within five percent of nominal, so a persistently high report would have
-  the engine draining the ring faster than the host fills it. Log the accepted value against
-  nominal over a session and see whether it sits off centre. Note that no feedback report has
-  ever been observed in the log despite the pipe opening, which is itself unexplained -- the
-  `DAC asks for` line has never appeared, and neither have the misses it would otherwise
-  report.
-* Core Audio's own convergence. Its counter follows the timeline the driver posts rather than
-  leading it, and it closes a gap at a few thousand frames a second rather than instantly. A
-  session that starts with the two far apart spends a long time converging, and the read point
-  is chasing a moving target throughout.
+**What the fix measures on hardware.** Two sweeps at 44100, one on a fresh load and one
+resuming the previous session's timeline:
 
-**How to measure it.** `session ends: N read point moves, M cycles the engine had overtaken the
-host, K frames sent as silence` is logged at every `StopIsoc`. `N` is the number of audible
-clicks -- it has matched what a listener reports every time it has been checked, and it is the
-number to drive to zero. `K` is how long the opening ramp lasted.
+| | fresh load | resumed timeline |
+| --- | --- | --- |
+| read point moves | 1 | 1 |
+| cycles the engine had overtaken the host | 0 | 0 |
+| host's lead over the read point, over 17-21 s | 2691-2832 | 2708-2850 |
+| frames sent as silence | 43,395 | 64,564 |
 
-**A test signal helps.** A slow rising sine sweep makes both faults obvious where music does
-not: a repeat is heard as the pitch dropping back, and a read point move as the pitch stepping.
-Twenty seconds from 300 Hz to 1200 Hz at low amplitude is enough.
+The lead is the number that matters. It used to walk by tens of thousands of frames within
+seconds of the anchor; it now holds inside a band of seventy frames, under two milliseconds,
+for the length of the track. Neither sweep had an audible click or step.
+
+**The silence is the opening ramp, not a regression.** Earlier builds logged the same 18,000 to
+81,000 frames. Nearly all of it falls before the host's first write -- 770 ms and 1.27 s in the
+two sessions above -- which is Core Audio's own IO startup. Until then the audio to fill the
+ring does not exist, and silence is what there is.
 
 **Watch for the fail-silent trap.** An earlier version waited for the host to be pacing before
-it would anchor, and sent silence until then. On sessions where that condition never arrived it
+it would anchor and sent silence until then. On sessions where that condition never arrived it
 sent silence from end to end -- no audio at all, which is worse than the artefact it was
-avoiding. Anchoring now falls back to a deadline. Any gate on the read path needs one.
+avoiding. Any gate on the read path needs a deadline; this one has `kSettleDeadlineFrames`.
+
+**What was ruled out on the way.** The engine's own pacing is real time to within two parts in
+a thousand measured against wall clock, the zero timestamps are exact to nine parts in a
+million -- 16,384 frames per 8,916,264 mach ticks, three in a row -- and isochronous completions
+come back `status 0` with a full first frame. Neither the transfer chain nor the timeline
+arithmetic was ever drifting.
+
+**Still unexplained: the feedback endpoint never completes.** Its pipe opens on every session
+and `SubmitFeedback` returns success, but no completion has ever been observed -- neither a
+report nor the miss a completion carrying no data would log. The engine has run open loop on
+the nominal rate throughout, and a lead that holds inside two milliseconds over twenty seconds
+says the DAC's clock and the bus clock are close enough that it has not mattered yet. Over a
+long track it would.
+
+**A test signal helps.** A slow rising sine sweep makes these obvious where music does not: a
+repeat is heard as the pitch dropping back, and a read point move as the pitch stepping. Twenty
+seconds from 300 Hz to 1200 Hz at low amplitude is enough.
+
+**What is logged at the end of a session.** `session ends: N read point moves, M cycles the
+engine had overtaken the host, K frames sent as silence`, at every `StopIsoc`. `N` has matched
+what a listener reports every time it has been checked, and one is the floor rather than zero:
+the anchor itself counts. `K` is how long the opening ramp lasted.
 
 ## Iterating on this
 
-`activate` alone does not swap the running code, so every change costs a round trip: rebuild,
-`activate`, then `sudo pkill -f "SystemExtensions.*DsdAudioDriver"` and replug the DAC.
+`activate` stages a build; the kill is what swaps it in. Every change costs a round trip:
+rebuild, `activate`, then `sudo pkill -f "SystemExtensions.*DsdAudioDriver"` and replug the
+DAC. Expect to go round twice -- the first kill retires whichever copy was pinned and hands the
+DAC to the one already staged, and only the second brings up the build just made.
 
 **Check the reload took before trusting a result.** A whole round of listening tests once ran
 against a build that was never loaded, because the DAC came back before `activate` completed.
@@ -179,9 +209,11 @@ shasum -a 256 "$LOADED" \
 com.github.xenide.dsdrust.driver.dext/Contents/MacOS/DsdAudioDriver
 ```
 
-If `activate` fails with `OSSystemExtensionError 4`, a previous copy is pinned:
-`systemextensionsctl list` will show one entry `activated enabled` beside another `terminating
-for upgrade via delegate`. The `pkill` clears it, and the activate then succeeds.
+If `activate` fails with `OSSystemExtensionError 4`, two copies are on file and `sysextd` will
+not choose between them: `log show --predicate 'process == "sysextd"'` says `activateDecision
+found two entries`, one `activated_enabled` beside one `terminating_for_upgrade_via_delegate`.
+The pinned one is still running because it still owns the DAC, so the kill has to come before
+the activate rather than after it.
 
 **os_log drops lines from the IO path.** Counters that are summarised once per session are
 trustworthy; a log line emitted per cycle is not, and reading a dropped line as an absent event
