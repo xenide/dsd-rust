@@ -39,6 +39,11 @@ struct AltSetting {
     uint8_t out_endpoint;
     /// Zero when the endpoint runs without explicit feedback.
     uint8_t feedback_endpoint;
+    /// The feedback endpoint's own service interval and payload, which are not the output
+    /// endpoint's. A report arrives every 2^(interval - 1) microframes, so how much bus time
+    /// a frame list submitted against it spans follows from this and nothing else.
+    uint8_t feedback_interval;
+    uint32_t feedback_max_packet;
     /// Payload bytes one microframe can carry, with the high-speed transaction multiplier
     /// already applied.
     uint32_t max_packet;

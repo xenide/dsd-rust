@@ -241,6 +241,8 @@ void ReadEndpoint(const Descriptor& descriptor, AltSetting* alt) {
     const uint8_t address = descriptor.body[0];
     if ((address & kEndpointDirectionIn) != 0) {
         alt->feedback_endpoint = address;
+        alt->feedback_max_packet = PacketPayload(ReadLE16(descriptor.body + 2));
+        alt->feedback_interval = descriptor.body[4];
         return;
     }
     alt->out_endpoint = address;

@@ -34,9 +34,9 @@ void AppendInterface(std::vector<uint8_t>& config, uint8_t number, uint8_t alt,
 }
 
 void AppendEndpoint(std::vector<uint8_t>& config, uint8_t address, uint8_t attributes,
-                    uint16_t max_packet) {
+                    uint16_t max_packet, uint8_t interval = 1) {
     Append(config, {7, 0x05, address, attributes, static_cast<uint8_t>(max_packet & 0xFF),
-                    static_cast<uint8_t>(max_packet >> 8), 1});
+                    static_cast<uint8_t>(max_packet >> 8), interval});
 }
 
 /// The Cayin RU7's real configuration descriptor: three PCM alternate settings and one
@@ -101,6 +101,33 @@ int main() {
         Check(native->out_endpoint == 0x01, "native DSD writes to endpoint 1");
         Check(native->feedback_endpoint == 0x81, "native DSD has a feedback endpoint");
         Check(native->max_packet == 776, "native DSD packet is 776 bytes");
+    }
+
+    // The two endpoints of an alternate setting have separate intervals and payloads, and
+    // the feedback chain is scheduled off its own. Reading the output endpoint's instead
+    // schedules every resubmit against the wrong bus frame.
+    {
+        std::vector<uint8_t> config = {9, 0x02, 0, 0, 2, 1, 0, 0x80, 50};
+        AppendInterface(config, 0, 0, 0, 0x01);
+        Append(config, {9, 0x24, 0x01, 0x00, 0x02, 0x04, 0x40, 0x00, 0x00});
+        Append(config, {8, 0x24, 0x0A, 0x05, 0x03, 0x07, 0x00, 0x00});
+        AppendInterface(config, 1, 0, 0, 0x02);
+        AppendInterface(config, 1, 1, 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+        AppendEndpoint(config, 0x01, 0x05, 776, 1);
+        AppendEndpoint(config, 0x81, 0x11, 4, 4);
+        dsd::Uac2Layout split{};
+        Check(dsd::ParseLayout(config.data(), config.size(), &split), "split intervals parse");
+        const dsd::AltSetting* alt = FindAlt(split, 1);
+        Check(alt != nullptr, "the alternate setting is kept");
+        if (alt != nullptr) {
+            Check(alt->interval == 1, "the output endpoint keeps its own interval");
+            Check(alt->max_packet == 776, "the output endpoint keeps its own payload");
+            Check(alt->feedback_interval == 4, "the feedback endpoint keeps its own interval");
+            Check(alt->feedback_max_packet == 4, "the feedback endpoint keeps its own payload");
+        }
     }
 
     const dsd::AltSetting* pcm24 = FindAlt(layout, 2);

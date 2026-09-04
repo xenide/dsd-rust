@@ -132,12 +132,22 @@ struct DsdAudioDriver_IVars {
 
     Transfer transfers[kTransfersInFlight];
     Transfer feedback;
-    uint64_t feedback_bus_frame;
+    /// Frame list entries one feedback submission uses. A feedback endpoint reports once
+    /// per service interval rather than once per microframe, so this follows from its own
+    /// `bInterval` and not from the output endpoint's.
+    uint32_t feedback_entries;
     /// What the rate would be if the DAC ran exactly on the nominal clock, which is what the
     /// reported rate is sanity checked against.
     double nominal_samples_per_microframe;
     uint64_t feedback_reports;
     uint64_t feedback_misses;
+    uint64_t feedback_completions;
+    uint64_t feedback_submits;
+    uint64_t feedback_rearms;
+    /// Whether a feedback read is outstanding. The chain resubmits only from its own
+    /// completion, so a single refused submit ends it for the rest of the track, and
+    /// re-arming has to key off this rather than off whether a report was ever heard.
+    bool feedback_in_flight;
     uint64_t output_completions;
     /// Bytes one sample frame occupies on the wire, from the format in force.
     uint32_t frame_bytes;
@@ -988,7 +998,25 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->nominal_samples_per_microframe = ivars->samples_per_microframe;
     ivars->feedback_reports = 0;
     ivars->feedback_misses = 0;
+    ivars->feedback_completions = 0;
+    ivars->feedback_submits = 0;
+    ivars->feedback_rearms = 0;
+    ivars->feedback_in_flight = false;
     ivars->output_completions = 0;
+    // A feedback endpoint reports once every 2^(bInterval - 1) microframes, and the frame
+    // list is one entry per report, so 32 entries against this DAC's interval of 4 span 32
+    // bus frames rather than the 4 an output transfer uses. Advancing by the output chain's
+    // span left every resubmit pointing 28 ms into the past: the first went out, its
+    // completion arrived 32 ms later, and everything after it came back kIOReturnIsoTooOld.
+    // Take as many entries as cover one output transfer's worth of bus time instead.
+    const uint32_t microframes_per_report =
+        alt->feedback_interval > 0 && alt->feedback_interval <= 16
+            ? 1u << (alt->feedback_interval - 1)
+            : 1u;
+    ivars->feedback_entries = kMicroframesPerTransfer / microframes_per_report;
+    if (ivars->feedback_entries == 0) {
+        ivars->feedback_entries = 1;
+    }
     ivars->carry = 0.0;
     // Pick the timeline up where it was left, rather than starting it again at zero.
     //
@@ -1051,18 +1079,19 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
             return result;
         }
     }
-    // After the output chain, not before: the frame the loop started on is already behind
-    // the bus by the time the last transfer is queued, and a request for a frame that has
-    // gone is refused.
-    ivars->feedback_bus_frame = ivars->next_bus_frame;
+    // After the output chain, not before: `SubmitFeedback` schedules against its queue
+    // point, and the frame the loop started on is already behind the bus by the time the
+    // last transfer is queued.
     const kern_return_t feedback = SubmitFeedback();
     if (feedback != kIOReturnSuccess) {
         Log("feedback endpoint would not start (0x%08x), running open loop", feedback);
     }
     Log("streaming %u Hz on alt %u: ring %llu frames of %u bytes, timeline resumes at %llu, "
-        "feedback endpoint 0x%02x pipe %{public}s",
+        "feedback endpoint 0x%02x pipe %{public}s, interval %u payload %u, %u entries",
         rate, alt_setting, ivars->ring_frames, ivars->frame_bytes, ivars->sample_counter,
-        alt->feedback_endpoint, ivars->feedback_pipe != nullptr ? "open" : "none");
+        alt->feedback_endpoint, ivars->feedback_pipe != nullptr ? "open" : "none",
+        static_cast<unsigned>(alt->feedback_interval), alt->feedback_max_packet,
+        ivars->feedback_entries);
     return kIOReturnSuccess;
 }
 
@@ -1072,6 +1101,10 @@ void DsdAudioDriver::StopIsoc() {
             Log("session ends: %llu read point moves, %llu cycles the engine had overtaken "
                 "the host, %llu frames sent as silence",
                 ivars->anchors, ivars->crossings, ivars->starved);
+            Log("feedback over the session: %llu submits, %llu completions, %llu reports, "
+                "%llu misses, %llu re-arms",
+                ivars->feedback_submits, ivars->feedback_completions, ivars->feedback_reports,
+                ivars->feedback_misses, ivars->feedback_rearms);
         }
         ivars->running = false;
         if (ivars->pipe != nullptr) {
@@ -1177,25 +1210,43 @@ uint32_t TransferForAction(const DsdAudioDriver_IVars* ivars, const OSAction* ac
 
 kern_return_t DsdAudioDriver::SubmitFeedback() {
     if (!ivars->running || ivars->feedback_pipe == nullptr ||
-        ivars->feedback.frame_map == nullptr) {
+        ivars->feedback.frame_map == nullptr || ivars->feedback_entries == 0) {
         return kIOReturnNotReady;
     }
+    // Schedule against the output chain's queue point, which is a whole in-flight window
+    // into the future and therefore always a frame the controller will still take.
+    //
+    // A feedback chain has one transfer outstanding, so it has no lead of its own:
+    // resubmitting from its own completion aims at the frame that transfer just finished,
+    // which has gone by the time the handler runs. Advancing a counter of its own does not
+    // help either -- it only moves on success, so the first refusal pins it and every retry
+    // afterwards aims at the same receding frame. Both chains take one completion per output
+    // transfer, so this neither overlaps the previous submission nor leaves a gap.
+    const uint64_t at_frame = ivars->next_bus_frame;
     IOUSBIsochronousFrame* frames =
         reinterpret_cast<IOUSBIsochronousFrame*>(ivars->feedback.frame_map->GetAddress());
-    for (uint32_t microframe = 0; microframe < kMicroframesPerTransfer; microframe++) {
-        frames[microframe].status = kIOReturnInvalid;
-        frames[microframe].requestCount = kFeedbackBytes;
-        frames[microframe].completeCount = 0;
-        frames[microframe].reserved = 0;
-        frames[microframe].timeStamp = 0;
+    for (uint32_t entry = 0; entry < ivars->feedback_entries; entry++) {
+        frames[entry].status = kIOReturnInvalid;
+        frames[entry].requestCount = kFeedbackBytes;
+        frames[entry].completeCount = 0;
+        frames[entry].reserved = 0;
+        frames[entry].timeStamp = 0;
     }
+    ivars->feedback_submits++;
     const kern_return_t result =
         ivars->feedback_pipe->IsochIO(ivars->feedback.data, ivars->feedback.frames,
-                                      ivars->feedback_bus_frame, ivars->feedback.completion);
+                                      at_frame, ivars->feedback.completion);
     if (result != kIOReturnSuccess) {
+        // The first few unconditionally. Every symptom of a refused submit is an absence --
+        // no report, no miss, no line at all -- which is indistinguishable from an endpoint
+        // that was never asked, and that is how this one has looked from the start.
+        if (ivars->feedback_submits <= 4) {
+            Log("feedback submit %llu refused at bus frame %llu: 0x%08x",
+                ivars->feedback_submits, at_frame, result);
+        }
         return result;
     }
-    ivars->feedback_bus_frame += kMicroframesPerTransfer / kMicroframesPerFrame;
+    ivars->feedback_in_flight = true;
     return kIOReturnSuccess;
 }
 
@@ -1204,16 +1255,41 @@ kern_return_t DsdAudioDriver::SubmitFeedback() {
 /// instead walks the DAC's buffer until it breaks, which is audible as a glitch every few
 /// seconds.
 void HandleFeedback(DsdAudioDriver_IVars* ivars, IOReturn status) {
-    if ((status == kIOReturnSuccess || status == kIOReturnUnderrun) &&
-        ivars->feedback.data_map != nullptr && ivars->feedback.frame_map != nullptr) {
+    ivars->feedback_in_flight = false;
+    ivars->feedback_completions++;
+    // The first completion entry by entry, so a chain that runs once and stops is
+    // distinguishable from one that never ran, and so a report that is being discarded is
+    // distinguishable from one that never arrived. Both were silent before: a handful of
+    // accepted reports is never a multiple of the summary interval, and a report having been
+    // seen at all suppressed the miss line.
+    if (ivars->feedback_completions == 1 && ivars->feedback.frame_map != nullptr) {
+        const IOUSBIsochronousFrame* first =
+            reinterpret_cast<const IOUSBIsochronousFrame*>(ivars->feedback.frame_map->GetAddress());
+        for (uint32_t entry = 0; entry < ivars->feedback_entries; entry++) {
+            Log("feedback completion 1 entry %u: status 0x%08x count %u (transfer 0x%08x)",
+                entry, first[entry].status, first[entry].completeCount, status);
+        }
+    }
+    // Judge each interval by its own status, not by the transfer's.
+    //
+    // This DAC's feedback transfers come back kIOReturnOverrun every time, while every
+    // interval in them is marked success and holds its four bytes -- not some of them, all
+    // of them. Whatever the aggregate is reporting, it is not whether the reports arrived,
+    // and gating the read on it threw away 475 completions in a row without one line to say
+    // so. The per-interval status is the one that answers the question being asked.
+    if (ivars->feedback.data_map != nullptr && ivars->feedback.frame_map != nullptr) {
         const uint8_t* data = reinterpret_cast<const uint8_t*>(ivars->feedback.data_map->GetAddress());
         const IOUSBIsochronousFrame* frames =
             reinterpret_cast<const IOUSBIsochronousFrame*>(ivars->feedback.frame_map->GetAddress());
-        for (uint32_t microframe = 0; microframe < kMicroframesPerTransfer; microframe++) {
-            if (frames[microframe].completeCount < kFeedbackBytes) {
+        // Only the entries actually submitted: the rest of the list still holds the counts
+        // the transfer before it left there, and reading those counts a report twice.
+        for (uint32_t entry = 0; entry < ivars->feedback_entries; entry++) {
+            const bool carried = frames[entry].status == kIOReturnSuccess ||
+                                 frames[entry].status == kIOReturnUnderrun;
+            if (!carried || frames[entry].completeCount < kFeedbackBytes) {
                 continue;
             }
-            const uint8_t* report = data + microframe * kFeedbackBytes;
+            const uint8_t* report = data + entry * kFeedbackBytes;
             const uint32_t raw = static_cast<uint32_t>(report[0]) |
                                  (static_cast<uint32_t>(report[1]) << 8) |
                                  (static_cast<uint32_t>(report[2]) << 16) |
@@ -1224,7 +1300,7 @@ void HandleFeedback(DsdAudioDriver_IVars* ivars, IOReturn status) {
             if (ratio >= kMinFeedbackRatio && ratio <= kMaxFeedbackRatio) {
                 ivars->samples_per_microframe = samples;
                 ivars->feedback_reports++;
-                if (ivars->feedback_reports % 2000 == 0) {
+                if (ivars->feedback_reports == 1 || ivars->feedback_reports % 2000 == 0) {
                     Log("DAC asks for %d.%06d samples per microframe, nominal %d.%06d",
                         static_cast<int>(samples),
                         static_cast<int>((samples - static_cast<int>(samples)) * 1000000),
@@ -1275,20 +1351,24 @@ void IMPL(DsdAudioDriver, IsochComplete) {
                   ivars->transfers[index].frame_map->GetAddress())
             : nullptr;
 
-    // A feedback read that never completes takes the servo down with it, silently, because
-    // the chain only resubmits from its own completion. Re-arm it from here rather than run
-    // open loop for the rest of the track.
     ivars->output_completions++;
     if (ivars->output_completions <= 3 && transfer_frames_for_log != nullptr) {
         Log("completion %llu: status 0x%08x, frame 0 status 0x%08x count %u, engine at %llu",
             ivars->output_completions, status, transfer_frames_for_log[0].status,
             transfer_frames_for_log[0].completeCount, ivars->sample_counter);
     }
-    if (ivars->feedback_pipe != nullptr && ivars->feedback_reports == 0 &&
-        ivars->feedback_misses == 0 && ivars->output_completions % 250 == 0) {
+    // A feedback chain that stops takes the servo down with it silently, because the chain
+    // only resubmits from its own completion. It stops for more reasons than never starting:
+    // one refused submit ends it just as completely. So re-arm on whether a read is
+    // outstanding rather than on whether a report was ever heard.
+    if (ivars->feedback_pipe != nullptr && !ivars->feedback_in_flight &&
+        ivars->output_completions % 250 == 0) {
         const kern_return_t armed = SubmitFeedback();
-        Log("feedback silent after %llu transfers, resubmit says 0x%08x",
-            ivars->output_completions, armed);
+        if (ivars->feedback_rearms < 4) {
+            Log("feedback chain idle after %llu transfers, re-arm says 0x%08x",
+                ivars->output_completions, armed);
+        }
+        ivars->feedback_rearms++;
     }
 
     // The DAC's own clock decides when a frame goes out, so timing the host's timeline off

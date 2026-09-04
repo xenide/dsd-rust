@@ -173,13 +173,6 @@ million -- 16,384 frames per 8,916,264 mach ticks, three in a row -- and isochro
 come back `status 0` with a full first frame. Neither the transfer chain nor the timeline
 arithmetic was ever drifting.
 
-**Still unexplained: the feedback endpoint never completes.** Its pipe opens on every session
-and `SubmitFeedback` returns success, but no completion has ever been observed -- neither a
-report nor the miss a completion carrying no data would log. The engine has run open loop on
-the nominal rate throughout, and a lead that holds inside two milliseconds over twenty seconds
-says the DAC's clock and the bus clock are close enough that it has not mattered yet. Over a
-long track it would.
-
 **A test signal helps.** A slow rising sine sweep makes these obvious where music does not: a
 repeat is heard as the pitch dropping back, and a read point move as the pitch stepping. Twenty
 seconds from 300 Hz to 1200 Hz at low amplitude is enough.
@@ -188,6 +181,67 @@ seconds from 300 Hz to 1200 Hz at low amplitude is enough.
 engine had overtaken the host, K frames sent as silence`, at every `StopIsoc`. `N` has matched
 what a listener reports every time it has been checked, and one is the floor rather than zero:
 the anchor itself counts. `K` is how long the opening ramp lasted.
+
+## The feedback endpoint, and three ways to lose a servo
+
+An asynchronous endpoint runs on the DAC's clock rather than the host's and says, once per
+service interval, how many samples it wants per microframe as a 16.16 fixed point count. This
+one had never produced an observed report, and looked like an endpoint that was never asked:
+the pipe opened, `SubmitFeedback` returned success, and nothing followed. No report, no miss,
+no line at all.
+
+It was being asked. Three faults stacked, and each turned off its own evidence.
+
+**The frame list is one entry per service interval, not per microframe.** The RU7's feedback
+endpoint has `bInterval` 4, so a report arrives every 2^3 = 8 microframes and 32 entries span
+32 bus frames. The chain advanced its target by 4, which is an *output* transfer's span. The
+first submission went out, its completion arrived 32 ms later, and everything after it was
+refused `kIOReturnIsoTooOld` against a frame 28 ms gone. The parser had never read the feedback
+endpoint's own `bInterval`: `ReadEndpoint` returned early for the IN endpoint after recording
+its address, so `alt->interval` and `alt->max_packet` are the output endpoint's and always
+were.
+
+**A chain with one transfer outstanding has no lead of its own.** Even with the span right,
+resubmitting from its own completion aims at the frame that transfer just finished, which has
+gone by the time the handler runs. A private counter does not help -- it only advances on
+success, so the first refusal pins it and every retry afterwards aims at the same receding
+frame. It schedules against the output chain's queue point now, which is a whole in-flight
+window into the future and always a frame the controller will still take.
+
+**The transfer's aggregate status is not whether the reports arrived.** This DAC's feedback
+transfers come back `kIOReturnOverrun` every time while all four intervals inside them are
+marked success and hold their four bytes -- not some of them, all of them. The accept path
+gated on the aggregate and discarded 475 completions in a row.
+
+All of it was invisible, which is the part worth carrying forward. Reports were logged only
+every 2000th, so the 32 that one surviving transfer collected never printed. Any report at all
+suppressed the miss line. The re-arm was gated on `feedback_reports == 0`, so a chain that got
+one completion and then died was permanently excluded from restart. A servo that ran for 32 ms
+and froze on its last value looked identical to one that never started.
+
+**What the DAC asks for.** 24.000732 samples per microframe against a nominal 24 at 192000,
+steady to the last digit across a five minute session: the crystal runs about thirty parts per
+million fast. Open loop that is roughly 1700 frames of the DAC's own buffer per five minute
+track, which is what the servo exists to absorb.
+
+**Five minutes at 192000 with the loop closed:**
+
+```
+session ends: 1 read point moves, 0 cycles the engine had overtaken the host,
+              159748 frames sent as silence
+feedback over the session: 6855 submits, 6854 completions, 27416 reports, 0 misses, 0 re-arms
+```
+
+| | full session | last three minutes |
+| --- | --- | --- |
+| drift | -0.3 ppm | +0.4 ppm |
+| host write rate | 192007.30 Hz | 192006.43 Hz |
+
+The DAC asks for 192005.86 Hz and Core Audio writes at 192006.43, so the host has followed the
+driver's timeline onto the DAC's crystal to within three parts per million. The first fifty
+seconds of that session read -11.8 ppm and the last three minutes read +0.4: the early number
+is Core Audio converging onto the rate the servo stepped to, not a standing drift, and only a
+run long enough to hold both tells them apart.
 
 ## Iterating on this
 
