@@ -282,6 +282,32 @@ found two entries`, one `activated_enabled` beside one `terminating_for_upgrade_
 The pinned one is still running because it still owns the DAC, so the kill has to come before
 the activate rather than after it.
 
+Once two entries are on file, killing and activating again does not resolve it -- `sysextd`
+keeps handing out the stale one, and a stale copy has been seen staged without its exec bit,
+which fails the launch outright rather than loading the wrong build:
+
+```
+launchd: access(/Library/SystemExtensions/<uuid>/…/DsdAudioDriver, X_OK) failed with errno 13
+DK: DsdAudioDriver-0x… failed to launch server
+```
+
+The DAC then falls back to `usbaudiod` and the driver logs nothing at all, which reads exactly
+like a driver that loaded and stayed quiet. `system_profiler SPAudioDataType` tells the two
+apart: the device reports `Manufacturer: dsd-rust` under this driver and `Manufacturer: <the
+DAC's own>` under `usbaudiod`.
+
+Clearing it takes a deactivate, with the DAC unplugged so nothing pins anything:
+
+```
+sudo pkill -f "SystemExtensions.*DsdAudioDriver"
+DsdDriverInstaller deactivate
+systemextensionsctl list          # must show no dsdrust entry at all
+DsdDriverInstaller activate
+```
+
+then plug the DAC back in. `find /Library/SystemExtensions -name DsdAudioDriver -exec ls -l {} \;`
+shows what is really on file, which is one line per staged copy and their permissions.
+
 **os_log drops lines from the IO path.** Counters that are summarised once per session are
 trustworthy; a log line emitted per cycle is not, and reading a dropped line as an absent event
 sent this work down a wrong path more than once.
