@@ -7,6 +7,7 @@
 #include <AudioDriverKit/AudioDriverKit.h>
 #include <DriverKit/DriverKit.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
+#include <DriverKit/IODispatchQueue.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOMemoryMap.h>
 #include <DriverKit/OSSharedPtr.h>
@@ -28,6 +29,22 @@ constexpr uint32_t kTransfersInFlight = 4;
 constexpr uint64_t kMicroframesPerFrame = 8;
 /// Bus frames to schedule the first transfer ahead of now.
 constexpr uint64_t kStartLead = 10;
+
+/// Milliseconds of bus time one transfer covers. A transfer spans a fixed number of
+/// microframes rather than a fixed number of samples, so counting completions is a wall
+/// clock at every rate the DAC runs.
+constexpr uint64_t kTransferMs = kMicroframesPerTransfer / kMicroframesPerFrame;
+/// How long the engine keeps streaming after its last client stopped.
+///
+/// The engine outliving its client is what makes the next one start warm, and a client
+/// returning inside this window pays nothing for it -- a browser opening and closing the
+/// stream while a page settles is well within it. Past it the streaming buys nothing: it
+/// holds an alternate setting's bandwidth reserved in the periodic schedule and wakes the
+/// driver every transfer to send silence no one is listening to. So the interface goes back
+/// to its zero bandwidth setting, which is what that setting is for, and the client after
+/// the window pays one relock instead.
+constexpr uint64_t kIdleTeardownMs = 10000;
+constexpr uint64_t kIdleTeardownCompletions = kIdleTeardownMs / kTransferMs;
 
 /// Sample frames between the timestamps the host reads to build its timeline, which is also
 /// the length of the ring the two share.
@@ -198,8 +215,14 @@ struct DsdAudioDriver_IVars {
     uint32_t active_rate;
     /// Whether a client is doing IO. The engine outlives this: it keeps streaming silence
     /// and posting timestamps between clients, so the next one starts against a clock that
-    /// never stopped.
+    /// never stopped. It does not outlive it indefinitely -- see `idle_completions`.
     bool client_active;
+    /// Output completions since the last client stopped, which is how long the engine has
+    /// been idling. Reset whenever a client is doing IO.
+    uint64_t idle_completions;
+    /// A teardown is scheduled and the chains are draining, so nothing resubmits. Cleared by
+    /// `StopIsoc`, which is what the teardown runs.
+    bool idle_stopping;
 };
 
 namespace {
@@ -836,13 +859,17 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     //
     // The engine kept running, so the timeline, the ring geometry and the read point are all
     // still where they were. There is nothing to set up and nothing to wait for.
-    if (ivars->running && ivars->active_alt == entry->alt_setting &&
+    // Not one whose teardown is already scheduled: its chains have stopped resubmitting, so
+    // there is nothing left running to join. That falls through to a full restart below,
+    // where `StopIsoc` clears the flag and the scheduled teardown becomes a no-op.
+    if (ivars->running && !ivars->idle_stopping && ivars->active_alt == entry->alt_setting &&
         ivars->active_rate == static_cast<uint32_t>(entry->sample_rate) &&
         ivars->frame_bytes == frame_bytes) {
         // The read point stays where it is -- that is the whole point -- but the counters
         // that describe a start are per client, so they begin again here.
         ivars->crossings = 0;        ivars->laps = 0;
         ivars->starved = 0;
+        ivars->idle_completions = 0;
         ivars->client_active = true;
         Log("client starts on the engine already streaming %u Hz on alt %u",
             ivars->active_rate, ivars->active_alt);
@@ -889,8 +916,13 @@ kern_return_t DsdAudioDriver::StopDevice(IOUserAudioObjectID in_object_id,
     // start. The read path sends silence while no one is writing, which for a DSD carrier
     // is what holds the DAC in lock between tracks as well.
     //
-    // It is torn down on a format change, in StartDevice, and when the driver stops.
+    // Leaving it streaming is not leaving it streaming forever. The completion handler
+    // counts how long it runs with no client and retires it past `kIdleTeardownMs`, which is
+    // long after the gap between two tracks and long before the streaming is worth its cost.
+    //
+    // It is also torn down on a format change, in StartDevice, and when the driver stops.
     ivars->client_active = false;
+    ivars->idle_completions = 0;
     Log("client stops: %llu cycles the engine had overtaken the host, %llu cycles the host "
         "had lapped the read point, %llu frames sent as silence",
         ivars->crossings, ivars->laps, ivars->starved);
@@ -997,6 +1029,8 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->crossings = 0;
     ivars->laps = 0;
     ivars->client_active = false;
+    ivars->idle_completions = 0;
+    ivars->idle_stopping = false;
     ivars->last_write_sample = 0;
     ivars->last_write_frames = 0;
     ivars->starved = 0;
@@ -1056,6 +1090,7 @@ void DsdAudioDriver::StopIsoc() {
                 ivars->feedback_misses, ivars->feedback_rearms);
         }
         ivars->running = false;
+        ivars->idle_stopping = false;
         if (ivars->pipe != nullptr) {
             // Synchronous, so nothing is still holding a buffer when they are freed below.
             ivars->pipe->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, this);
@@ -1281,14 +1316,47 @@ void HandleFeedback(DsdAudioDriver_IVars* ivars, IOReturn status) {
     }
 }
 
+void DsdAudioDriver::ScheduleIdleTeardown() {
+    // Not from here: `StopIsoc` aborts the pipe synchronously and then frees the buffers and
+    // the completion action this handler is running on. It has to happen once the handler
+    // has returned, which is what the queue is for.
+    IODispatchQueue* queue = nullptr;
+    if (CopyDispatchQueue(kIOServiceDefaultQueueName, &queue) != kIOReturnSuccess ||
+        queue == nullptr) {
+        // Leave the engine up rather than tear it down from the wrong context, and let the
+        // count run again so this is retried rather than given up on.
+        Log("no dispatch queue to retire the idle engine on, leaving it streaming");
+        ivars->idle_stopping = false;
+        ivars->idle_completions = 0;
+        return;
+    }
+    // The block outlives this call and reaches for ivars, which `free` deletes.
+    retain();
+    queue->DispatchAsync(^{
+        // A client may have arrived in between, in which case `StopIsoc` has already run
+        // from StartDevice and cleared this, and the engine is wanted again.
+        if (ivars->idle_stopping) {
+            Log("engine idle for %llu seconds with no client, dropping to alt 0",
+                kIdleTeardownMs / 1000);
+            StopIsoc();
+        }
+        release();
+    });
+    OSSafeReleaseNULL(queue);
+}
+
 void IMPL(DsdAudioDriver, IsochComplete) {
     if (ivars == nullptr || !ivars->running || action == nullptr) {
         return;
     }
     if (action == ivars->feedback.completion) {
         HandleFeedback(ivars, status);
-        // Always resubmit: a servo that stops silently stops tracking the DAC's clock.
-        SubmitFeedback();
+        // Always resubmit: a servo that stops silently stops tracking the DAC's clock. The
+        // one exception is a teardown already scheduled, where resubmitting only gives the
+        // abort more to reclaim.
+        if (!ivars->idle_stopping) {
+            SubmitFeedback();
+        }
         return;
     }
     const uint32_t index = TransferForAction(ivars, action);
@@ -1297,6 +1365,20 @@ void IMPL(DsdAudioDriver, IsochComplete) {
     }
     if (status != kIOReturnSuccess && status != kIOReturnUnderrun) {
         Log("transfer %u came back 0x%08x, stopping", index, status);
+        return;
+    }
+    // How long the engine has been running with nobody listening. A completion is a fixed
+    // slice of bus time, so this counts seconds without a timer, and the handler that has to
+    // read it is already running at every one.
+    if (ivars->client_active) {
+        ivars->idle_completions = 0;
+    } else if (!ivars->idle_stopping && ++ivars->idle_completions >= kIdleTeardownCompletions) {
+        ivars->idle_stopping = true;
+        ScheduleIdleTeardown();
+    }
+    if (ivars->idle_stopping) {
+        // Draining. Nothing is resubmitted, so the abort the teardown runs has less to
+        // reclaim, and the timeline stops advancing because no client is reading it.
         return;
     }
     const IOUSBIsochronousFrame* transfer_frames_for_log =

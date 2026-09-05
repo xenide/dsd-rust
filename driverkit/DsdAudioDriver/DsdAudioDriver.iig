@@ -51,6 +51,10 @@ public:
     /// Abort what is in flight and drop the interface back to its zero bandwidth setting.
     void StopIsoc() LOCALONLY;
 
+    /// Retire an engine that has been streaming to nobody, from a context that is not an
+    /// isochronous completion: `StopIsoc` frees the buffers such a completion runs on.
+    void ScheduleIdleTeardown() LOCALONLY;
+
     /// Fill one transfer from the ring and hand it to the pipe.
     kern_return_t SubmitTransfer(uint32_t index) LOCALONLY;
 
