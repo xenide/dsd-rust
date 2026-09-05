@@ -195,6 +195,23 @@ struct DsdAudioDriver_IVars {
     /// does not exist, and silence is the honest thing to send in its place.
     uint64_t last_write_sample;
     uint32_t last_write_frames;
+    /// One-time shift of the read point, set from the host's first write of a stream.
+    ///
+    /// The lag above says how far behind the timeline to read. Where the timeline itself
+    /// starts is a guess: `StartIsoc` takes it from the last zero timestamp posted, which is
+    /// the only thing that survives a stream ending, and which the host does not have to
+    /// agree with. Measured, it disagrees by more than a whole ring after the engine has been
+    /// torn down for a while -- the session opens already lapped and stays that way.
+    ///
+    /// So the guess is corrected once, against the only authority on where the host is
+    /// writing: the host. Nothing real has been read at that point -- the read is bounded by
+    /// `last_write_frames`, which is zero until this same cycle -- so the shift is inaudible,
+    /// and after it the geometry is as fixed as it ever was. This is not the anchoring that
+    /// caused clicks: that one ran for the life of the stream and moved the read point under
+    /// playing audio.
+    int64_t read_offset;
+    /// Whether that correction has been applied for this stream.
+    bool timeline_anchored;
     /// Frames sent as silence because the host had not written that far yet.
     uint64_t starved;
     /// The byte this carrier calls silence: DSD silence is alternating bits, not zero.
@@ -218,6 +235,15 @@ struct DsdAudioDriver_IVars {
     /// and posting timestamps between clients, so the next one starts against a clock that
     /// never stopped. It does not outlive it indefinitely -- see `idle_completions`.
     bool client_active;
+
+    /// Where the ring is read for a point on the timeline. One definition, because the read
+    /// path and the counters that police it have to mean the same thing by it.
+    uint64_t ReadPointFor(uint64_t timeline) const {
+        const int64_t at =
+            static_cast<int64_t>(timeline) - static_cast<int64_t>(read_lag) + read_offset;
+        return at > 0 ? static_cast<uint64_t>(at) : 0;
+    }
+
     /// Output completions since the last client stopped, which is how long the engine has
     /// been idling. Reset whenever a client is doing IO.
     uint64_t idle_completions;
@@ -663,9 +689,30 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         ^kern_return_t(IOUserAudioObjectID, IOUserAudioIOOperation in_operation,
                        uint32_t in_frame_size, uint64_t in_sample_time, uint64_t) {
             state->io_calls++;
-            const uint64_t read_at = state->sample_counter > state->read_lag
-                                         ? state->sample_counter - state->read_lag
-                                         : 0;
+            if (in_operation == IOUserAudioIOOperationWriteEnd && !state->timeline_anchored) {
+                // The host's first write of the stream, and the first statement of where it
+                // actually is. Put the read point half a ring behind it, which is the midpoint
+                // of the band the two failures bound: the host falling onto the read point at
+                // zero, and lapping it at a ring less one IO buffer. That is the most headroom
+                // available in both directions at once, it is rate independent because the
+                // ring is a fixed number of frames, and it is about where sessions that were
+                // never torn down settled on their own -- measured at 9.4k on a 16384 ring.
+                //
+                // Nothing is gated on this. Until it happens the offset is zero, which is
+                // what the read point was before, and the read is bounded by the host's own
+                // last write in either case -- so a stream where this never fires plays as
+                // it always did rather than falling silent.
+                const uint64_t unshifted = state->ReadPointFor(state->sample_counter);
+                const int64_t target = static_cast<int64_t>(state->ring_frames / 2);
+                state->read_offset =
+                    static_cast<int64_t>(in_sample_time) - static_cast<int64_t>(unshifted) -
+                    target;
+                state->timeline_anchored = true;
+                Log("anchored the read point on the host's first write at %llu: was %llu, "
+                    "shifted by %lld to sit %lld behind",
+                    in_sample_time, unshifted, state->read_offset, target);
+            }
+            const uint64_t read_at = state->ReadPointFor(state->sample_counter);
             if (in_operation == IOUserAudioIOOperationWriteEnd) {
                 // Both of these are impossible if the geometry holds, which is why they are
                 // counted rather than corrected. The host can fall back onto the read point,
@@ -1026,6 +1073,13 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     uint64_t resumed_sample = 0;
     uint64_t resumed_host = 0;
     ivars->device->GetCurrentZeroTimestamp(&resumed_sample, &resumed_host);
+    // What the host's timeline had reached against where this engine last left off. The two
+    // are not the same number and the difference is not elapsed time: it has been measured at
+    // roughly a ring whether the engine was down for ten minutes or seventeen. Logged because
+    // the read offset below exists to absorb it, and the size of it is the thing to watch.
+    Log("resuming at %llu, engine last reached %llu, so the host's timeline is %lld ahead",
+        resumed_sample, ivars->sample_counter,
+        static_cast<int64_t>(resumed_sample) - static_cast<int64_t>(ivars->sample_counter));
     ivars->sample_counter = resumed_sample;
     ivars->next_timestamp_at = resumed_sample + kZeroTimestampPeriod;
     ivars->prev_sample = 0;
@@ -1039,6 +1093,8 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->idle_stopping = false;
     ivars->last_write_sample = 0;
     ivars->last_write_frames = 0;
+    ivars->read_offset = 0;
+    ivars->timeline_anchored = false;
     ivars->starved = 0;
     ivars->silence_byte = alt->raw_data ? kDsdSilenceByte : 0;
     ivars->active_rate = rate;
@@ -1156,8 +1212,7 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
         // runs at rate from the first transfer, and the audio to fill that gap does not
         // exist yet -- no choice of read position conjures it. Silence is the honest thing
         // to send, and the bound stops mattering the moment the host is running at rate.
-        const uint64_t at =
-            ivars->sample_counter > ivars->read_lag ? ivars->sample_counter - ivars->read_lag : 0;
+        const uint64_t at = ivars->ReadPointFor(ivars->sample_counter);
         const uint64_t written_to = ivars->last_write_sample + ivars->last_write_frames;
         if (ivars->last_write_frames == 0 || at + samples > written_to) {
             memset(data + offset, ivars->silence_byte, samples * stride);
