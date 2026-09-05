@@ -71,8 +71,9 @@ constexpr uint64_t kIdleTeardownCompletions = kIdleTeardownMs / kTransferMs;
 constexpr uint32_t kZeroTimestampPeriod = 16384;
 
 
-/// Widest sample frame any published format uses: two channels of four byte subslots.
-constexpr uint32_t kWidestFrameBytes = 8;
+/// Widest sample frame any published format uses. One source of truth with the bound
+/// `BuildFormats` applies, so the ring cannot be sized for less than it publishes.
+constexpr uint32_t kWidestFrameBytes = dsd::kMaxFrameBytes;
 /// Bytes the ring holds.
 ///
 /// The host treats the stream buffer as exactly one zero timestamp period of frames and
@@ -973,7 +974,12 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
         }
     }
 
-    if (frame_bytes == 0) {
+    // Belt and braces against the ring's stride. `BuildFormats` already refuses to publish a
+    // format this wide, so reaching here means the format list and the ring disagree, and the
+    // read path would run off the end of the mapping rather than report anything.
+    if (frame_bytes == 0 || frame_bytes > kWidestFrameBytes) {
+        Log("refusing a %u byte frame against a ring of stride %u", frame_bytes,
+            kWidestFrameBytes);
         return kIOReturnBadArgument;
     }
     ivars->frame_bytes = frame_bytes;

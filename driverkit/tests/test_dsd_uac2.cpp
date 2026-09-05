@@ -201,6 +201,55 @@ int main() {
     // endpoint carries, so DSD512 is not on this DAC's native list.
     Check(!native_at_1411200, "DSD512 exceeds the native endpoint and is not published");
 
+    // A frame wider than the ring's stride is never published.
+    //
+    // The ring is one allocation of a fixed stride and the read path bounds itself on the
+    // ring's length in frames, not on the mapping's length in bytes, so publishing a wider
+    // format reads off the end of the mapping from the IO path. Nothing between the
+    // descriptor and here narrows the channel count -- it is whatever byte the device sent --
+    // so a DAC with a multichannel alternate setting would reach it.
+    {
+        std::vector<uint8_t> config = {9, 0x02, 0, 0, 2, 1, 0, 0x80, 50};
+        AppendInterface(config, 0, 0, 0, 0x01);
+        Append(config, {9, 0x24, 0x01, 0x00, 0x02, 0x04, 0x40, 0x00, 0x00});
+        Append(config, {8, 0x24, 0x0A, 0x05, 0x03, 0x07, 0x00, 0x00});
+        AppendInterface(config, 1, 0, 0, 0x02);
+        // Alt 1 is ordinary stereo; alt 2 declares eight channels of four byte subslots,
+        // which is 32 bytes a frame against a ring built for 8.
+        AppendInterface(config, 1, 1, 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+        AppendEndpoint(config, 0x01, 0x05, 776);
+        AppendInterface(config, 1, 2, 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x08, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+        AppendEndpoint(config, 0x01, 0x05, 3104);
+
+        dsd::Uac2Layout wide{};
+        Check(dsd::ParseLayout(config.data(), config.size(), &wide), "the wide descriptor parses");
+        const dsd::AltSetting* eight = FindAlt(wide, 2);
+        Check(eight != nullptr && eight->channels == 8, "the parser reports all eight channels");
+        Check(eight != nullptr && dsd::AltFrameBytes(eight->channels, eight->subslot_bytes) >
+                                      dsd::kMaxFrameBytes,
+              "eight channels exceed the ring stride");
+
+        dsd::FormatEntry wide_formats[64] = {};
+        const uint32_t one_rate[] = {44100};
+        const size_t wide_written = dsd::BuildFormats(wide, one_rate, 1, wide_formats,
+                                                      sizeof(wide_formats) / sizeof(wide_formats[0]));
+        Check(wide_written > 0, "the stereo setting is still published");
+        bool published_wide = false;
+        for (size_t index = 0; index < wide_written; index++) {
+            if (dsd::AltFrameBytes(wide_formats[index].channels,
+                                   wide_formats[index].subslot_bytes) > dsd::kMaxFrameBytes) {
+                published_wide = true;
+            }
+        }
+        Check(!published_wide, "no published format is wider than the ring stride");
+    }
+
     if (failures == 0) {
         std::printf("ok, all checks passed\n");
         return 0;

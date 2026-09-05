@@ -27,6 +27,22 @@ constexpr size_t kMaxSampleRates = 32;
 /// Native DSD packs 32 DSD bits per channel per frame, so its subslot is four bytes wide.
 constexpr uint8_t kNativeSubslotBytes = 4;
 
+/// Widest sample frame the driver will publish a format for: two channels of four byte
+/// subslots.
+///
+/// The ring is one allocation of a fixed stride, and the read path bounds itself on the ring
+/// length in frames rather than on the mapping's length in bytes. A format wider than the
+/// stride the ring was sized for therefore reads off the end of the mapping, on the IO path,
+/// where a fault takes the machine down rather than the driver. Nothing narrows the channel
+/// count on the way here -- it is whatever byte the descriptor carried -- so the bound has to
+/// be applied before such a format is ever published.
+constexpr uint32_t kMaxFrameBytes = 8;
+
+/// Bytes one sample frame of this alternate setting occupies on the wire.
+constexpr uint32_t AltFrameBytes(uint8_t channels, uint8_t subslot_bytes) {
+    return static_cast<uint32_t>(channels) * static_cast<uint32_t>(subslot_bytes);
+}
+
 /// One streaming alternate setting, as the descriptor describes it.
 struct AltSetting {
     uint8_t alt_setting;

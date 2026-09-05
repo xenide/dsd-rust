@@ -113,6 +113,18 @@ what an application that takes the first format it is offered gets. Setting it o
 before `AddObject` is not enough on its own: it comes back as the narrowest published once
 Core Audio picks the device up, so it is set again afterwards and both values logged.
 
+## This is a source build, not a release
+
+There is no signed, notarised download and no plan for one. The driver names one DAC by
+`idVendor` and `idProduct` in both its `Info.plist` and its entitlements, and pointing it at
+another means editing those and rebuilding -- which a signed binary could not survive, so a
+release would serve exactly one device and no one else. Both install paths below build from
+this tree. "Point it at your DAC" is the supported way to use it on anything else.
+
+That choice is what makes the format width bound below load bearing rather than defensive: the
+DACs this gets pointed at are not this one, and a multichannel alternate setting is ordinary on
+an interface.
+
 ## Where the ring is read
 
 The read point is `sample_counter` minus two in-flight windows, fixed for the life of a
@@ -204,7 +216,9 @@ steady to the last digit across a five minute session: the crystal runs about th
 million fast. Open loop that is roughly 1700 frames of the DAC's own buffer per five minute
 track, which is what the servo exists to absorb.
 
-**Five minutes at 192000 with the loop closed:**
+**Five minutes at 192000 with the loop closed**, from the session that closed it. The counters
+have been renamed since -- the read point is derived now, so nothing counts it moving -- but
+the feedback line is unchanged:
 
 ```
 session ends: 1 read point moves, 0 cycles the engine had overtaken the host,
@@ -442,11 +456,24 @@ back in recovery `csrutil enable` and Startup Security Utility set to Full Secur
 are deliberately not wildcards: a personality matching every UAC2 streaming interface would
 displace `usbaudiod` for every USB audio device on the machine.
 
+**Alternate settings wider than eight bytes a frame are dropped, not published.** The ring is
+one allocation of a fixed stride, so an interface offering more than two channels of four byte
+subslots will appear with those settings missing rather than with a driver that reads off the
+end of its mapping. `dsd::kMaxFrameBytes` is the bound, and it is the same constant the ring is
+sized from. Raising it means raising the ring with it.
+
 The dext bundle is named for its bundle identifier, `com.github.xenide.dsdrust.driver.dext`,
 because the system copies it out of the app by that name. Renaming it breaks installation
 with no useful message, and a bundle identifier over 63 characters fails the same way.
 
 ## Notes for whoever picks this up
+
+**Volume and mute belong to the DAC.** The driver publishes no volume or mute control, so the
+system volume keys do nothing for this device and applications see a device that cannot be
+attenuated. That is deliberate. Any volume the host applies is arithmetic on the samples, which
+is the one thing a bit-perfect path must not do, and native DSD has no meaningful software
+volume at all -- the bits are a one bit stream whose amplitude is its density. The RU7 has a
+hardware volume control, and that is where the level is set.
 
 **DSD silence is not zero.** Native DSD goes out as big-endian 32-bit integer PCM, marked
 non-mixable so the HAL leaves the bits alone. Core Audio does not know the stream is DSD, so

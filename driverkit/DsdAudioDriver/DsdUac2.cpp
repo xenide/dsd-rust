@@ -128,6 +128,10 @@ size_t BuildFormats(const Uac2Layout& layout, const uint32_t* rates, size_t rate
                 if (native != (native_pass == 1) || alt.subslot_bytes != width) {
                     continue;
                 }
+                // Wider than the ring's stride is not a format to publish. See kMaxFrameBytes.
+                if (AltFrameBytes(alt.channels, alt.subslot_bytes) > kMaxFrameBytes) {
+                    continue;
+                }
                 for (size_t rate_index = 0; rate_index < rate_count && written < capacity;
                      rate_index++) {
                     const uint32_t rate = rates[rate_index];
