@@ -28,16 +28,6 @@ constexpr uint32_t kTransfersInFlight = 4;
 constexpr uint64_t kMicroframesPerFrame = 8;
 /// Bus frames to schedule the first transfer ahead of now.
 constexpr uint64_t kStartLead = 10;
-/// Host writes the engine's rate is compared against. One write measures the host's buffer
-/// size rather than its rate; several of them measure the rate.
-constexpr uint64_t kWritesPerWindow = 8;
-/// Consecutive windows the host has to keep up over before the read point is anchored to it.
-constexpr uint32_t kWindowsBeforeAnchor = 2;
-/// Sixteenths of the engine's advance the host has to match to count as keeping up. Faster
-/// than the engine is fine and expected -- Core Audio over-runs to close a gap it opened
-/// with, and that only moves its writes further ahead of the read point. Slower is the case
-/// that has to be waited out.
-constexpr uint64_t kKeepingUpSixteenths = 15;
 
 /// Sample frames between the timestamps the host reads to build its timeline, which is also
 /// the length of the ring the two share.
@@ -63,10 +53,6 @@ constexpr uint64_t kKeepingUpSixteenths = 15;
 /// between the two, not a maximum.
 constexpr uint32_t kZeroTimestampPeriod = 16384;
 
-/// Frames the engine may advance past the host's first write while waiting for it to keep
-/// up, before the read point is anchored on whatever there is. Waiting on the rate alone can
-/// wait for ever, and a track that came out silent end to end is a worse fault than a click.
-constexpr uint64_t kSettleDeadlineFrames = 4 * kZeroTimestampPeriod;
 
 /// Widest sample frame any published format uses: two channels of four byte subslots.
 constexpr uint32_t kWidestFrameBytes = 8;
@@ -167,31 +153,30 @@ struct DsdAudioDriver_IVars {
     /// the current one can be interpolated.
     uint64_t prev_sample;
     uint64_t prev_host;
-    /// How far behind the submission point the ring is read. What is submitted now plays a
-    /// whole in-flight window later, and the host writes just ahead of what is playing, so
-    /// reading at the submission point reads where it has not written yet.
+    /// How far behind the submission point the ring is read. Two in-flight windows.
+    ///
+    /// This is the whole geometry, and it is fixed. The timeline maps a sample index to the
+    /// time that index goes out on the wire, so the transfer starting at sample S carries the
+    /// host's audio for index S minus this, and what is heard is this far behind the
+    /// timeline's own time for that index -- which is exactly the reported latency. Nothing
+    /// is measured against the host and nothing moves, so the read point cannot jump, and a
+    /// jump is what a click was.
+    ///
+    /// One window of it is the read-ahead a transfer needs: the ring is read at submission
+    /// and a transfer covers a quarter of a window, so reading level with the timeline runs
+    /// its tail past what the host has written.
+    ///
+    /// The second window is margin, and it has to come from here because it does not come
+    /// from the safety offset. Setting that to a window does not make Core Audio write a
+    /// window ahead: measured, it writes between 130 and 660 frames ahead of the timeline
+    /// whatever the offset says. Reading level with the timeline therefore left under one
+    /// transfer of headroom, and the tail of every transfer came out as silence -- heard as
+    /// noise, not as a dropout.
     uint64_t read_lag;
-    /// Where the ring is read, relative to the submission point: the read position is the
-    /// sample counter plus this. It starts at minus the lag and is set once from a host
-    /// write, because only the host says where the host really is.
-    int64_t read_offset;
-    bool read_anchored;
-    /// The last write the host made. The read point is anchored once the host is keeping up
-    /// with the engine rather than still closing on it.
+    /// The last write the host made, which bounds the read: audio it has not written yet
+    /// does not exist, and silence is the honest thing to send in its place.
     uint64_t last_write_sample;
     uint32_t last_write_frames;
-    /// Where the host and the engine stood when the window their rates are compared over
-    /// opened, and how many consecutive windows the host has kept up for. Every anchor after
-    /// the first is a jump in the read position, which is heard as a click, so the first has
-    /// to be taken somewhere it will hold.
-    uint64_t window_write_sample;
-    uint64_t window_engine_sample;
-    uint32_t windows_kept_up;
-    uint64_t anchored_at;
-    /// Where the engine stood on the host's first write, so waiting for the host to keep up
-    /// is given up on from when it started writing rather than from a session start it can
-    /// be a second behind.
-    uint64_t first_write_at;
     /// Frames sent as silence because the host had not written that far yet.
     uint64_t starved;
     /// The byte this carrier calls silence: DSD silence is alternating bits, not zero.
@@ -206,9 +191,6 @@ struct DsdAudioDriver_IVars {
     /// Times the host had run a whole ring ahead of the read point, so the slot the engine
     /// was about to read had already been overwritten.
     uint64_t laps;
-    /// Times the read point moved. Every one of them is a jump in the audio, heard as a
-    /// click and, in a sweep, as the pitch stepping.
-    uint64_t anchors;
     bool running;
     uint8_t active_alt;
     /// The rate the engine is streaming, so a client asking for the same one can be let
@@ -501,33 +483,6 @@ bool ReadRatesAndFormats(DsdAudioDriver_IVars* ivars) {
     return true;
 }
 
-/// Whether the host is writing as fast as the engine is reading, averaged over a window.
-///
-/// Contiguity says nothing about this. The host's writes always start where the last one
-/// ended, whatever wall clock rate they arrive at, so a write one buffer past the last is
-/// no evidence of anything. Core Audio opens some sessions at a seventh of rate for half a
-/// second while its own IO cycles come late, and the audio to fill that gap does not exist.
-/// An anchor taken then sits the read point where the host will not be for another second or
-/// two: everything until it arrives is silence, and the crossing when it does is a click.
-///
-/// The engine's advance closes the window rather than the host's, because a host at a
-/// seventh of rate takes seven times as long to fill a window of its own writes, and that is
-/// exactly the case being waited out.
-bool HostKeepsUp(DsdAudioDriver_IVars* ivars, uint64_t in_sample_time, uint32_t in_frame_size) {
-    const uint64_t engine = ivars->sample_counter - ivars->window_engine_sample;
-    if (engine < kWritesPerWindow * in_frame_size) {
-        return ivars->windows_kept_up >= kWindowsBeforeAnchor;
-    }
-    const uint64_t host = in_sample_time - ivars->window_write_sample;
-    if (host * 16 >= engine * kKeepingUpSixteenths) {
-        ivars->windows_kept_up++;
-    } else {
-        ivars->windows_kept_up = 0;
-    }
-    ivars->window_write_sample = in_sample_time;
-    ivars->window_engine_sample = ivars->sample_counter;
-    return ivars->windows_kept_up >= kWindowsBeforeAnchor;
-}
 
 }  // namespace
 
@@ -684,103 +639,30 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         ^kern_return_t(IOUserAudioObjectID, IOUserAudioIOOperation in_operation,
                        uint32_t in_frame_size, uint64_t in_sample_time, uint64_t) {
             state->io_calls++;
-            const int64_t read_position =
-                static_cast<int64_t>(state->sample_counter) + state->read_offset;
-            const uint64_t read_at = read_position > 0 ? static_cast<uint64_t>(read_position) : 0;
-            // Anchor the read point to the host's first write of the session.
-            //
-            // The engine's timeline starts running the moment IO does, but Core Audio only
-            // begins writing some time later, and how much later varies -- 30 ms on one start
-            // and 144 ms on the next. Reading a fixed lag behind the engine's own counter
-            // therefore reads past where the host has got to whenever that delay exceeds the
-            // lag, and what comes out is whatever the ring held before: the same buffer over
-            // and over until the host catches up. Where the host actually is is the only
-            // thing that says where it is safe to read, and it says so on the first write.
+            const uint64_t read_at = state->sample_counter > state->read_lag
+                                         ? state->sample_counter - state->read_lag
+                                         : 0;
             if (in_operation == IOUserAudioIOOperationWriteEnd) {
+                // Both of these are impossible if the geometry holds, which is why they are
+                // counted rather than corrected. The host can fall back onto the read point,
+                // or it can get a whole ring ahead of it and overwrite the slot the engine is
+                // about to read -- and the second one sounds perfectly fine, because what
+                // comes out is continuous audio from further along the track. It is heard as
+                // the sound running ahead of the picture, not as a glitch, which is why it
+                // went unnoticed for as long as it did. Either means the safety offset is not
+                // buying what it is supposed to.
                 const int64_t margin =
                     static_cast<int64_t>(in_sample_time) - static_cast<int64_t>(read_at);
-                // Two ways for the pair to be wrong, and only one of them was being caught.
-                // The host can fall back onto the read point, which is the ring lapping the
-                // way it was already counted. It can also get a whole ring ahead, and then
-                // the slot the engine is about to read has been overwritten: what comes out
-                // is continuous audio from further along the track, which sounds fine and
-                // plays ahead of the timeline the driver reports. That is heard as the sound
-                // running ahead of the picture rather than as a glitch, so nothing caught it.
                 const int64_t lapped_at = static_cast<int64_t>(state->ring_frames) -
                                           static_cast<int64_t>(in_frame_size);
-                const bool behind = state->read_anchored && margin <= 0;
-                const bool lapped = state->read_anchored && margin >= lapped_at;
-                if (behind) {
+                if (margin <= 0) {
                     state->crossings++;
                 }
-                if (lapped) {
+                if (margin >= lapped_at) {
                     state->laps++;
-                }
-                const bool overtaken = behind || lapped;
-                // Anchor once the host is keeping up with the engine, and again only as a
-                // backstop. Each correction moves the read position, which is heard as a
-                // click, so the one that counts has to be taken somewhere it will hold: not
-                // while the engine's counter is still surging through the pre-rolled
-                // transfers, and not while the host is opening the session below rate.
-                // Until then the bound below sends silence, which is what there is.
-                if (state->last_write_frames == 0) {
-                    state->first_write_at = state->sample_counter;
-                    state->window_write_sample = in_sample_time;
-                    state->window_engine_sample = state->sample_counter;
                 }
                 state->last_write_sample = in_sample_time;
                 state->last_write_frames = in_frame_size;
-                const bool keeping_up = HostKeepsUp(state, in_sample_time, in_frame_size);
-                // Either the host is keeping up, or it has had long enough that waiting is
-                // worse than anchoring on what there is. Waiting on the rate alone can wait
-                // for ever -- a session where the condition never arrived came out silent
-                // from end to end, which is a worse fault than the click the wait avoids.
-                // The deadline runs from the host's first write rather than from the start
-                // of the session, which it can be a second behind.
-                const bool settled =
-                    keeping_up ||
-                    state->sample_counter > state->first_write_at + kSettleDeadlineFrames;
-                // A later correction is a backstop, not a servo: rate-limit it so a bad
-                // patch cannot turn into a stream of clicks.
-                const bool may_correct =
-                    overtaken && state->sample_counter > state->anchored_at + kZeroTimestampPeriod;
-                if ((!state->read_anchored && settled) || may_correct) {
-                    state->anchored_at = state->sample_counter;
-                    // Sit the read point a whole in-flight window plus a few of the host's
-                    // own buffers behind it. The window alone is 705 frames at 44100, which
-                    // is sixteen milliseconds, and the host's cycles do not arrive that
-                    // evenly: one grazed the read point by four frames and cost a second
-                    // correction, which is a second click. The margin is silence that never
-                    // gets played, so it is cheap; the only thing it buys back is latency.
-                    //
-                    // But it has to fit in the ring, which is one zero timestamp period and
-                    // nothing more. Four of the host's buffers is 2048 frames when it asks
-                    // for 512, and 16384 when it asks for 4096 -- a browser asks for 4096,
-                    // and that is the whole ring on its own. The read point then sat more
-                    // than a lap behind the write point and every transfer picked up a slot
-                    // the host had already overwritten twice: continuous audio, running a
-                    // couple of hundred milliseconds ahead of the timeline being reported,
-                    // which is A/V sync gone while nothing sounds wrong.
-                    const uint64_t ceiling =
-                        state->ring_frames > in_frame_size + state->read_lag
-                            ? state->ring_frames - in_frame_size - state->read_lag
-                            : state->read_lag;
-                    uint64_t margin_frames =
-                        state->read_lag + static_cast<uint64_t>(in_frame_size) * 4;
-                    if (margin_frames > ceiling) {
-                        margin_frames = ceiling;
-                    }
-                    state->read_offset = static_cast<int64_t>(in_sample_time) -
-                                         static_cast<int64_t>(margin_frames) -
-                                         static_cast<int64_t>(state->sample_counter);
-                    state->read_anchored = true;
-                    state->anchors++;
-                    if (state->anchors <= 4) {
-                        Log("read point set from the host: it writes at %llu, engine queues at "
-                            "%llu, margin was %lld, ring now read %lld behind the queue point",
-                            in_sample_time, state->sample_counter, margin, -state->read_offset);
-                    }
-                }
             }
             // The first cycle of a session says whether the host and the engine agree on
             // where the timeline is. They are on the same one only if the driver resumed
@@ -791,9 +673,6 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                     in_operation, in_frame_size, in_sample_time, state->sample_counter, read_at,
                     static_cast<int64_t>(in_sample_time - read_at));
             }
-            // Where the engine is actually reading, which is the anchored offset and not
-            // the nominal lag: reporting the lag hid the whole distance an anchor had moved
-            // the read point, which is the number this fault is measured in.
             if (state->io_calls % 250 == 0 && in_operation == IOUserAudioIOOperationWriteEnd) {
                 Log("host wrote %u frames at sample %llu (ring slot %llu); engine reads at "
                     "sample %llu (slot %llu), so the host leads it by %lld",
@@ -962,9 +841,7 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
         ivars->frame_bytes == frame_bytes) {
         // The read point stays where it is -- that is the whole point -- but the counters
         // that describe a start are per client, so they begin again here.
-        ivars->anchors = 0;
-        ivars->crossings = 0;
-        ivars->laps = 0;
+        ivars->crossings = 0;        ivars->laps = 0;
         ivars->starved = 0;
         ivars->client_active = true;
         Log("client starts on the engine already streaming %u Hz on alt %u",
@@ -980,15 +857,16 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     // the margin has to cover the whole window again plus the host's own IO buffer.
     const uint32_t window_frames = static_cast<uint32_t>(
         kTransfersInFlight * kMicroframesPerTransfer * entry->sample_rate / 8000.0);
-    ivars->read_lag = window_frames;
-    // The safety offset is how far ahead of the timeline the host has to write to stay clear
-    // of the read point, which is one window. The latency is how long a sample it writes
-    // takes to be heard, which is two: it waits for the read point to reach it, and then
-    // sits a whole in-flight window on the controller. Reporting one window for both told
-    // every player the audio was half as far behind as it is, and video sync is exactly what
-    // that number is for.
+    ivars->read_lag = static_cast<uint64_t>(window_frames) * 2;
+    // The latency is the read lag and nothing else. The timeline maps a sample index to the
+    // time that index goes out on the wire, so the in-flight window a transfer spends on the
+    // controller is already inside it and adding it again would report it twice. The host's
+    // sample X is carried by the transfer starting at X plus the lag, so it is heard that
+    // much after the timeline's own time for X. Video sync is what this number is for, and
+    // it is now a constant the driver can state rather than a consequence of where the host
+    // happened to be writing when the read point was last set.
     ivars->device->SetOutputSafetyOffset(window_frames);
-    ivars->device->SetOutputLatency(window_frames + static_cast<uint32_t>(ivars->read_lag));
+    ivars->device->SetOutputLatency(static_cast<uint32_t>(ivars->read_lag));
     Log("host asked for %.0f Hz %{public}s, alternate setting %u, in-flight window %u frames",
         entry->sample_rate, entry->native_dsd ? "native DSD" : "PCM", entry->alt_setting,
         window_frames);
@@ -1013,9 +891,9 @@ kern_return_t DsdAudioDriver::StopDevice(IOUserAudioObjectID in_object_id,
     //
     // It is torn down on a format change, in StartDevice, and when the driver stops.
     ivars->client_active = false;
-    Log("client stops: %llu read point moves, %llu cycles the engine had overtaken the host, "
-        "%llu cycles the host had lapped the read point, %llu frames sent as silence",
-        ivars->anchors, ivars->crossings, ivars->laps, ivars->starved);
+    Log("client stops: %llu cycles the engine had overtaken the host, %llu cycles the host "
+        "had lapped the read point, %llu frames sent as silence",
+        ivars->crossings, ivars->laps, ivars->starved);
     return super::StopDevice(in_object_id, in_flags);
 }
 
@@ -1118,17 +996,9 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->timestamps_posted = 0;
     ivars->crossings = 0;
     ivars->laps = 0;
-    ivars->anchors = 0;
     ivars->client_active = false;
-    ivars->read_offset = -static_cast<int64_t>(ivars->read_lag);
-    ivars->read_anchored = false;
     ivars->last_write_sample = 0;
     ivars->last_write_frames = 0;
-    ivars->window_write_sample = 0;
-    ivars->window_engine_sample = 0;
-    ivars->windows_kept_up = 0;
-    ivars->anchored_at = 0;
-    ivars->first_write_at = 0;
     ivars->starved = 0;
     ivars->silence_byte = alt->raw_data ? kDsdSilenceByte : 0;
     ivars->active_rate = rate;
@@ -1176,12 +1046,10 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
 
 void DsdAudioDriver::StopIsoc() {
     if (ivars->running) {
-        if (ivars->anchors != 0 || ivars->crossings != 0 || ivars->laps != 0 ||
-            ivars->starved != 0) {
-            Log("session ends: %llu read point moves, %llu cycles the engine had overtaken "
-                "the host, %llu cycles the host had lapped the read point, %llu frames sent "
-                "as silence",
-                ivars->anchors, ivars->crossings, ivars->laps, ivars->starved);
+        if (ivars->crossings != 0 || ivars->laps != 0 || ivars->starved != 0) {
+            Log("stream ends: %llu cycles the engine had overtaken the host, %llu cycles the "
+                "host had lapped the read point, %llu frames sent as silence",
+                ivars->crossings, ivars->laps, ivars->starved);
             Log("feedback over the session: %llu submits, %llu completions, %llu reports, "
                 "%llu misses, %llu re-arms",
                 ivars->feedback_submits, ivars->feedback_completions, ivars->feedback_reports,
@@ -1234,22 +1102,23 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
         if (samples * stride > packet) {
             samples = packet / stride;
         }
-        // Read where the audio will be heard, not where it is being queued -- and never
-        // past what the host has actually written.
+        // Read a fixed lag behind the submission point, and never past what the host has
+        // actually written.
         //
-        // Core Audio writes at a fraction of real time for about a second after IO starts,
-        // while the engine runs at rate from the first transfer, so the engine gets tens of
-        // thousands of frames in front of it. The ring is one zero timestamp period long, so
-        // reading in front of the host wraps and returns audio from a moment ago, which is
-        // heard as a stutter that repeats until the host catches up. No anchor fixes this:
-        // it is not an offset that is wrong, it is that the audio does not exist yet.
+        // The lag is the whole geometry and it never moves: the transfer starting at sample
+        // S carries the host's audio for index S minus the lag, so what is heard is the lag
+        // behind the timeline's own time for that index, which is what the reported latency
+        // says.
         //
-        // So bound the read by the host's own last write and send silence past it. The bound
-        // stops mattering the moment the host is running at rate, and it costs nothing then.
-        const int64_t position = static_cast<int64_t>(ivars->sample_counter) + ivars->read_offset;
-        const uint64_t at = position > 0 ? static_cast<uint64_t>(position) : 0;
+        // The bound is for the start, where it is not steady. Core Audio writes at a
+        // fraction of real time for about a second after IO first begins while the engine
+        // runs at rate from the first transfer, and the audio to fill that gap does not
+        // exist yet -- no choice of read position conjures it. Silence is the honest thing
+        // to send, and the bound stops mattering the moment the host is running at rate.
+        const uint64_t at =
+            ivars->sample_counter > ivars->read_lag ? ivars->sample_counter - ivars->read_lag : 0;
         const uint64_t written_to = ivars->last_write_sample + ivars->last_write_frames;
-        if (!ivars->read_anchored || at + samples > written_to) {
+        if (ivars->last_write_frames == 0 || at + samples > written_to) {
             memset(data + offset, ivars->silence_byte, samples * stride);
             // Silence with no client is the engine idling, not the host failing to keep up,
             // and counting it would bury the number that says how long a start took.

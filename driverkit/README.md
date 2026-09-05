@@ -113,74 +113,54 @@ what an application that takes the first format it is offered gets. Setting it o
 before `AddObject` is not enough on its own: it comes back as the narrowest published once
 Core Audio picks the device up, so it is set again afterwards and both values logged.
 
-## Anchoring the read point, and what the anchor waits for
+## Where the ring is read
 
-The read point is set once per session, from a host write, and every later move is a jump in
-the audio -- a click, and in a rising sweep the pitch stepping by roughly a fourth. Putting
-that one anchor somewhere it will hold is the whole of it.
+The read point is `sample_counter` minus two in-flight windows, fixed for the life of a
+stream. It is derived, not measured, and that is the whole design: nothing about it depends on
+where the host happens to be writing, so it cannot move, and a move is what a click was.
 
-**Core Audio does not open a session at rate.** On some starts it writes three buffers in half
-a second: 3072 frames where the engine, which runs on the bus clock, has advanced 22,000. It is
-not late by a fixed offset that could be measured and subtracted -- it runs at a seventh of
-rate while its own IO cycles settle and then over-runs to close the gap it opened, taking
-seconds to converge. In between it can sit twenty-five thousand frames behind the engine, which
-on a ring of 16,384 is more than a lap.
+**Why that position.** The timeline maps a sample index to the time that index goes out on the
+wire -- the pairs posted are a transfer's `start_sample` against the bus timestamp of its first
+microframe. So the transfer starting at sample S must carry the host's audio for index S minus
+the lag, and what is heard is the lag behind the timeline's own time for that index. That is
+exactly the reported latency, and it is now a constant the driver can state.
 
-**Contiguity is not pacing.** The test this replaced asked whether a write started exactly one
-buffer past the last. It always does: the host's writes are contiguous in sample time whatever
-wall clock rate they arrive at, so the condition was met by the second or third write of every
-session, including the ones running at a seventh of rate. The deadline meant to bound the wait
-ran from the start of the session and had already expired by the time the host wrote at all, so
-in practice the anchor was always taken on the first write. Taken there it sits the read point
-where the host will not be for another second or two: everything until it arrives is silence,
-and the crossing when it does is the click.
+**Why two windows and not one.** One is the read-ahead a transfer needs: the ring is read at
+submission and a transfer spans a quarter of a window, so reading level with the timeline runs
+its tail past the write head. The second is margin, and it has to come from here because it
+does not come from the safety offset. Setting `SetOutputSafetyOffset` to a window does not make
+Core Audio write a window ahead of the timeline -- measured against Chrome, it writes between
+130 and 660 frames ahead whatever the offset says. Reading level with the timeline left under
+one transfer of headroom, and the tail of every transfer came out as silence, which is heard as
+noise rather than as a dropout.
 
-**What is measured instead.** `HostKeepsUp` compares the host's advance with the engine's over
-a window of eight host buffers and wants at least fifteen sixteenths of it, twice running. The
-engine's advance closes the window rather than the host's -- a host at a seventh of rate takes
-seven times as long to fill a window of its own writes, which is exactly the case being waited
-out. Faster than the engine passes deliberately: the over-run only moves the host's writes
-further ahead of the read point, so the margin grows rather than closing. The deadline now runs
-from the host's first write.
+**What it looks like settled.** At 352800 with 512 frame host buffers the host's write head
+sits 8954 to 10507 frames ahead of the read point on a ring of 16384: clear of zero at one end
+and of a lap at the other, with no trend.
 
-**What the fix measures on hardware.** Two sweeps at 44100, one on a fresh load and one
-resuming the previous session's timeline:
+**The two ways it could still be wrong are counted, not corrected.** `crossings` is the host
+falling back onto the read point; `laps` is the host getting a whole ring ahead of it, so the
+slot about to be read has been overwritten. The second is the nastier one -- what comes out is
+continuous audio from further along the track, so it sounds perfectly fine and is heard only as
+the sound running ahead of the picture. Both are impossible if the geometry holds, so a
+non-zero count is a bug to find rather than a condition to correct.
 
-| | fresh load | resumed timeline |
-| --- | --- | --- |
-| read point moves | 1 | 1 |
-| cycles the engine had overtaken the host | 0 | 0 |
-| host's lead over the read point, over 17-21 s | 2691-2832 | 2708-2850 |
-| frames sent as silence | 43,395 | 64,564 |
+**What this replaced.** The read point used to be anchored to the host's own write position and
+corrected when it drifted. Every correction was a jump in the audio, and the position it landed
+on depended on when in Core Audio's opening ramp the anchor was taken, which made the real
+latency vary from session to session while the reported figure stayed constant. The margin was
+`read_lag + 4 x in_frame_size`, which is 2048 frames against a 512 frame host buffer and 16384
+-- the entire ring -- against the 4096 a browser asks for. That put the read point more than a
+lap behind and every transfer picked up a slot already overwritten twice.
 
-The lead is the number that matters. It used to walk by tens of thousands of frames within
-seconds of the anchor; it now holds inside a band of seventy frames, under two milliseconds,
-for the length of the track. Neither sweep had an audible click or step.
-
-**The silence is the opening ramp, not a regression.** Earlier builds logged the same 18,000 to
-81,000 frames. Nearly all of it falls before the host's first write -- 770 ms and 1.27 s in the
-two sessions above -- which is Core Audio's own IO startup. Until then the audio to fill the
-ring does not exist, and silence is what there is.
-
-**Watch for the fail-silent trap.** An earlier version waited for the host to be pacing before
-it would anchor and sent silence until then. On sessions where that condition never arrived it
-sent silence from end to end -- no audio at all, which is worse than the artefact it was
-avoiding. Any gate on the read path needs a deadline; this one has `kSettleDeadlineFrames`.
-
-**What was ruled out on the way.** The engine's own pacing is real time to within two parts in
-a thousand measured against wall clock, the zero timestamps are exact to nine parts in a
-million -- 16,384 frames per 8,916,264 mach ticks, three in a row -- and isochronous completions
-come back `status 0` with a full first frame. Neither the transfer chain nor the timeline
-arithmetic was ever drifting.
+**The bound stays.** During Core Audio's opening ramp the audio does not exist yet, whatever
+the read position: it writes at a fraction of real time for about a second after IO first
+starts. The read is bounded by the host's own last write, with silence past it, and `starved`
+counts how long that lasted.
 
 **A test signal helps.** A slow rising sine sweep makes these obvious where music does not: a
-repeat is heard as the pitch dropping back, and a read point move as the pitch stepping. Twenty
+repeat is heard as the pitch dropping back, a read point move as the pitch stepping. Twenty
 seconds from 300 Hz to 1200 Hz at low amplitude is enough.
-
-**What is logged at the end of a session.** `session ends: N read point moves, M cycles the
-engine had overtaken the host, K frames sent as silence`, at every `StopIsoc`. `N` has matched
-what a listener reports every time it has been checked, and one is the floor rather than zero:
-the anchor itself counts. `K` is how long the opening ramp lasted.
 
 ## The feedback endpoint, and three ways to lose a servo
 
