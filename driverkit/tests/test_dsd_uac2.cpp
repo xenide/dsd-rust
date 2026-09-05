@@ -1,0 +1,259 @@
+//
+//  test_dsd_uac2.cpp
+//  Host-side tests for the descriptor parser the dext shares.
+//
+//  These build and run without Xcode, DriverKit, entitlements or a DAC, which is the whole
+//  reason the parser has no DriverKit dependency. Build with driverkit/build.sh test.
+//
+
+#include "DsdAudioDriver/DsdUac2.h"
+
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+
+void Check(bool condition, const char* what) {
+    if (condition) {
+        return;
+    }
+    std::printf("FAIL %s\n", what);
+    failures++;
+}
+
+void Append(std::vector<uint8_t>& config, std::initializer_list<uint8_t> bytes) {
+    config.insert(config.end(), bytes);
+}
+
+void AppendInterface(std::vector<uint8_t>& config, uint8_t number, uint8_t alt,
+                     uint8_t endpoints, uint8_t subclass) {
+    Append(config, {9, 0x04, number, alt, endpoints, 0x01, subclass, 0x20, 0});
+}
+
+void AppendEndpoint(std::vector<uint8_t>& config, uint8_t address, uint8_t attributes,
+                    uint16_t max_packet, uint8_t interval = 1) {
+    Append(config, {7, 0x05, address, attributes, static_cast<uint8_t>(max_packet & 0xFF),
+                    static_cast<uint8_t>(max_packet >> 8), interval});
+}
+
+/// The Cayin RU7's real configuration descriptor: three PCM alternate settings and one
+/// RAW_DATA setting for native DSD. Transcribed from the same source as the Rust fixture in
+/// src/output/usb/descriptors.rs, so the two parsers are held to one device.
+std::vector<uint8_t> Ru7() {
+    std::vector<uint8_t> config = {9, 0x02, 0, 0, 2, 1, 0, 0x80, 50};
+
+    AppendInterface(config, 0, 0, 0, 0x01);
+    Append(config, {9, 0x24, 0x01, 0x00, 0x02, 0x04, 0x40, 0x00, 0x00});
+    Append(config, {8, 0x24, 0x0A, 0x05, 0x03, 0x07, 0x00, 0x00});
+    Append(config, {17, 0x24, 0x02, 0x01, 0x01, 0x01, 0x00, 0x05, 0x02, 0x03, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00});
+
+    AppendInterface(config, 1, 0, 0, 0x02);
+    const uint8_t pcm[3][3] = {{1, 2, 16}, {2, 3, 24}, {3, 4, 32}};
+    for (const auto& setting : pcm) {
+        AppendInterface(config, 1, setting[0], 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, setting[1], setting[2]});
+        AppendEndpoint(config, 0x01, 0x05, 776);
+        AppendEndpoint(config, 0x81, 0x11, 4);
+    }
+    // Alt 4: bmFormats = 0x80000000, RAW_DATA.
+    AppendInterface(config, 1, 4, 2, 0x02);
+    Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x00, 0x00, 0x00, 0x80, 0x02, 0x03, 0x00,
+                    0x00, 0x00, 0x00});
+    Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+    AppendEndpoint(config, 0x01, 0x05, 776);
+    AppendEndpoint(config, 0x81, 0x11, 4);
+    return config;
+}
+
+const dsd::AltSetting* FindAlt(const dsd::Uac2Layout& layout, uint8_t alt_setting) {
+    for (size_t index = 0; index < layout.alt_count; index++) {
+        if (layout.alts[index].alt_setting == alt_setting) {
+            return &layout.alts[index];
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+int main() {
+    const std::vector<uint8_t> ru7 = Ru7();
+    dsd::Uac2Layout layout{};
+    Check(dsd::ParseLayout(ru7.data(), ru7.size(), &layout), "RU7 descriptor parses");
+
+    Check(layout.control_interface == 0, "control interface is 0");
+    Check(layout.streaming_interface == 1, "streaming interface is 1");
+    Check(layout.clock_id == 5, "clock source is ID 5");
+    Check(layout.alt_count == 4, "alt 0 is dropped, four settings carry audio");
+
+    const dsd::AltSetting* native = FindAlt(layout, 4);
+    Check(native != nullptr, "alt 4 is kept");
+    if (native != nullptr) {
+        Check(native->raw_data, "alt 4 is RAW_DATA");
+        Check(native->subslot_bytes == 4, "native DSD uses four-byte subslots");
+        Check(native->channels == 2, "native DSD carries two channels");
+        Check(native->out_endpoint == 0x01, "native DSD writes to endpoint 1");
+        Check(native->feedback_endpoint == 0x81, "native DSD has a feedback endpoint");
+        Check(native->max_packet == 776, "native DSD packet is 776 bytes");
+    }
+
+    // The two endpoints of an alternate setting have separate intervals and payloads, and
+    // the feedback chain is scheduled off its own. Reading the output endpoint's instead
+    // schedules every resubmit against the wrong bus frame.
+    {
+        std::vector<uint8_t> config = {9, 0x02, 0, 0, 2, 1, 0, 0x80, 50};
+        AppendInterface(config, 0, 0, 0, 0x01);
+        Append(config, {9, 0x24, 0x01, 0x00, 0x02, 0x04, 0x40, 0x00, 0x00});
+        Append(config, {8, 0x24, 0x0A, 0x05, 0x03, 0x07, 0x00, 0x00});
+        AppendInterface(config, 1, 0, 0, 0x02);
+        AppendInterface(config, 1, 1, 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+        AppendEndpoint(config, 0x01, 0x05, 776, 1);
+        AppendEndpoint(config, 0x81, 0x11, 4, 4);
+        dsd::Uac2Layout split{};
+        Check(dsd::ParseLayout(config.data(), config.size(), &split), "split intervals parse");
+        const dsd::AltSetting* alt = FindAlt(split, 1);
+        Check(alt != nullptr, "the alternate setting is kept");
+        if (alt != nullptr) {
+            Check(alt->interval == 1, "the output endpoint keeps its own interval");
+            Check(alt->max_packet == 776, "the output endpoint keeps its own payload");
+            Check(alt->feedback_interval == 4, "the feedback endpoint keeps its own interval");
+            Check(alt->feedback_max_packet == 4, "the feedback endpoint keeps its own payload");
+        }
+    }
+
+    const dsd::AltSetting* pcm24 = FindAlt(layout, 2);
+    Check(pcm24 != nullptr && !pcm24->raw_data, "alt 2 is PCM, not RAW_DATA");
+    Check(pcm24 != nullptr && pcm24->bit_resolution == 24, "alt 2 carries 24 bits");
+
+    // 776 bytes per microframe over two four-byte subslots is 97 samples, so the endpoint
+    // reaches 776000 Hz and stops short of 780000.
+    if (native != nullptr) {
+        Check(dsd::AltCarriesRate(*native, 705600), "DSD256 native rate fits");
+        Check(dsd::AltCarriesRate(*native, 776000), "the endpoint ceiling fits exactly");
+        Check(!dsd::AltCarriesRate(*native, 780000), "past the ceiling does not fit");
+        Check(!dsd::AltCarriesRate(*native, 0), "a zero rate never fits");
+    }
+
+    // Two subranges: one discrete rate, and a walked range of three.
+    const uint8_t report[] = {0x02, 0x00,                          // two subranges
+                              0x44, 0xAC, 0x00, 0x00,              // min 44100
+                              0x44, 0xAC, 0x00, 0x00,              // max 44100
+                              0x00, 0x00, 0x00, 0x00,              // resolution 0
+                              0x80, 0xBB, 0x00, 0x00,              // min 48000
+                              0x60, 0x74, 0x02, 0x00,              // max 160800
+                              0x50, 0xDC, 0x00, 0x00};             // resolution 56400
+    uint32_t rates[dsd::kMaxSampleRates] = {};
+    const size_t count = dsd::ParseClockRange(report, sizeof(report), rates, dsd::kMaxSampleRates);
+    Check(count == 4, "one discrete rate and three walked rates");
+    Check(count > 0 && rates[0] == 44100, "the discrete subrange is 44100");
+    Check(count > 3 && rates[1] == 48000 && rates[2] == 104400 && rates[3] == 160800,
+          "the walked subrange steps by its resolution");
+
+    const size_t truncated = dsd::ParseClockRange(report, 10, rates, dsd::kMaxSampleRates);
+    Check(truncated == 0, "a subrange cut short is dropped rather than read past");
+
+    dsd::FormatEntry formats[64] = {};
+    const uint32_t publish[] = {44100, 352800, 705600, 1411200};
+    const size_t written =
+        dsd::BuildFormats(layout, publish, 4, formats, sizeof(formats) / sizeof(formats[0]));
+    Check(written > 0, "the RU7 publishes formats");
+    Check(!formats[0].native_dsd, "PCM leads the format list, not native DSD");
+    Check(formats[0].sample_rate == 44100.0, "the list starts at the lowest rate");
+    // The head of the list is what the device defaults to, so everything the OS plays goes
+    // out at this width. The RU7's descriptor lists 16 bit first; the widest is 32.
+    Check(formats[0].subslot_bytes == 4 && formats[0].bit_resolution == 32,
+          "the widest PCM subslot leads, not the one the descriptor lists first");
+
+    bool narrower_seen = false;
+    bool widened_again = false;
+    bool trailing_native = false;
+    bool pcm_after_native = false;
+    bool native_at_1411200 = false;
+    for (size_t index = 0; index < written; index++) {
+        if (formats[index].native_dsd) {
+            trailing_native = true;
+            if (formats[index].sample_rate == 1411200.0) {
+                native_at_1411200 = true;
+            }
+            continue;
+        }
+        if (trailing_native) {
+            pcm_after_native = true;
+        }
+        if (formats[index].subslot_bytes < formats[0].subslot_bytes) {
+            narrower_seen = true;
+        } else if (narrower_seen) {
+            widened_again = true;
+        }
+    }
+    Check(!pcm_after_native, "no PCM format follows a native one");
+    Check(!widened_again, "PCM subslots only ever narrow down the list");
+    // 1411200 Hz needs 1416 bytes a microframe in four-byte subslots, past the 776 the
+    // endpoint carries, so DSD512 is not on this DAC's native list.
+    Check(!native_at_1411200, "DSD512 exceeds the native endpoint and is not published");
+
+    // A frame wider than the ring's stride is never published.
+    //
+    // The ring is one allocation of a fixed stride and the read path bounds itself on the
+    // ring's length in frames, not on the mapping's length in bytes, so publishing a wider
+    // format reads off the end of the mapping from the IO path. Nothing between the
+    // descriptor and here narrows the channel count -- it is whatever byte the device sent --
+    // so a DAC with a multichannel alternate setting would reach it.
+    {
+        std::vector<uint8_t> config = {9, 0x02, 0, 0, 2, 1, 0, 0x80, 50};
+        AppendInterface(config, 0, 0, 0, 0x01);
+        Append(config, {9, 0x24, 0x01, 0x00, 0x02, 0x04, 0x40, 0x00, 0x00});
+        Append(config, {8, 0x24, 0x0A, 0x05, 0x03, 0x07, 0x00, 0x00});
+        AppendInterface(config, 1, 0, 0, 0x02);
+        // Alt 1 is ordinary stereo; alt 2 declares eight channels of four byte subslots,
+        // which is 32 bytes a frame against a ring built for 8.
+        AppendInterface(config, 1, 1, 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+        AppendEndpoint(config, 0x01, 0x05, 776);
+        AppendInterface(config, 1, 2, 2, 0x02);
+        Append(config, {16, 0x24, 0x01, 0x01, 0x05, 0x01, 0x01, 0x00, 0x00, 0x00, 0x08, 0x03,
+                        0x00, 0x00, 0x00, 0x00});
+        Append(config, {6, 0x24, 0x02, 0x01, 0x04, 0x20});
+        AppendEndpoint(config, 0x01, 0x05, 3104);
+
+        dsd::Uac2Layout wide{};
+        Check(dsd::ParseLayout(config.data(), config.size(), &wide), "the wide descriptor parses");
+        const dsd::AltSetting* eight = FindAlt(wide, 2);
+        Check(eight != nullptr && eight->channels == 8, "the parser reports all eight channels");
+        Check(eight != nullptr && dsd::AltFrameBytes(eight->channels, eight->subslot_bytes) >
+                                      dsd::kMaxFrameBytes,
+              "eight channels exceed the ring stride");
+
+        dsd::FormatEntry wide_formats[64] = {};
+        const uint32_t one_rate[] = {44100};
+        const size_t wide_written = dsd::BuildFormats(wide, one_rate, 1, wide_formats,
+                                                      sizeof(wide_formats) / sizeof(wide_formats[0]));
+        Check(wide_written > 0, "the stereo setting is still published");
+        bool published_wide = false;
+        for (size_t index = 0; index < wide_written; index++) {
+            if (dsd::AltFrameBytes(wide_formats[index].channels,
+                                   wide_formats[index].subslot_bytes) > dsd::kMaxFrameBytes) {
+                published_wide = true;
+            }
+        }
+        Check(!published_wide, "no published format is wider than the ring stride");
+    }
+
+    if (failures == 0) {
+        std::printf("ok, all checks passed\n");
+        return 0;
+    }
+    std::printf("%d check(s) failed\n", failures);
+    return 1;
+}
