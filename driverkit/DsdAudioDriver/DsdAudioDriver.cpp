@@ -203,11 +203,21 @@ struct DsdAudioDriver_IVars {
     /// ring lapping and is audible. Counted rather than logged per occurrence: the IO handler
     /// runs hundreds of times a second.
     uint64_t crossings;
+    /// Times the host had run a whole ring ahead of the read point, so the slot the engine
+    /// was about to read had already been overwritten.
+    uint64_t laps;
     /// Times the read point moved. Every one of them is a jump in the audio, heard as a
     /// click and, in a sweep, as the pitch stepping.
     uint64_t anchors;
     bool running;
     uint8_t active_alt;
+    /// The rate the engine is streaming, so a client asking for the same one can be let
+    /// straight in rather than restarted.
+    uint32_t active_rate;
+    /// Whether a client is doing IO. The engine outlives this: it keeps streaming silence
+    /// and posting timestamps between clients, so the next one starts against a clock that
+    /// never stopped.
+    bool client_active;
 };
 
 namespace {
@@ -689,10 +699,24 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
             if (in_operation == IOUserAudioIOOperationWriteEnd) {
                 const int64_t margin =
                     static_cast<int64_t>(in_sample_time) - static_cast<int64_t>(read_at);
-                const bool overtaken = state->read_anchored && margin <= 0;
-                if (overtaken) {
+                // Two ways for the pair to be wrong, and only one of them was being caught.
+                // The host can fall back onto the read point, which is the ring lapping the
+                // way it was already counted. It can also get a whole ring ahead, and then
+                // the slot the engine is about to read has been overwritten: what comes out
+                // is continuous audio from further along the track, which sounds fine and
+                // plays ahead of the timeline the driver reports. That is heard as the sound
+                // running ahead of the picture rather than as a glitch, so nothing caught it.
+                const int64_t lapped_at = static_cast<int64_t>(state->ring_frames) -
+                                          static_cast<int64_t>(in_frame_size);
+                const bool behind = state->read_anchored && margin <= 0;
+                const bool lapped = state->read_anchored && margin >= lapped_at;
+                if (behind) {
                     state->crossings++;
                 }
+                if (lapped) {
+                    state->laps++;
+                }
+                const bool overtaken = behind || lapped;
                 // Anchor once the host is keeping up with the engine, and again only as a
                 // backstop. Each correction moves the read position, which is heard as a
                 // click, so the one that counts has to be taken somewhere it will hold: not
@@ -728,8 +752,24 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                     // evenly: one grazed the read point by four frames and cost a second
                     // correction, which is a second click. The margin is silence that never
                     // gets played, so it is cheap; the only thing it buys back is latency.
-                    const uint64_t margin_frames =
+                    //
+                    // But it has to fit in the ring, which is one zero timestamp period and
+                    // nothing more. Four of the host's buffers is 2048 frames when it asks
+                    // for 512, and 16384 when it asks for 4096 -- a browser asks for 4096,
+                    // and that is the whole ring on its own. The read point then sat more
+                    // than a lap behind the write point and every transfer picked up a slot
+                    // the host had already overwritten twice: continuous audio, running a
+                    // couple of hundred milliseconds ahead of the timeline being reported,
+                    // which is A/V sync gone while nothing sounds wrong.
+                    const uint64_t ceiling =
+                        state->ring_frames > in_frame_size + state->read_lag
+                            ? state->ring_frames - in_frame_size - state->read_lag
+                            : state->read_lag;
+                    uint64_t margin_frames =
                         state->read_lag + static_cast<uint64_t>(in_frame_size) * 4;
+                    if (margin_frames > ceiling) {
+                        margin_frames = ceiling;
+                    }
                     state->read_offset = static_cast<int64_t>(in_sample_time) -
                                          static_cast<int64_t>(margin_frames) -
                                          static_cast<int64_t>(state->sample_counter);
@@ -907,6 +947,30 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     }
 
     const uint32_t frame_bytes = static_cast<uint32_t>(entry->channels) * entry->subslot_bytes;
+    // Let a client that wants what is already streaming straight in.
+    //
+    // Tearing the engine down on every StopDevice made each client pay a cold start: about
+    // a second in which Core Audio has not found its rate, the engine has nothing real to
+    // send, and the frames the host writes in the meantime are never read. A browser opens
+    // and closes the stream several times while a page settles, so it paid that repeatedly,
+    // and its video pipeline waited on an audio clock that had run through all of it.
+    //
+    // The engine kept running, so the timeline, the ring geometry and the read point are all
+    // still where they were. There is nothing to set up and nothing to wait for.
+    if (ivars->running && ivars->active_alt == entry->alt_setting &&
+        ivars->active_rate == static_cast<uint32_t>(entry->sample_rate) &&
+        ivars->frame_bytes == frame_bytes) {
+        // The read point stays where it is -- that is the whole point -- but the counters
+        // that describe a start are per client, so they begin again here.
+        ivars->anchors = 0;
+        ivars->crossings = 0;
+        ivars->laps = 0;
+        ivars->starved = 0;
+        ivars->client_active = true;
+        Log("client starts on the engine already streaming %u Hz on alt %u",
+            ivars->active_rate, ivars->active_alt);
+        return super::StartDevice(in_object_id, in_flags);
+    }
     // The driver reads the ring up to a whole in-flight window ahead of what the DAC is
     // playing, because that much audio is already handed to the controller. The host writes
     // relative to the timeline the zero timestamps describe, so unless it is told to stay
@@ -928,18 +992,30 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
     Log("host asked for %.0f Hz %{public}s, alternate setting %u, in-flight window %u frames",
         entry->sample_rate, entry->native_dsd ? "native DSD" : "PCM", entry->alt_setting,
         window_frames);
+    // A different format than the engine is on, so it does have to be restarted.
+    StopIsoc();
     const kern_return_t result = StartIsoc(static_cast<uint32_t>(entry->sample_rate),
                                            entry->alt_setting, frame_bytes);
     if (result != kIOReturnSuccess) {
         StopIsoc();
         return result;
     }
+    ivars->client_active = true;
     return super::StartDevice(in_object_id, in_flags);
 }
 
 kern_return_t DsdAudioDriver::StopDevice(IOUserAudioObjectID in_object_id,
                                          IOUserAudioStartStopFlags in_flags) {
-    StopIsoc();
+    // Leave the engine streaming. A running audio device keeps its clock running whether or
+    // not anything is playing, and stopping it here is what made every client pay a cold
+    // start. The read path sends silence while no one is writing, which for a DSD carrier
+    // is what holds the DAC in lock between tracks as well.
+    //
+    // It is torn down on a format change, in StartDevice, and when the driver stops.
+    ivars->client_active = false;
+    Log("client stops: %llu read point moves, %llu cycles the engine had overtaken the host, "
+        "%llu cycles the host had lapped the read point, %llu frames sent as silence",
+        ivars->anchors, ivars->crossings, ivars->laps, ivars->starved);
     return super::StopDevice(in_object_id, in_flags);
 }
 
@@ -1041,7 +1117,9 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->crossings = 0;
+    ivars->laps = 0;
     ivars->anchors = 0;
+    ivars->client_active = false;
     ivars->read_offset = -static_cast<int64_t>(ivars->read_lag);
     ivars->read_anchored = false;
     ivars->last_write_sample = 0;
@@ -1053,6 +1131,7 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->first_write_at = 0;
     ivars->starved = 0;
     ivars->silence_byte = alt->raw_data ? kDsdSilenceByte : 0;
+    ivars->active_rate = rate;
     ivars->running = true;
     // The ring is read a whole in-flight window before the host's first write of the track
     // lands, so it starts out holding silence rather than the tail of the track before. Which
@@ -1097,10 +1176,12 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
 
 void DsdAudioDriver::StopIsoc() {
     if (ivars->running) {
-        if (ivars->anchors != 0 || ivars->crossings != 0 || ivars->starved != 0) {
+        if (ivars->anchors != 0 || ivars->crossings != 0 || ivars->laps != 0 ||
+            ivars->starved != 0) {
             Log("session ends: %llu read point moves, %llu cycles the engine had overtaken "
-                "the host, %llu frames sent as silence",
-                ivars->anchors, ivars->crossings, ivars->starved);
+                "the host, %llu cycles the host had lapped the read point, %llu frames sent "
+                "as silence",
+                ivars->anchors, ivars->crossings, ivars->laps, ivars->starved);
             Log("feedback over the session: %llu submits, %llu completions, %llu reports, "
                 "%llu misses, %llu re-arms",
                 ivars->feedback_submits, ivars->feedback_completions, ivars->feedback_reports,
@@ -1170,7 +1251,11 @@ kern_return_t DsdAudioDriver::SubmitTransfer(uint32_t index) {
         const uint64_t written_to = ivars->last_write_sample + ivars->last_write_frames;
         if (!ivars->read_anchored || at + samples > written_to) {
             memset(data + offset, ivars->silence_byte, samples * stride);
-            ivars->starved += samples;
+            // Silence with no client is the engine idling, not the host failing to keep up,
+            // and counting it would bury the number that says how long a start took.
+            if (ivars->client_active) {
+                ivars->starved += samples;
+            }
         } else {
             CopyFromRing(ring, ivars->ring_frames, at, samples, stride, data + offset);
         }
@@ -1388,6 +1473,20 @@ void IMPL(DsdAudioDriver, IsochComplete) {
             reinterpret_cast<const IOUSBIsochronousFrame*>(transfer.frame_map->GetAddress());
         const uint64_t sample = transfer.start_sample;
         const uint64_t host = frames[0].timeStamp;
+        // Give the host a pair from this session as soon as there is one to give.
+        //
+        // Nothing is posted while IO is stopped, so until the first period boundary lands
+        // the newest pair the host holds is the last one of the previous session, and it
+        // works out where to write from that. A period is 372 ms at 44100. Sessions where
+        // the host began writing on that first boundary opened tens of thousands of frames
+        // behind the engine and spent a second converging on it; the ones that happened to
+        // wait for the second boundary opened at rate and needed no convergence at all.
+        // This is the same pair, exact -- the sample the first transfer starts at, against
+        // the bus time it actually went out on -- roughly fourteen milliseconds in.
+        if (ivars->prev_host == 0 && ivars->device) {
+            ivars->device->UpdateCurrentZeroTimestamp(sample, host);
+            Log("seeded the timeline at sample %llu, host time %llu", sample, host);
+        }
         if (ivars->prev_host != 0 && sample > ivars->prev_sample && ivars->device) {
             const double per_sample = static_cast<double>(host - ivars->prev_host) /
                                       static_cast<double>(sample - ivars->prev_sample);

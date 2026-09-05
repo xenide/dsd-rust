@@ -243,6 +243,39 @@ seconds of that session read -11.8 ppm and the last three minutes read +0.4: the
 is Core Audio converging onto the rate the servo stepped to, not a standing drift, and only a
 run long enough to hold both tells them apart.
 
+## The engine outlives the client
+
+`StopDevice` used to tear the isochronous stream down, so every client paid a cold start:
+about a second in which Core Audio has not found its rate, the engine has nothing real to
+send, and the frames the host writes meanwhile are read by nobody. One client opening once
+hides that. A browser does not -- it opens and closes the stream several times while a page
+settles, and each open cost another second:
+
+```
+12:56:28 streaming -> ends 12:56:33   220422 frames silence
+12:56:37 streaming -> ends 12:56:42   244998 frames silence
+12:56:47 streaming -> ends 12:57:18   215813 frames silence
+```
+
+Watched, that is a YouTube tab whose audio starts while the picture sits on a spinner at
+0:00, then races to catch up: the audio clock had run through several seconds nobody heard.
+Spotify and VLC open once and hold, which is why they never showed it, and setting the device
+to 48000 changed nothing, which is what ruled out resampling.
+
+A running audio device keeps its clock running whether or not anything is playing. The engine
+now does too. `StopDevice` marks the client inactive and leaves the stream going on silence,
+still posting timestamps; `StartDevice` lets a client whose rate, alternate setting and frame
+width already match straight in, with no `StartIsoc`, no re-anchor and no wait, because the
+timeline and the ring geometry never stopped being valid. A format change restarts it, from
+`StartDevice` rather than `StopDevice`, and unplugging still tears it down.
+
+Two consequences, both deliberate. The DAC streams continuously while it is the default
+output, so there is no idle power saving while it is connected. And after a DSD track it stays
+on that alternate setting until something asks for a different one, so its display keeps
+showing DSD. Returning it to a default PCM setting on an idle timeout needs a timer on a
+separate dispatch queue -- a synchronous pipe abort from the completion queue would deadlock
+against the completions it is waiting for -- so it is not done.
+
 ## Iterating on this
 
 `activate` stages a build; the kill is what swaps it in. Every change costs a round trip:
