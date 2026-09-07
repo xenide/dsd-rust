@@ -263,19 +263,41 @@ width already match straight in, with no `StartIsoc`, no re-anchor and no wait, 
 timeline and the ring geometry never stopped being valid. A format change restarts it, from
 `StartDevice` rather than `StopDevice`, and unplugging still tears it down.
 
-Two consequences, both deliberate. The DAC streams continuously while it is the default
-output, so there is no idle power saving while it is connected. And after a DSD track it stays
-on that alternate setting until something asks for a different one, so its display keeps
-showing DSD. Returning it to a default PCM setting on an idle timeout needs a timer on a
-separate dispatch queue -- a synchronous pipe abort from the completion queue would deadlock
-against the completions it is waiting for -- so it is not done.
+It does not outlive it indefinitely. The completion handler counts how long it has run with no
+client -- a transfer spans a fixed number of microframes, so the count is a wall clock at every
+rate -- and past ten seconds the chains stop resubmitting and the interface drops back to its
+zero bandwidth alternate setting. Ten seconds is far longer than the gap between two tracks and
+far shorter than the streaming is worth paying for: at native DSD the engine reserves about
+3 MB/s in the periodic schedule and wakes the driver 500 times a second to send silence.
+
+The teardown runs from a dispatch queue rather than from the completion that triggers it,
+because `StopIsoc` aborts the pipe synchronously and then frees the buffers and the OSAction
+that completion is running on.
+
+One consequence remains deliberate: after a DSD track the DAC stays on that alternate setting
+until the teardown, so its display keeps showing DSD for those ten seconds.
 
 ## Iterating on this
 
-`activate` stages a build; the kill is what swaps it in. Every change costs a round trip:
-rebuild, `activate`, then `sudo pkill -f "SystemExtensions.*DsdAudioDriver"` and replug the
-DAC. Expect to go round twice -- the first kill retires whichever copy was pinned and hands the
-DAC to the one already staged, and only the second brings up the build just made.
+`activate` stages a build; it never swaps the running code. Deactivate first, every time:
+
+```
+# with the DAC unplugged
+sudo pkill -f "SystemExtensions.*DsdAudioDriver"
+./build.sh app
+build/DsdDriverInstaller.app/Contents/MacOS/DsdDriverInstaller deactivate
+systemextensionsctl list      # must show no dsdrust entry at all
+build/DsdDriverInstaller.app/Contents/MacOS/DsdDriverInstaller activate
+# then plug the DAC back in
+```
+
+Activating over a live entry is what costs the round trips. Two copies then sit on file,
+`sysextd` keeps handing out the stale one, and staging a new copy strips the exec bit from the
+outgoing one -- so the pinned server cannot even be relaunched, and the kernel gives up with
+`failed to find server`. The DAC falls back to `usbaudiod` and the driver logs nothing at all,
+which reads exactly like a driver that loaded and stayed quiet. Deactivating first avoids the
+whole state; `find /Library/SystemExtensions -name DsdAudioDriver -exec ls -l {} \;` shows what
+is really on file and which copies are still executable.
 
 **Check the reload took before trusting a result.** A whole round of listening tests once ran
 against a build that was never loaded, because the DAC came back before `activate` completed.
