@@ -36,14 +36,18 @@ constexpr uint64_t kStartLead = 10;
 constexpr uint64_t kTransferMs = kMicroframesPerTransfer / kMicroframesPerFrame;
 /// How long the engine keeps streaming after its last client stopped.
 ///
-/// The engine outliving its client is what makes the next one start warm, and a client
-/// returning inside this window pays nothing for it -- a browser opening and closing the
-/// stream while a page settles is well within it. Past it the streaming buys nothing: it
-/// holds an alternate setting's bandwidth reserved in the periodic schedule and wakes the
-/// driver every transfer to send silence no one is listening to. So the interface goes back
-/// to its zero bandwidth setting, which is what that setting is for, and the client after
-/// the window pays one relock instead.
-constexpr uint64_t kIdleTeardownMs = 10000;
+/// The engine outliving its client is what makes the next one start warm. Past this window
+/// the streaming buys nothing: it holds an alternate setting's bandwidth reserved in the
+/// periodic schedule and wakes the driver every transfer to send silence no one is listening
+/// to. So the interface goes back to its zero bandwidth setting, which is what that setting
+/// is for, and the client after the window pays a cold open instead.
+///
+/// Fifteen minutes, not the ten seconds this started at, because a cold open still costs
+/// real audio -- see "What is left: the cold open" in README.md. Ten seconds put that cost
+/// in front of ordinary listening, which is what it was measured doing. This keeps the
+/// saving for a DAC left connected and idle, and keeps normal use on the warm path, without
+/// pretending the cold open is fixed.
+constexpr uint64_t kIdleTeardownMs = 900000;
 constexpr uint64_t kIdleTeardownCompletions = kIdleTeardownMs / kTransferMs;
 
 /// Sample frames between the timestamps the host reads to build its timeline, which is also

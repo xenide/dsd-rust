@@ -174,6 +174,59 @@ counts how long that lasted.
 repeat is heard as the pitch dropping back, a read point move as the pitch stepping. Twenty
 seconds from 300 Hz to 1200 Hz at low amplitude is enough.
 
+## What is left: the cold open
+
+Opening a stream on an engine that was not already running costs about a third of a second of
+real audio. It is heard as the audio starting while the video spins, and then the video running
+fast to catch up. Under `usbaudiod` the same clip on the same DAC does the opposite -- the video
+starts and the audio arrives late -- so this is not simply the client's own start-up.
+
+**What it is.** Chrome's audio thread stalls once, shortly after the stream opens. Traced cycle
+by cycle at 192000, twelve cycles arrive dead on real time and then one does not:
+
+```
+ramp cycle 12: host wrote 4096 frames at 6721556, margin 6419, silence so far 4608   (25.402)
+ramp cycle 13: host wrote 8192 frames at 6787504, margin 3245, silence so far 63218  (25.760)
+```
+
+358 ms with no write, and the host comes back 65948 frames -- 343 ms -- further along the
+timeline. The engine free-runs through the gap and sends 58610 frames of silence. That one stall
+is the whole session's starvation: 4608 before it, 63218 after, nothing afterwards. The audio
+clock has advanced through a third of a second that never contained audio, and the video
+pipeline follows that clock.
+
+**What is already ruled out.** The ring geometry is not involved: the session ran 0 crossings and
+0 laps with the margin steady between 5908 and 7853. Pacing is not involved either -- cycles 1
+through 12 are exactly one 4096 frame buffer every 21.5 ms.
+
+**Buffering cannot fix it, and that is worth knowing before trying.** The cushion against a stall
+is `read_lag` and nothing else: starvation begins `margin / rate` after the host stops, which is
+6400/192000, about 33 ms. Riding out 358 ms needs 358 ms of `read_lag` -- and `read_lag` is what
+`SetOutputLatency` reports, so that is 358 ms of output latency, far more than `usbaudiod`
+reports at this rate. It is not reachable in any case: the ring is one zero timestamp period
+because the host wraps there whatever the buffer's length, and the period cannot grow to suit
+192000 without breaking 44100, where 32768 was already measured making the host limp at a tenth
+of rate for a second and a half. Growing the ring alone moves the lap threshold and not the
+cushion.
+
+**So the direction is the timeline, not the buffer.** What goes wrong is that the timeline
+advances through the stall, so the host resumes further along and the content in between is
+lost rather than delayed. `usbaudiod` ends up with the audio late, which is the same stall
+costing latency instead of content.
+
+**Three things that were tried and are not it.** Resuming a period on from the last posted zero
+timestamp: fitted to Chrome, which opened 23048 frames ahead, but afplay opens on the other side
+and the same change put it 21232 frames the wrong way. Anchoring the read point to the host's
+first write: shifts the read point without shifting `SetOutputLatency`, which makes the true
+latency `read_lag` minus the shift and therefore negative -- audio ahead of the timeline, which
+is the fault it was meant to remove. Growing the ring: see above.
+
+**A warm open does not pay it.** Measured on the same clip minutes apart, `client starts on the
+engine already streaming` cost 15361 frames of silence against 63218 for a cold one. That is
+what keeping the engine alive between clients buys, and why the idle teardown is set to fifteen
+minutes rather than ten seconds: it keeps ordinary listening on the warm path while the cold
+open is unfixed.
+
 ## The feedback endpoint, and three ways to lose a servo
 
 An asynchronous endpoint runs on the DAC's clock rather than the host's and says, once per
