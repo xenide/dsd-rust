@@ -510,7 +510,7 @@ sent this work down a wrong path more than once.
 | `DsdAudioDriver/DsdUac2.{h,cpp}` | UAC2 descriptor parsing and the format list. No DriverKit. |
 | `DsdAudioDriver/DsdAudioDriver.iig` | The driver class, as iig reads it. |
 | `DsdAudioDriver/DsdAudioDriver.cpp` | Matching, the audio objects, and the isochronous engine. |
-| `DsdAudioDriver/DsdAudioDevice.{iig,cpp}` | The device, subclassed to publish geometry on a config change. |
+| `DsdAudioDriver/DsdAudioDevice.{iig,cpp}` | The device. Publishes geometry on a config change. |
 | `DsdAudioDriver/Info.plist` | The matching personality. |
 | `DsdAudioDriver/DsdAudioDriver.entitlements` | What Apple has to grant. |
 | `tests/test_dsd_uac2.cpp` | Host tests for the parser. |
