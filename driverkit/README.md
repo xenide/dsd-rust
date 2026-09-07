@@ -263,6 +263,26 @@ which is half a period spread across the whole of it.
 `engine was down N periods of the DAC's clock` says the resume ran; `resuming a period on from`
 says it fell back.
 
+**The short gap is still a lie, and it bounds the period from above.** A rate change puts
+`StopIsoc` and `StartIsoc` about twenty milliseconds apart, which is less than a period, so the
+resume falls back on one period past the last pair. Core Audio then reads one period of samples
+across twenty milliseconds of host time -- a rate of `period / gap`, which at 16384 frames is
+about four times too fast for the eighty-five milliseconds until the next boundary lands. It is
+the same fault the long gap had, in the one shape the anchor cannot take: placing the anchor a
+period back from the first transfer would date it before the pair the host already holds.
+
+What it costs is visible in the write head. Measured mid-song at 192000, the host wrote 224
+frames a cycle while its sample time advanced 64000 every 27 ms, about twelve times real time,
+until it caught up and snapped back to a steady margin. Audible as noise, and as half a second
+repeating where the write head laps the read point on the way past.
+
+**So the period cannot simply be made longer, which is the obvious fix for the table above.**
+Scaling it with the rate -- 65536 at 192000, 131072 at 352800, holding 340 ms at every rate --
+was tried and made this worse in exact proportion: an eighteen times rate error lasting 371 ms,
+with laps in the tens of thousands where the fixed period had tens. More headroom for the
+over-run, and a bigger lie to open with. The two want opposite things, and the lie is the one
+that is heard, so the period stays at 16384 until the short gap resumes honestly.
+
 **One thing tried that is not it, and is worth not trying again.** Anchoring the read point to
 the host's first write shifts the read point without shifting `SetOutputLatency`, which makes
 the true latency `read_lag` minus the shift and therefore negative -- audio ahead of the
@@ -490,7 +510,7 @@ sent this work down a wrong path more than once.
 | `DsdAudioDriver/DsdUac2.{h,cpp}` | UAC2 descriptor parsing and the format list. No DriverKit. |
 | `DsdAudioDriver/DsdAudioDriver.iig` | The driver class, as iig reads it. |
 | `DsdAudioDriver/DsdAudioDriver.cpp` | Matching, the audio objects, and the isochronous engine. |
-| `DsdAudioDriver/DsdAudioDevice.{iig,cpp}` | The device, subclassed to publish the geometry on a configuration change. |
+| `DsdAudioDriver/DsdAudioDevice.{iig,cpp}` | The device, subclassed to publish geometry on a config change. |
 | `DsdAudioDriver/Info.plist` | The matching personality. |
 | `DsdAudioDriver/DsdAudioDriver.entitlements` | What Apple has to grant. |
 | `tests/test_dsd_uac2.cpp` | Host tests for the parser. |
