@@ -697,6 +697,17 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                     in_operation, in_frame_size, in_sample_time, state->sample_counter, read_at,
                     static_cast<int64_t>(in_sample_time - read_at));
             }
+            // The opening ramp, cycle by cycle. What is wanted is where the starvation sits:
+            // one block at the head while the host finds its feet, or scattered through the
+            // session. The margin against the running silence count says which, and the host's
+            // own sample times say how fast it is ramping.
+            if (state->io_calls <= 15 && in_operation == IOUserAudioIOOperationWriteEnd) {
+                Log("ramp cycle %llu: host wrote %u frames at %llu, engine reads at %llu, "
+                    "margin %lld, silence so far %llu",
+                    state->io_calls, in_frame_size, in_sample_time, read_at,
+                    static_cast<int64_t>(in_sample_time) - static_cast<int64_t>(read_at),
+                    state->starved);
+            }
             if (state->io_calls % 250 == 0 && in_operation == IOUserAudioIOOperationWriteEnd) {
                 Log("host wrote %u frames at sample %llu (ring slot %llu); engine reads at "
                     "sample %llu (slot %llu), so the host leads it by %lld",
