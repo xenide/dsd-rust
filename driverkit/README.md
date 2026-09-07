@@ -174,15 +174,16 @@ counts how long that lasted.
 repeat is heard as the pitch dropping back, a read point move as the pitch stepping. Twenty
 seconds from 300 Hz to 1200 Hz at low amplitude is enough.
 
-## What is left: the cold open
+## The cold open
 
-Opening a stream on an engine that was not already running costs about a third of a second of
-real audio. It is heard as the audio starting while the video spins, and then the video running
-fast to catch up. Under `usbaudiod` the same clip on the same DAC does the opposite -- the video
-starts and the audio arrives late -- so this is not simply the client's own start-up.
+Opening a stream on an engine that was not already running cost about a third of a second of
+real audio. It was heard as the audio starting while the video spins, and then the video
+running fast to catch up. Under `usbaudiod` the same clip on the same DAC does the opposite --
+the video starts and the audio arrives late -- so it was never simply the client's own
+start-up.
 
-**What it is.** Chrome's audio thread stalls once, shortly after the stream opens. Traced cycle
-by cycle at 192000, twelve cycles arrive dead on real time and then one does not:
+**What it looked like.** Chrome's audio thread stalled once, shortly after the stream opened.
+Traced cycle by cycle at 192000, twelve cycles arrive dead on real time and then one does not:
 
 ```
 ramp cycle 12: host wrote 4096 frames at 6721556, margin 6419, silence so far 4608   (25.402)
@@ -195,37 +196,82 @@ is the whole session's starvation: 4608 before it, 63218 after, nothing afterwar
 clock has advanced through a third of a second that never contained audio, and the video
 pipeline follows that clock.
 
-**What is already ruled out.** The ring geometry is not involved: the session ran 0 crossings and
-0 laps with the margin steady between 5908 and 7853. Pacing is not involved either -- cycles 1
-through 12 are exactly one 4096 frame buffer every 21.5 ms.
+**What it was not.** The ring geometry is not involved: the session ran 0 crossings and 0 laps
+with the margin steady between 5908 and 7853. Pacing is not involved either -- cycles 1 through
+12 are exactly one 4096 frame buffer every 21.5 ms. And buffering could not have absorbed it.
+The cushion against a stall is `read_lag` and nothing else: starvation begins `margin / rate`
+after the host stops, which is 6400/192000, about 33 ms. Riding out 358 ms needs 358 ms of
+`read_lag` -- and `read_lag` is what `SetOutputLatency` reports, so that is 358 ms of output
+latency, far more than `usbaudiod` reports at this rate. It is not reachable in any case: the
+ring is one zero timestamp period because the host wraps there whatever the buffer's length,
+and the period cannot grow to suit 192000 without breaking 44100, where 32768 was already
+measured making the host limp at a tenth of rate for a second and a half. Growing the ring
+alone moves the lap threshold and not the cushion.
 
-**Buffering cannot fix it, and that is worth knowing before trying.** The cushion against a stall
-is `read_lag` and nothing else: starvation begins `margin / rate` after the host stops, which is
-6400/192000, about 33 ms. Riding out 358 ms needs 358 ms of `read_lag` -- and `read_lag` is what
-`SetOutputLatency` reports, so that is 358 ms of output latency, far more than `usbaudiod`
-reports at this rate. It is not reachable in any case: the ring is one zero timestamp period
-because the host wraps there whatever the buffer's length, and the period cannot grow to suit
-192000 without breaking 44100, where 32768 was already measured making the host limp at a tenth
-of rate for a second and a half. Growing the ring alone moves the lap threshold and not the
-cushion.
+**What it was: a timeline with a hole in it.** `StopIsoc` leaves the last pair the engine
+posted as the newest thing the host holds, and `StartIsoc` used to resume one period on from
+it. That put the engine where the host writes, which is right, and it also handed Core Audio an
+interval of one period spanning however long the engine had been down. Read as a clock, that is
+a device running at a tiny fraction of rate -- 16384 frames in five minutes -- and a host
+scheduling its next cycle from it sleeps far too long. It sleeps once, wakes, sees how far
+behind it is, and writes a double buffer to catch up. That is the whole signature: one stall,
+then a session with nothing else wrong with it. It is also the fault the engine outliving its
+client was working around from the other end, where the same thing reads as "about a second in
+which Core Audio has not found its rate".
 
-**So the direction is the timeline, not the buffer.** What goes wrong is that the timeline
-advances through the stall, so the host resumes further along and the content in between is
-lost rather than delayed. `usbaudiod` ends up with the audio late, which is the same stall
-costing latency instead of content.
+**So the timeline runs on through the gap.** The DAC's crystal never stopped; only the driver's
+counter did. `StartIsoc` works out where that clock would have reached -- elapsed host time
+since the last pair, at the rate about to be streamed -- and resumes on the period boundary
+nearest it, posting that boundary against the host time the clock passes it, before IO starts.
+Core Audio then reads one continuous timeline at one rate across the gap, and has nothing to
+walk back from. What the boundary quantisation costs is spread over the whole gap: half a
+period of samples against minutes of it.
 
-**Three things that were tried and are not it.** Resuming a period on from the last posted zero
-timestamp: fitted to Chrome, which opened 23048 frames ahead, but afplay opens on the other side
-and the same change put it 21232 frames the wrong way. Anchoring the read point to the host's
-first write: shifts the read point without shifting `SetOutputLatency`, which makes the true
-latency `read_lag` minus the shift and therefore negative -- audio ahead of the timeline, which
-is the fault it was meant to remove. Growing the ring: see above.
+The anchor is posted exactly one period before the first transfer goes out, which is what stops
+where the host opens depending on the client. Whether the host projects to the boundary after
+the newest pair or extrapolates forward from its host time, both land on the sample the engine
+starts at. Fitting a constant offset is what could not be made to do that: one period on suited
+Chrome, which opened 23048 frames ahead, and put afplay 21232 frames the other way.
 
-**A warm open does not pay it.** Measured on the same clip minutes apart, `client starts on the
-engine already streaming` cost 15361 frames of silence against 63218 for a cold one. That is
-what keeping the engine alive between clients buys, and why the idle teardown is set to fifteen
-minutes rather than ten seconds: it keeps ordinary listening on the warm path while the cold
-open is unfixed.
+Turning the gap into sample frames needs the host clock's tick rate, so the engine measures it
+over the length of each stream and keeps it. Nothing in a stream needs it; by the time a start
+does, there is no stream left to measure it from. Before the first one there is no measurement
+and no pair, and the resume falls back to a period on from whatever `GetCurrentZeroTimestamp`
+reports, which is zero.
+
+**Measured, on the same DAC at 192000 with the teardown at ten seconds.** Two cold opens, one
+after 21 seconds down and one after 10:
+
+```
+engine was down 246 periods of the DAC's clock: anchored at 9093120 (host time 154754874456),
+                                                last pair was 5062656 (host time 154251275208)
+client stops: 0 cycles the engine had overtaken the host, 0 cycles the host had lapped the
+              read point, 4608 frames sent as silence
+```
+
+4608 frames is the pre-roll before the host's first write, and it is the cheapest open in the
+log, warm ones included. The same binary before the change, at the same teardown, cost 63218,
+148228 and 181518 for its three cold opens against 4608 to 15361 for the warm ones, and took
+770 ms to reach the host's first write where this takes 36.
+
+That first line is also the arithmetic: 4030464 frames of timeline over 503599248 host ticks is
+23.99 MHz, which is the mach timebase. Posting a period across that same gap instead claimed
+780 Hz on a device running at 192000, and sleeping off a rate 246 times slow is what the stall
+was. The second open shows what the quantisation costs: 0.4% of rate over a 10.5 second gap,
+which is half a period spread across the whole of it.
+
+`engine was down N periods of the DAC's clock` says the resume ran; `resuming a period on from`
+says it fell back.
+
+**One thing tried that is not it, and is worth not trying again.** Anchoring the read point to
+the host's first write shifts the read point without shifting `SetOutputLatency`, which makes
+the true latency `read_lag` minus the shift and therefore negative -- audio ahead of the
+timeline, which is the fault it was meant to remove.
+
+**A warm open never paid this**, which is what the engine outliving its client was for, and it
+is also why the idle teardown was fifteen minutes for a while: the window had become a way of
+avoiding a cold open rather than a judgement about what idle streaming is worth. It is back to
+ten seconds now that the two cost the same.
 
 ## The feedback endpoint, and three ways to lose a servo
 

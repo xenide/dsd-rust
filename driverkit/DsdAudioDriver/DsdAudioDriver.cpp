@@ -42,12 +42,12 @@ constexpr uint64_t kTransferMs = kMicroframesPerTransfer / kMicroframesPerFrame;
 /// to. So the interface goes back to its zero bandwidth setting, which is what that setting
 /// is for, and the client after the window pays a cold open instead.
 ///
-/// Fifteen minutes, not the ten seconds this started at, because a cold open still costs
-/// real audio -- see "What is left: the cold open" in README.md. Ten seconds put that cost
-/// in front of ordinary listening, which is what it was measured doing. This keeps the
-/// saving for a DAC left connected and idle, and keeps normal use on the warm path, without
-/// pretending the cold open is fixed.
-constexpr uint64_t kIdleTeardownMs = 900000;
+/// Ten seconds, which is far longer than the gap between two tracks. It was raised to
+/// fifteen minutes for a while because a cold open cost a third of a second of real audio,
+/// and that made the window a way of avoiding one rather than a judgement about what idle
+/// streaming is worth. A cold open costs the same as a warm one now -- see "The cold open"
+/// in README.md -- so the window is back to answering only its own question.
+constexpr uint64_t kIdleTeardownMs = 10000;
 constexpr uint64_t kIdleTeardownCompletions = kIdleTeardownMs / kTransferMs;
 
 /// Sample frames between the timestamps the host reads to build its timeline, which is also
@@ -93,6 +93,12 @@ constexpr uint32_t kFeedbackBytes = 4;
 /// A reported rate this far from nominal is a decoding error, not a clock, and is ignored.
 constexpr double kMinFeedbackRatio = 0.95;
 constexpr double kMaxFeedbackRatio = 1.05;
+
+/// A measured host clock outside this band is not a clock, and the timeline is resumed the
+/// blind way instead. The mach timebase is 24 MHz on Apple silicon and nanoseconds elsewhere;
+/// what the band is really guarding is the divide that turns a gap into sample frames.
+constexpr double kMinHostTicksPerSecond = 1.0e6;
+constexpr double kMaxHostTicksPerSecond = 1.0e10;
 
 /// DSD silence is alternating bits, not zero: a DAC fed zeroes leaves DSD lock and pops.
 constexpr uint8_t kDsdSilenceByte = 0x69;
@@ -175,6 +181,16 @@ struct DsdAudioDriver_IVars {
     /// the current one can be interpolated.
     uint64_t prev_sample;
     uint64_t prev_host;
+    /// The first pair this stream posted, so the host clock is measured over the whole
+    /// stream rather than over one transfer.
+    uint64_t session_sample;
+    uint64_t session_host;
+    /// Host clock ticks a second, measured from the engine's own timestamps.
+    ///
+    /// This is the machine's clock, not the DAC's, so it outlives a stream and is not reset
+    /// with one: the next start needs it to turn the time the engine was down into sample
+    /// frames, and by then there is nothing streaming to measure it from.
+    double host_ticks_per_second;
     /// How far behind the submission point the ring is read. Two in-flight windows.
     ///
     /// This is the whole geometry, and it is fixed. The timeline maps a sample index to the
@@ -832,6 +848,80 @@ kern_return_t AllocateTransfers(DsdAudioDriver* driver, DsdAudioDriver_IVars* iv
     return driver->CreateActionIsochComplete(0, &ivars->feedback.completion);
 }
 
+/// Where the timeline picks up, and the pair the host should pick it up from.
+///
+/// Core Audio's sample time carries across an IO stop and start, and its counter follows the
+/// timeline the driver posts rather than restarting alongside it: the sample time the host
+/// writes at on the first cycle of a track is the number of frames the track before it
+/// played. Zeroing the counter here anchors the two to different timelines, so the ring is
+/// read nowhere near where the host writes.
+///
+/// The pair the host is still holding is the last one the engine posted, which is as old as
+/// the engine has been down. Resuming a period on from it puts the engine where the host
+/// projects to and writes, and that much is right -- but it also hands Core Audio an
+/// interval of one period spanning that whole gap, which reads back as a clock running at a
+/// tiny fraction of rate. That is the cold open: the host runs at rate for a few periods,
+/// then sleeps off the bad rate in one long stall, and the timeline advances through the
+/// stall while the audio that belonged there is never written.
+///
+/// So the timeline resumes where the DAC's clock would have reached, rather than where it
+/// was left. The DAC's crystal never stopped; only the driver's counter did. Posting a
+/// boundary that far on, at the time the clock passes it, makes both intervals around it
+/// honest: the gap the host has been holding reads back at the DAC's rate, and the pair the
+/// first completion seeds is exactly one period further on again.
+///
+/// The anchor is placed exactly one period before the first transfer goes out, which is what
+/// stops where the host opens depending on the client. Whether it projects to the boundary
+/// after the newest pair or extrapolates forward from that pair's host time, both land on the
+/// sample the engine starts at. A constant offset could not do that: one period on suited
+/// Chrome, which opened 23048 frames ahead, and put afplay 21232 frames the other way. What
+/// the boundary quantisation costs is spread over the whole gap instead: half a period of
+/// samples against minutes of it.
+///
+/// Before the first stream there is no pair and no measured clock, and the fallback is what
+/// this replaced -- a period on from whatever `GetCurrentZeroTimestamp` reports, which is
+/// zero on the first stream and starts the host from zero with it.
+uint64_t ResumeTimeline(DsdAudioDriver_IVars* ivars, uint32_t rate, uint64_t now_host) {
+    uint64_t stale_sample = 0;
+    uint64_t stale_host = 0;
+    ivars->device->GetCurrentZeroTimestamp(&stale_sample, &stale_host);
+    if (stale_sample == 0) {
+        return 0;
+    }
+    if (ivars->host_ticks_per_second < kMinHostTicksPerSecond ||
+        ivars->host_ticks_per_second > kMaxHostTicksPerSecond || stale_host == 0) {
+        Log("resuming a period on from %llu: no host clock measured yet", stale_sample);
+        return stale_sample + kZeroTimestampPeriod;
+    }
+    const double ticks_per_frame = ivars->host_ticks_per_second / static_cast<double>(rate);
+    const uint64_t period_ticks =
+        static_cast<uint64_t>(static_cast<double>(kZeroTimestampPeriod) * ticks_per_frame);
+    // The bus timestamp the first transfer will carry: it goes out kStartLead bus frames on
+    // from the one GetFrameNumber just read, and a bus frame is a millisecond.
+    const uint64_t first_host =
+        now_host +
+        static_cast<uint64_t>(static_cast<double>(kStartLead) * ivars->host_ticks_per_second /
+                              1000.0);
+    // The anchor sits one period back, so a gap shorter than that has nowhere to put it, and
+    // a gap the two clocks disagree about the direction of is not one this can measure. Both
+    // fall back on where the last pair was, which for a format change -- the short gap this
+    // catches -- is where the engine was streaming a moment ago anyway.
+    if (first_host <= stale_host + period_ticks) {
+        Log("resuming a period on from %llu: the gap is under a period", stale_sample);
+        return stale_sample + kZeroTimestampPeriod;
+    }
+    const uint64_t anchor_host = first_host - period_ticks;
+    const double gap_frames = static_cast<double>(anchor_host - stale_host) / ticks_per_frame;
+    const uint64_t periods =
+        static_cast<uint64_t>(gap_frames / static_cast<double>(kZeroTimestampPeriod) + 0.5);
+    const uint64_t anchor = stale_sample + periods * kZeroTimestampPeriod;
+    ivars->device->UpdateCurrentZeroTimestamp(anchor, anchor_host);
+    Log("engine was down %llu periods of the DAC's clock: anchored at %llu (host time %llu), "
+        "last pair was %llu (host time %llu)",
+        periods, anchor, anchor_host, stale_sample, stale_host);
+    return anchor + kZeroTimestampPeriod;
+}
+
 }  // namespace
 
 kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
@@ -1025,43 +1115,10 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
         ivars->feedback_entries = 1;
     }
     ivars->carry = 0.0;
-    // Pick the timeline up where it was left, rather than starting it again at zero.
-    //
-    // Core Audio's sample time carries across an IO stop and start, and its counter follows
-    // the timeline the driver posts rather than restarting alongside it: the sample time the
-    // host writes at on the first cycle of a track is the number of frames the track before
-    // it played. Zeroing the counter here anchors the two to different timelines, so the ring
-    // is read nowhere near where the host writes, and the HAL then walks the difference off at
-    // a few thousand frames a second -- crossing the write point, and taking the audio with
-    // it, every few seconds for the minute or more that takes.
-    //
-    // One period on from the last timestamp posted, not the last one itself.
-    //
-    // `GetCurrentZeroTimestamp` reports the newest pair the driver handed over, which is the
-    // boundary already gone by. The host does not sit there: the device promised a timestamp
-    // every period, so the host projects to the next boundary and writes a little past it.
-    // Resuming on the stale one therefore starts the engine exactly one period -- one whole
-    // ring -- behind where the host is writing, and the stream opens past the lap threshold
-    // and stays there. Measured across three sessions the host led the engine by 16904, 16900
-    // and 16900 against a period of 16384: one period, plus the 130 to 660 frames Core Audio
-    // writes ahead of any timeline. Constant, and not a function of how long the engine was
-    // down, which is what says it is a boundary off by one rather than drift.
-    //
-    // Only when there is a timeline to resume. Before the first stream this reads back zero,
-    // and the host starts from zero with it; adding a period there would start the engine
-    // ahead of the host instead, which is the same fault mirrored.
-    uint64_t resumed_sample = 0;
-    uint64_t resumed_host = 0;
-    ivars->device->GetCurrentZeroTimestamp(&resumed_sample, &resumed_host);
-    if (resumed_sample != 0) {
-        resumed_sample += kZeroTimestampPeriod;
-    }
-    Log("resuming the timeline at %llu, engine last reached %llu", resumed_sample,
-        ivars->sample_counter);
-    ivars->sample_counter = resumed_sample;
-    ivars->next_timestamp_at = resumed_sample + kZeroTimestampPeriod;
     ivars->prev_sample = 0;
     ivars->prev_host = 0;
+    ivars->session_sample = 0;
+    ivars->session_host = 0;
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->crossings = 0;
@@ -1093,6 +1150,11 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
         return result;
     }
     ivars->next_bus_frame = bus_frame + kStartLead;
+    // After the frame number, because where the timeline picks up depends on when the first
+    // transfer goes out, and before the first transfer is filled, because that reads it.
+    const uint64_t resumed_sample = ResumeTimeline(ivars, rate, when);
+    ivars->sample_counter = resumed_sample;
+    ivars->next_timestamp_at = resumed_sample + kZeroTimestampPeriod;
 
     for (uint32_t index = 0; index < kTransfersInFlight; index++) {
         result = SubmitTransfer(index);
@@ -1109,7 +1171,7 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     }
     Log("streaming %u Hz on alt %u: ring %llu frames of %u bytes, timeline resumes at %llu, "
         "feedback endpoint 0x%02x pipe %{public}s, interval %u payload %u, %u entries",
-        rate, alt_setting, ivars->ring_frames, ivars->frame_bytes, ivars->sample_counter,
+        rate, alt_setting, ivars->ring_frames, ivars->frame_bytes, resumed_sample,
         alt->feedback_endpoint, ivars->feedback_pipe != nullptr ? "open" : "none",
         static_cast<unsigned>(alt->feedback_interval), alt->feedback_max_packet,
         ivars->feedback_entries);
@@ -1474,6 +1536,8 @@ void IMPL(DsdAudioDriver, IsochComplete) {
         // the bus time it actually went out on -- roughly fourteen milliseconds in.
         if (ivars->prev_host == 0 && ivars->device) {
             ivars->device->UpdateCurrentZeroTimestamp(sample, host);
+            ivars->session_sample = sample;
+            ivars->session_host = host;
             Log("seeded the timeline at sample %llu, host time %llu", sample, host);
         }
         if (ivars->prev_host != 0 && sample > ivars->prev_sample && ivars->device) {
@@ -1492,6 +1556,16 @@ void IMPL(DsdAudioDriver, IsochComplete) {
                 }
                 ivars->timestamps_posted++;
                 ivars->next_timestamp_at += kZeroTimestampPeriod;
+            }
+            // How fast the host clock runs, over this stream's whole length rather than over
+            // one transfer. Nothing in the stream needs it -- the next start does, to work
+            // out how far the DAC's clock ran on while the engine was down, and by then
+            // there is no stream left to measure it from.
+            if (sample > ivars->session_sample) {
+                ivars->host_ticks_per_second =
+                    static_cast<double>(host - ivars->session_host) *
+                    static_cast<double>(ivars->active_rate) /
+                    static_cast<double>(sample - ivars->session_sample);
             }
         }
         ivars->prev_sample = sample;
