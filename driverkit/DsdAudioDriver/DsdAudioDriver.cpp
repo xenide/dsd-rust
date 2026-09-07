@@ -4,6 +4,8 @@
 
 #include <DsdAudioDriver/DsdAudioDriver.h>
 
+#include <DsdAudioDriver/DsdAudioDevice.h>
+
 #include <AudioDriverKit/AudioDriverKit.h>
 #include <DriverKit/DriverKit.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
@@ -422,6 +424,28 @@ bool DsdAudioDriver::init() {
     return ivars != nullptr;
 }
 
+/// The read lag, and the two numbers that describe it to the host.
+///
+/// The read lag is two in-flight windows: one is the read-ahead a transfer needs, the other
+/// is margin, and `SetOutputLatency` reports the pair because that is exactly how far behind
+/// the timeline a sample is heard.
+void DsdAudioDriver::PublishGeometry(uint32_t rate) {
+    if (!ivars->device || rate == 0) {
+        return;
+    }
+    const uint32_t window_frames =
+        static_cast<uint32_t>(kTransfersInFlight * kMicroframesPerTransfer * rate / 8000.0);
+    const uint64_t read_lag = static_cast<uint64_t>(window_frames) * 2;
+    if (ivars->read_lag == read_lag) {
+        return;
+    }
+    ivars->read_lag = read_lag;
+    ivars->device->SetOutputSafetyOffset(window_frames);
+    ivars->device->SetOutputLatency(static_cast<uint32_t>(read_lag));
+    Log("geometry for %u Hz: in-flight window %u frames, latency %llu frames", rate,
+        window_frames, read_lag);
+}
+
 void DsdAudioDriver::free() {
     if (ivars != nullptr) {
         ivars->device.reset();
@@ -597,12 +621,19 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
     OSSharedPtr<OSString> manufacturer =
         OSSharedPtr(OSString::withCString("dsd-rust"), OSNoRetain);
 
-    ivars->device = IOUserAudioDevice::Create(this, false, device_uid.get(), model_uid.get(),
-                                              manufacturer.get(), kZeroTimestampPeriod);
-    if (!ivars->device) {
-        Log("IOUserAudioDevice::Create failed");
+    DsdAudioDevice* device = OSTypeAlloc(DsdAudioDevice);
+    if (device == nullptr) {
+        Log("DsdAudioDevice allocation failed");
         return kIOReturnNoMemory;
     }
+    if (!device->init(this, false, device_uid.get(), model_uid.get(), manufacturer.get(),
+                      kZeroTimestampPeriod)) {
+        Log("DsdAudioDevice::init failed");
+        OSSafeReleaseNULL(device);
+        return kIOReturnNoMemory;
+    }
+    device->SetOwner(this);
+    ivars->device.reset(device, OSNoRetain);
     OSSharedPtr<OSString> device_name = OSSharedPtr(OSString::withCString(name), OSNoRetain);
     ivars->device->SetName(device_name.get());
     ivars->device->SetTransportType(IOUserAudioTransportType::USB);
@@ -981,28 +1012,13 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
             ivars->active_rate, ivars->active_alt);
         return super::StartDevice(in_object_id, in_flags);
     }
-    // The driver reads the ring up to a whole in-flight window ahead of what the DAC is
-    // playing, because that much audio is already handed to the controller. The host writes
-    // relative to the timeline the zero timestamps describe, so unless it is told to stay
-    // that far ahead it writes behind the read point and the DAC gets an empty ring.
-    // Twice the in-flight window, not once. At exactly one window the host's writes land
-    // level with the read point and every transfer picks up whatever was there before, so
-    // the margin has to cover the whole window again plus the host's own IO buffer.
-    const uint32_t window_frames = static_cast<uint32_t>(
-        kTransfersInFlight * kMicroframesPerTransfer * entry->sample_rate / 8000.0);
-    ivars->read_lag = static_cast<uint64_t>(window_frames) * 2;
-    // The latency is the read lag and nothing else. The timeline maps a sample index to the
-    // time that index goes out on the wire, so the in-flight window a transfer spends on the
-    // controller is already inside it and adding it again would report it twice. The host's
-    // sample X is carried by the transfer starting at X plus the lag, so it is heard that
-    // much after the timeline's own time for X. Video sync is what this number is for, and
-    // it is now a constant the driver can state rather than a consequence of where the host
-    // happened to be writing when the read point was last set.
-    ivars->device->SetOutputSafetyOffset(window_frames);
-    ivars->device->SetOutputLatency(static_cast<uint32_t>(ivars->read_lag));
-    Log("host asked for %.0f Hz %{public}s, alternate setting %u, in-flight window %u frames",
+    // The backstop, for a start no configuration change preceded. A client that changed rate
+    // has already read these when it opened, so publishing them here alone is too late --
+    // which is what `PerformDeviceConfigurationChange` is now for.
+    PublishGeometry(static_cast<uint32_t>(entry->sample_rate));
+    Log("host asked for %.0f Hz %{public}s, alternate setting %u, read lag %llu frames",
         entry->sample_rate, entry->native_dsd ? "native DSD" : "PCM", entry->alt_setting,
-        window_frames);
+        ivars->read_lag);
     // A different format than the engine is on, so it does have to be restarted.
     StopIsoc();
     const kern_return_t result = StartIsoc(static_cast<uint32_t>(entry->sample_rate),

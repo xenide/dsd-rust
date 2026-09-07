@@ -1,0 +1,42 @@
+//
+//  DsdAudioDevice.iig
+//
+
+#ifndef DsdAudioDevice_h
+#define DsdAudioDevice_h
+
+#include <AudioDriverKit/IOUserAudioDevice.iig>
+
+class DsdAudioDriver;
+
+/// The published Core Audio device, subclassed for one reason.
+///
+/// The output latency and safety offset both scale with the rate, and a client reads them
+/// when it opens the device -- which is before `StartDevice`, where the driver used to set
+/// them. So a client that changed rate positioned its writes by the rate it had left, and
+/// kept doing so for the life of its stream: after 384000 a 192000 stream ran with the write
+/// head 6144 frames further ahead than the geometry allows, which on a ring of 16384 is past
+/// the point where the host overwrites the slot the engine is about to read.
+///
+/// A configuration change is where state that affects IO is supposed to be published: the
+/// host has stopped IO, and it re-reads the device when the call returns. That is early
+/// enough for a client opening at the new rate to see the geometry it is opening into.
+class LOCALONLY DsdAudioDevice: public IOUserAudioDevice
+{
+public:
+    virtual bool init(IOUserAudioDriver* in_driver, bool in_supports_prewarming,
+                      OSString* in_device_uid, OSString* in_model_uid,
+                      OSString* in_manufacturer_uid,
+                      uint32_t in_zero_timestamp_period) override;
+    virtual void free() override;
+
+    virtual kern_return_t PerformDeviceConfigurationChange(uint64_t in_change_action,
+                                                           OSObject* in_change_info) override;
+    virtual kern_return_t HandleChangeSampleRate(double in_sample_rate) override;
+
+    /// The driver that owns this device, so a change can ask it to republish the geometry.
+    /// Not retained: the driver outlives the device it created.
+    void SetOwner(DsdAudioDriver* in_owner);
+};
+
+#endif /* DsdAudioDevice_h */

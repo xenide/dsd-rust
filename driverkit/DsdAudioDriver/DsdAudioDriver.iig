@@ -45,6 +45,13 @@ public:
     /// interface descriptors and the clock reported.
     kern_return_t PublishAudioObjects() LOCALONLY;
 
+    /// Publish the latency and safety offset a rate implies, and keep the read lag with them.
+    ///
+    /// One place computes the geometry, and everything that changes the rate calls it: the
+    /// configuration change, which is early enough for a client to read, and `StartDevice`,
+    /// which is the backstop for a start that no configuration change preceded.
+    void PublishGeometry(uint32_t rate) LOCALONLY;
+
     /// Select the alternate setting the format needs, set the clock, and fill the pipe.
     kern_return_t StartIsoc(uint32_t rate, uint8_t alt_setting, uint32_t frame_bytes) LOCALONLY;
 

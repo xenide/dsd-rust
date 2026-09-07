@@ -273,6 +273,42 @@ is also why the idle teardown was fifteen minutes for a while: the window had be
 avoiding a cold open rather than a judgement about what idle streaming is worth. It is back to
 ten seconds now that the two cost the same.
 
+## Geometry is published on a configuration change, not at IO start
+
+The output latency and safety offset both scale with the rate -- the read lag is two in-flight
+windows, and a window is a fixed number of microframes -- and the driver set them in
+`StartDevice`. That is too late. A client reads them when it opens the device, which is before
+IO starts, so a client that changed rate laid out its writes by the rate it had just left and
+kept doing so for the life of its stream.
+
+The pair that says so is half a second apart, same rate, same 512 frame host buffer, differing
+only in what played before:
+
+```
+96000 after 352800   read lag 3072   margin 9896   382 laps
+96000 after 96000    read lag 3072   margin 3740     0 laps
+```
+
+A margin wider than the ring less the host's buffer means the host overwrites the slot the
+engine is about to read, so what comes out is audio from a period further on. It is not heard
+as a glitch, which is why `laps` is counted: 384000 followed by 192000 ran at a margin of 13700
+against a threshold of 12288 for minutes, through two engine teardowns, because nothing re-reads
+the property once a stream is open.
+
+`DsdAudioDevice` exists for this. It overrides `PerformDeviceConfigurationChange` and
+`HandleChangeSampleRate` and republishes the geometry from there, which is where state that
+affects IO is supposed to be published: the host has stopped IO, and it re-reads the device when
+the call returns. `StartDevice` still calls the same `PublishGeometry`, as the backstop for a
+start no configuration change preceded, and it is a no-op when the numbers have not moved.
+
+**384000 is a separate problem and is not fixed.** The read lag there is 12288 on a ring of
+16384, so with a 4096 frame host buffer the lap threshold -- the ring less the buffer -- is
+12288, which the read lag reaches before the host has written anything. The ring is one zero
+timestamp period, and the period was sized for 352800, where 11289 plus 4096 leaves about a
+thousand frames spare. Making 384000 fit means a longer period, which was rejected when 32768
+made the host limp for a second and a half at 44100 -- a limp that was Core Audio failing to
+find its rate, which is what "The cold open" above addresses, so it is worth measuring again.
+
 ## The feedback endpoint, and three ways to lose a servo
 
 An asynchronous endpoint runs on the DAC's clock rather than the host's and says, once per
@@ -454,6 +490,7 @@ sent this work down a wrong path more than once.
 | `DsdAudioDriver/DsdUac2.{h,cpp}` | UAC2 descriptor parsing and the format list. No DriverKit. |
 | `DsdAudioDriver/DsdAudioDriver.iig` | The driver class, as iig reads it. |
 | `DsdAudioDriver/DsdAudioDriver.cpp` | Matching, the audio objects, and the isochronous engine. |
+| `DsdAudioDriver/DsdAudioDevice.{iig,cpp}` | The device, subclassed to publish the geometry on a configuration change. |
 | `DsdAudioDriver/Info.plist` | The matching personality. |
 | `DsdAudioDriver/DsdAudioDriver.entitlements` | What Apple has to grant. |
 | `tests/test_dsd_uac2.cpp` | Host tests for the parser. |
@@ -622,6 +659,10 @@ sees them published.
 **Build for arm64e.** Dexts on Apple silicon are arm64e, not arm64. A plain arm64 binary
 stages and enables without complaint and then fails to launch with `Exec format error`, which
 reaches the log as a matching failure rather than a link one.
+
+**One class per `.iig`.** The dispatch glue iig generates includes `<framework>/<ClassName>.h`
+by name, so two classes in one def file fail to compile with a missing header rather than
+anything that names the cause. `build.sh` runs iig once per class, device before driver.
 
 **Two plist keys are load bearing.** `IOUserAudioDriverUserClientProperties` is what lets the
 Core Audio host open the driver's user client; without it the driver starts, publishes its

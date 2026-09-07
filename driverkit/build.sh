@@ -59,16 +59,20 @@ build_dext() {
   rm -rf "${bundle}"
   mkdir -p "${genhdr}" "${bundle}/Contents/MacOS"
 
-  # iig turns the .iig into the header the driver includes and the dispatch glue it needs.
-  "${toolchain}/iig" \
-    --def "${src}/DsdAudioDriver.iig" \
-    --header "${genhdr}/DsdAudioDriver.h" \
-    --impl "${gen}/DsdAudioDriver.iig.cpp" \
-    --deployment-target 21.0 \
-    --framework-name DsdAudioDriver \
-    -- -isysroot "${sdk}" -x c++ -std=gnu++17 -D__IIG=1 -DDRIVERKIT=1 \
-    -I"${gen}" -I"${src}" -I"${sdk}/System/DriverKit/usr/include" \
-    -F"${sdk}/System/DriverKit/System/Library/Frameworks"
+  # iig turns each .iig into the header the driver includes and the dispatch glue it needs.
+  # One class per def file: the generated glue includes <framework>/<ClassName>.h by name.
+  # The device before the driver, because the driver's def refers to it.
+  for class in DsdAudioDevice DsdAudioDriver; do
+    "${toolchain}/iig" \
+      --def "${src}/${class}.iig" \
+      --header "${genhdr}/${class}.h" \
+      --impl "${gen}/${class}.iig.cpp" \
+      --deployment-target 21.0 \
+      --framework-name DsdAudioDriver \
+      -- -isysroot "${sdk}" -x c++ -std=gnu++17 -D__IIG=1 -DDRIVERKIT=1 \
+      -I"${gen}" -I"${src}" -I"${sdk}/System/DriverKit/usr/include" \
+      -F"${sdk}/System/DriverKit/System/Library/Frameworks"
+  done
 
   local flags=(
     -isysroot "${sdk}"
@@ -80,7 +84,8 @@ build_dext() {
   )
   rm -rf "${build}/obj"
   mkdir -p "${build}/obj"
-  for source in "${src}/DsdAudioDriver.cpp" "${src}/DsdUac2.cpp" "${gen}/DsdAudioDriver.iig.cpp"; do
+  for source in "${src}/DsdAudioDriver.cpp" "${src}/DsdAudioDevice.cpp" "${src}/DsdUac2.cpp" \
+                "${gen}/DsdAudioDevice.iig.cpp" "${gen}/DsdAudioDriver.iig.cpp"; do
     "${toolchain}/clang++" "${flags[@]}" -c "${source}" \
       -o "${build}/obj/$(basename "${source}").o"
   done
