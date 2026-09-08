@@ -256,18 +256,28 @@ host skipped 268 frames at sample 24650152
 click interval exactly. Core Audio believes each pair, so its cycle steps to where the newest
 one says the timeline has reached, and the step is the hole.
 
-The cause is where the slope came from. A boundary's host time was interpolated on a rate read
-off the single transfer straddling it -- four milliseconds, endpoints carrying about a
-millisecond of jitter, so a rate a quarter out. What that costs is the jitter multiplied by how
-far the boundary sits from the completion before it: nothing when it lands on one, the better
-part of a millisecond when it lands a transfer away, and the beat between a 131072 frame period
-and a 1536 frame transfer walks it through that range on a four post cycle. The anchor was
-never the problem -- posts landing near a completion were within 120 ticks -- so the anchor
-stays this completion's own pair and only the slope now comes from the stream length
-measurement, where the same jitter is divided by seconds instead of by four milliseconds.
+**The slope is not what was wrong, and the same log says so.** A boundary's host time used to
+be interpolated on a rate read off the single transfer straddling it, which is four
+milliseconds and a plausible suspect. Taking the rate from the stream length measurement
+instead changed the pattern not at all: +20885, -20466, twice near exact, still one hole every
+four posts.
 
-It is the same mistake as the cold open, at a different scale: a rate read off too short a
-baseline, believed by a host that has no way to tell.
+**It is the anchor.** One long interval followed by one short one, with the pairs either side
+of them clean, is the signature of a single post landing late rather than of a rate being
+wrong: post N inherits its anchor's error, so interval N runs long by exactly what interval
+N+1 runs short by. About one completion in four comes back with a `frames[0].timeStamp` some
+875 microseconds from where the completions either side of it put the timeline. Nothing else
+about those transfers is unusual -- the counters, the margin and the feedback servo read clean
+straight through -- so it is the timestamp and not the transfer.
+
+A bus timestamp is therefore not something to anchor a timeline on directly. The line is
+carried forward at the rate the stream measures and nudged a sixteenth of the way toward each
+completion, so an 875 microsecond outlier lands as 55: a fifth of the shortest IO cycle any
+client here asks for, where before it was three of them. A real change is still followed within
+sixteen transfers, which is 64 milliseconds.
+
+It is the cold open's mistake in a third place: a clock read off one short observation, handed
+to a host that has no way to tell.
 
 The driver patches the hole as soon as the cycle that skipped it reports, which is a read lag
 before the engine reaches it, and `holes the host skipped over` counts them.

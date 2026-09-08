@@ -99,6 +99,21 @@ constexpr uint32_t kFeedbackBytes = 4;
 constexpr double kMinFeedbackRatio = 0.95;
 constexpr double kMaxFeedbackRatio = 1.05;
 
+/// How much of a completion's own timestamp goes into the timeline it anchors.
+///
+/// The bus timestamps are not steady enough to anchor on directly. One completion in four
+/// comes back about 875 microseconds from where the two either side of it put the timeline,
+/// and a boundary posted against that one moves Core Audio's cycle by 336 frames at 384000
+/// -- a hole in the ring and a click, every 1.365 seconds. Nothing is wrong with the
+/// transfers themselves: the counters, the margin and the feedback servo all read clean
+/// through it.
+///
+/// So the line is predicted forward at the rate the stream measures and only nudged a
+/// sixteenth of the way toward each completion. An outlier lands as 55 microseconds, which
+/// is a fifth of the shortest cycle any client here asks for, and a real change is followed
+/// within sixteen transfers, which is 64 milliseconds.
+constexpr double kTimelineGain = 1.0 / 16.0;
+
 /// A measured host clock outside this band is not a clock, and the timeline is resumed the
 /// blind way instead. The mach timebase is 24 MHz on Apple silicon and nanoseconds elsewhere;
 /// what the band is really guarding is the divide that turns a gap into sample frames.
@@ -304,6 +319,10 @@ struct DsdAudioDriver_IVars {
     uint32_t last_write_frames;
     /// Frames sent as silence because the host had not written that far yet.
     uint64_t starved;
+    /// The filtered timeline: where the driver believes `timeline_sample` went out, held
+    /// steady against the jitter on any one completion's timestamp.
+    uint64_t timeline_sample;
+    double timeline_host;
     /// The last pair posted, so the interval to the next one can be measured against the
     /// rate it is supposed to describe. Diagnostic only.
     uint64_t last_post_sample;
@@ -1337,6 +1356,8 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->session_host = 0;
     ivars->last_post_sample = 0;
     ivars->last_post_host = 0;
+    ivars->timeline_sample = 0;
+    ivars->timeline_host = 0.0;
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->crossings = 0;
@@ -1797,13 +1818,27 @@ void IMPL(DsdAudioDriver, IsochComplete) {
                                      ivars->active_rate != 0;
             const double per_sample =
                 clock_known ? ivars->host_ticks_per_second / ivars->active_rate : measured;
+            // Carry the timeline forward at that rate and take only a fraction of what this
+            // completion says about where it landed. What is posted below is anchored on the
+            // line rather than on the timestamp, which is what stops one bad stamp becoming
+            // one hole in the ring.
+            if (ivars->timeline_sample == 0 || sample <= ivars->timeline_sample) {
+                ivars->timeline_sample = sample;
+                ivars->timeline_host = static_cast<double>(host);
+            } else {
+                const double predicted =
+                    ivars->timeline_host +
+                    static_cast<double>(sample - ivars->timeline_sample) * per_sample;
+                ivars->timeline_host =
+                    predicted + (static_cast<double>(host) - predicted) * kTimelineGain;
+                ivars->timeline_sample = sample;
+            }
             while (ivars->next_timestamp_at <= sample &&
                    ivars->next_timestamp_at >= ivars->prev_sample) {
                 const uint64_t at = ivars->next_timestamp_at;
-                const uint64_t when =
-                    ivars->prev_host +
-                    static_cast<uint64_t>(static_cast<double>(at - ivars->prev_sample) *
-                                          per_sample);
+                const uint64_t when = static_cast<uint64_t>(
+                    ivars->timeline_host -
+                    static_cast<double>(ivars->timeline_sample - at) * per_sample);
                 ivars->device->UpdateCurrentZeroTimestamp(at, when);
                 // Every one of them, with what the interval since the last says the clock
                 // is doing. Three a second, and the question this is asked to settle is
