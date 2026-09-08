@@ -324,9 +324,14 @@ struct DsdAudioDriver_IVars {
     uint64_t timeline_sample;
     double timeline_host;
     /// The last pair posted, so the interval to the next one can be measured against the
-    /// rate it is supposed to describe. Diagnostic only.
+    /// rate it is supposed to describe, and the worst and total of those over the session.
+    /// This is the timeline's own steadiness, which nothing else here reports: every other
+    /// counter read clean through 875 microseconds of it.
     uint64_t last_post_sample;
     uint64_t last_post_host;
+    uint64_t posts;
+    uint64_t worst_post_ticks;
+    uint64_t post_ticks_off;
     /// Cycles where Core Audio's sample time stepped over frames it never wrote, and the
     /// frames in them. A client that misses its deadline leaves the hole rather than
     /// filling it, and what is in those slots is a ring wrap old.
@@ -1358,6 +1363,9 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->last_post_host = 0;
     ivars->timeline_sample = 0;
     ivars->timeline_host = 0.0;
+    ivars->posts = 0;
+    ivars->worst_post_ticks = 0;
+    ivars->post_ticks_off = 0;
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->crossings = 0;
@@ -1431,6 +1439,10 @@ void DsdAudioDriver::StopIsoc() {
                 "host had lapped the read point, %llu frames sent as silence, %llu holes the "
                 "host skipped over (%llu frames)",
                 ivars->crossings, ivars->laps, ivars->starved, ivars->skips, ivars->skipped);
+            Log("timeline over the session: %llu boundaries posted, worst %llu ticks off "
+                "nominal, mean %llu",
+                ivars->posts, ivars->worst_post_ticks,
+                ivars->posts != 0 ? ivars->post_ticks_off / ivars->posts : 0);
             Log("feedback over the session: %llu submits, %llu completions, %llu reports, "
                 "%llu misses, %llu re-arms",
                 ivars->feedback_submits, ivars->feedback_completions, ivars->feedback_reports,
@@ -1840,21 +1852,22 @@ void IMPL(DsdAudioDriver, IsochComplete) {
                     ivars->timeline_host -
                     static_cast<double>(ivars->timeline_sample - at) * per_sample);
                 ivars->device->UpdateCurrentZeroTimestamp(at, when);
-                // Every one of them, with what the interval since the last says the clock
-                // is doing. Three a second, and the question this is asked to settle is
-                // whether they are steady.
+                // How far this boundary landed from where the one before it said it would.
+                // Summarised rather than logged: three a second is more than os_log carries
+                // from here, and it is the worst of them that says whether the timeline is
+                // steady enough for a host to schedule against.
                 if (ivars->last_post_host != 0 && at > ivars->last_post_sample &&
-                    ivars->host_ticks_per_second > kMinHostTicksPerSecond) {
-                    const double ticks_per_frame =
-                        ivars->host_ticks_per_second / static_cast<double>(ivars->active_rate);
+                    when > ivars->last_post_host) {
                     const double expected =
-                        static_cast<double>(at - ivars->last_post_sample) * ticks_per_frame;
+                        static_cast<double>(at - ivars->last_post_sample) * per_sample;
                     const double actual = static_cast<double>(when - ivars->last_post_host);
-                    Log("posted %llu at %llu: %lld frames on, %lld ticks, %lld off nominal",
-                        at, when, at - ivars->last_post_sample,
-                        static_cast<int64_t>(actual), static_cast<int64_t>(actual - expected));
-                } else {
-                    Log("posted %llu at %llu: first of the session", at, when);
+                    const double off = actual > expected ? actual - expected : expected - actual;
+                    const uint64_t ticks = static_cast<uint64_t>(off);
+                    if (ticks > ivars->worst_post_ticks) {
+                        ivars->worst_post_ticks = ticks;
+                    }
+                    ivars->post_ticks_off += ticks;
+                    ivars->posts++;
                 }
                 ivars->last_post_sample = at;
                 ivars->last_post_host = when;

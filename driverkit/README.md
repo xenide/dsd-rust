@@ -279,6 +279,17 @@ sixteen transfers, which is 64 milliseconds.
 It is the cold open's mistake in a third place: a clock read off one short observation, handed
 to a host that has no way to tell.
 
+**Measured, same rate and same client either side of the change:**
+
+| | worst post, off nominal | holes |
+| --- | --- | --- |
+| anchored on the timestamp | 21000 ticks, 875 us | 51 in 72 s |
+| anchored on the line | 2910 ticks, 121 us | 1 in 72 s |
+
+`timeline over the session: N boundaries posted, worst T ticks off nominal, mean M` reports it
+per stream. Nothing else does: every other counter in this driver read clean through 875
+microseconds of it, which is why the click outlived three attempts at the ring.
+
 The driver patches the hole as soon as the cycle that skipped it reports, which is a read lag
 before the engine reaches it, and `holes the host skipped over` counts them.
 
