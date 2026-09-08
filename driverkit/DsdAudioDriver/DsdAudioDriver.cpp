@@ -149,6 +149,58 @@ void FillRing(uint8_t* ring, uint64_t ring_frames, uint64_t position, uint64_t f
     }
 }
 
+/// One little endian signed sample of `bytes` width, sign extended. A subslot wider than the
+/// bit resolution is aligned high, so the padding rides along in the low bits and costs
+/// nothing to carry through the arithmetic.
+int32_t ReadSample(const uint8_t* sample, uint32_t bytes) {
+    uint32_t raw = 0;
+    for (uint32_t index = 0; index < bytes; index++) {
+        raw |= static_cast<uint32_t>(sample[index]) << (8 * index);
+    }
+    const uint32_t bits = bytes * 8;
+    if (bits < 32 && (raw & (1u << (bits - 1))) != 0) {
+        raw |= ~((1u << bits) - 1u);
+    }
+    return static_cast<int32_t>(raw);
+}
+
+void WriteSample(uint8_t* sample, uint32_t bytes, int32_t value) {
+    const uint32_t raw = static_cast<uint32_t>(value);
+    for (uint32_t index = 0; index < bytes; index++) {
+        sample[index] = static_cast<uint8_t>((raw >> (8 * index)) & 0xffu);
+    }
+}
+
+/// Draw a straight line across `frames` frames of the ring at `position`, from the frame
+/// before them to the frame after, per channel.
+///
+/// Both ends are written frames, so what this replaces a hole with meets the audio either
+/// side of it at its own value. Silence does not: a hole filled with zeroes is two steps
+/// from full amplitude, which is the click it was meant to remove, and at a millisecond long
+/// it is heard exactly as loudly as the stale audio was.
+void BridgeRing(uint8_t* ring, uint64_t ring_frames, uint64_t position, uint64_t frames,
+                uint32_t frame_bytes, uint32_t sample_bytes) {
+    if (ring == nullptr || sample_bytes == 0 || frame_bytes < sample_bytes || frames == 0 ||
+        frames + 1 >= ring_frames) {
+        return;
+    }
+    const uint32_t channels = frame_bytes / sample_bytes;
+    const uint64_t before = (position + ring_frames - 1) % ring_frames;
+    const uint64_t after = (position + frames) % ring_frames;
+    const int64_t span = static_cast<int64_t>(frames) + 1;
+    for (uint32_t channel = 0; channel < channels; channel++) {
+        const uint32_t offset = channel * sample_bytes;
+        const int64_t from = ReadSample(ring + before * frame_bytes + offset, sample_bytes);
+        const int64_t to = ReadSample(ring + after * frame_bytes + offset, sample_bytes);
+        for (uint64_t index = 0; index < frames; index++) {
+            const uint64_t at = (position + index) % ring_frames;
+            const int64_t value = from + (to - from) * static_cast<int64_t>(index + 1) / span;
+            WriteSample(ring + at * frame_bytes + offset, sample_bytes,
+                        static_cast<int32_t>(value));
+        }
+    }
+}
+
 /// One isochronous transfer's data buffer and frame list.
 struct Transfer {
     IOBufferMemoryDescriptor* data;
@@ -257,6 +309,10 @@ struct DsdAudioDriver_IVars {
     /// filling it, and what is in those slots is a ring wrap old.
     uint64_t skips;
     uint64_t skipped;
+    /// One channel's subslot width, and whether the subslots carry PCM at all. A hole in a
+    /// raw carrier cannot be bridged, only silenced.
+    uint32_t sample_bytes;
+    bool raw_carrier;
     /// The byte this carrier calls silence: DSD silence is alternating bits, not zero.
     uint8_t silence_byte;
     /// IO operations the host has performed, so a sample of them can be logged.
@@ -807,9 +863,8 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                 // and what is there is a ring wrap old -- a full amplitude discontinuity at
                 // both ends of it. Measured with Chrome at 384000, where its 128 frame
                 // buffer is a third of a millisecond: a few hundred frames skipped about
-                // once a second, heard as a regular click. Silence is the honest thing to
-                // put there and is inaudible beside what it replaces. The read point is a
-                // read lag ahead of this, so there is time.
+                // once a second, heard as a regular click. The read point is a read lag
+                // ahead of this, so there is time to put something else there first.
                 const uint64_t written_to = state->last_write_sample + state->last_write_frames;
                 if (state->last_write_frames != 0 && in_sample_time > written_to &&
                     state->ring_map) {
@@ -817,9 +872,20 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                     if (hole > state->ring_frames) {
                         hole = state->ring_frames;
                     }
-                    FillRing(reinterpret_cast<uint8_t*>(state->ring_map->GetAddress()),
-                             state->ring_frames, written_to, hole, state->frame_bytes,
-                             state->silence_byte);
+                    uint8_t* ring_base =
+                        reinterpret_cast<uint8_t*>(state->ring_map->GetAddress());
+                    // A short hole is bridged and a long one silenced. Five milliseconds is
+                    // where a straight line stops resembling what it replaces, and a hole
+                    // that long is a client restarting rather than one running late. A raw
+                    // carrier is never bridged: DSD is one bit per sample and the arithmetic
+                    // between two of them means nothing.
+                    if (!state->raw_carrier && hole * 200 <= state->active_rate) {
+                        BridgeRing(ring_base, state->ring_frames, written_to, hole,
+                                   state->frame_bytes, state->sample_bytes);
+                    } else {
+                        FillRing(ring_base, state->ring_frames, written_to, hole,
+                                 state->frame_bytes, state->silence_byte);
+                    }
                     state->skips++;
                     state->skipped += hole;
                 }
@@ -1274,6 +1340,8 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->starved = 0;
     ivars->skips = 0;
     ivars->skipped = 0;
+    ivars->sample_bytes = alt->subslot_bytes;
+    ivars->raw_carrier = alt->raw_data;
     ivars->silence_byte = alt->raw_data ? kDsdSilenceByte : 0;
     ivars->active_rate = rate;
     ivars->running = true;

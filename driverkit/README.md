@@ -240,10 +240,22 @@ Measured at 384000 against two clients on the same machine, same rate, same cold
 At 44100 the same buffer is 2.9 ms and it never misses. So the clicks were rate-dependent
 without anything about the rate being wrong.
 
-The driver writes the carrier's silence over the hole as soon as the cycle that skipped it
-reports, which is a read lag before the engine reaches it. `holes the host skipped over` counts
-them. A millisecond of silence once a second is not nothing, but it is inaudible beside what it
-replaces, and the frames it covers were never going to be audio.
+The driver patches the hole as soon as the cycle that skipped it reports, which is a read lag
+before the engine reaches it, and `holes the host skipped over` counts them.
+
+**Silence is not the patch, and measuring that is what took the second attempt.** A hole filled
+with zeroes is two steps from full amplitude to nothing and back -- the same discontinuity the
+stale audio had, at the same amplitude -- and a 0.67 ms one is heard exactly as loudly. The
+counter said the fill was working, 32 holes in 42 seconds, while the clicks carried on at the
+same rate. What goes there instead is a straight line, per channel, from the frame before the
+hole to the frame after: both ends are frames the host did write, so the patch meets the audio
+either side of it at its own value and there is no step at all. A millisecond of interpolation
+once a second is a dulling, not a click.
+
+Bridged up to five milliseconds; past that a straight line no longer resembles what it
+replaces, and a hole that long is a client restarting rather than one running late, so it is
+silenced. A raw carrier is always silenced: DSD is one bit per sample and the arithmetic
+between two of them means nothing.
 
 **A test signal helps.** A slow rising sine sweep makes these obvious where music does not: a
 repeat is heard as the pitch dropping back, a read point move as the pitch stepping. Twenty
