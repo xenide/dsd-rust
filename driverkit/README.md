@@ -45,14 +45,31 @@ Audio plays, as PCM and as native DSD. A file played to the DAC through the driv
 of it, continuously, with no clock resets from Core Audio.
 
 ```
-DsdAudioDriver: host asked for 44100 Hz PCM, alternate setting 1, in-flight window 1411 frames
-DsdAudioDriver: host wrote 512 frames at sample 521028 (ring slot 836); engine reads at sample 520556 (slot 364)
+host asked for 96000 Hz PCM, alternate setting 2, read lag 3072 frames
+timestamp period for 96000 Hz: 32768 frames, 341 ms
+host wrote 256 frames at sample 6324044 (ring slot 32588); engine reads at sample 6320697
+                                        (slot 29241), so the host leads it by 3347
 ```
 
+A cold open at the DAC's fastest rate, ten seconds after the engine retired, from a run that
+switched rate under a playing video from 44100 up to 384000 and back down again:
+
 ```
-DsdAudioDriver: host asked for 352800 Hz native DSD, alternate setting 4, in-flight window 11289 frames
-DsdAudioDriver: streaming 352800 Hz on alt 4: ring 32768 frames of 8 bytes, timeline resumes at 10431513, feedback endpoint 0x81 pipe open
+host asked for 384000 Hz PCM, alternate setting 2, read lag 12288 frames
+engine was down 56 periods of the DAC's clock: anchored at 45613056 (host time 511487899603),
+                                               last pair was 38273024 (host time 511025338549)
+streaming 384000 Hz on alt 2: ring 131072 frames of 6 bytes, timeline resumes at 45744128,
+                              feedback endpoint 0x81 pipe open, interval 4 payload 4, 4 entries
+first IO: op 1, 128 frames at sample 45752132; engine queues at 45751808, reads at 45739520,
+                                               so the host leads the read point by 12612
+client stops: 0 cycles the engine had overtaken the host, 0 cycles the host had lapped the
+              read point, 1536 frames sent as silence
 ```
+
+The host opens 12612 frames ahead of the read point against a read lag of 12288, which is the
+geometry holding to 324 frames at the rate that used to fill the ring with the read lag alone.
+Every rate in that run -- 44100, 48000, 96000, 176400, 192000, 352800, 384000, switched under
+a playing video in both directions -- ran 0 crossings and 0 laps.
 
 Native DSD is what the alternate setting exists for, and it is what Core Audio cannot reach
 on its own. `dsd-rust play` takes it whenever the file's rate has no PCM carrier: DSD256
@@ -311,6 +328,25 @@ the host wrote 224 frames a cycle while its sample time advanced 64000 every 27 
 twelve times real time, until it caught up and snapped back to a steady margin. Heard as noise,
 and as half a second repeating where the write head lapped the read point on the way past, with
 laps in the tens of thousands where the fixed period had tens.
+
+**Sample zero is a real sample, and testing for it cost 695 laps.** "No pair yet" was read off
+`GetCurrentZeroTimestamp` as a sample of zero, which is also where the first stream of a driver
+load starts its timeline and posts its first pair. A client that changed rate two hundred
+milliseconds into that first stream therefore resumed from zero a second time, onto a timeline
+Core Audio had already left:
+
+```
+streaming 352800 Hz on alt 2: ring 131072 frames of 6 bytes, timeline resumes at 0
+seeded the timeline at sample 0, host time 506713158666
+first IO: op 1, 512 frames at sample 140872; engine queues at 7056, reads at 0,
+                                             so the host leads the read point by 140872
+```
+
+The host was 140872 frames along and the engine was at zero. Core Audio walked the difference
+off over the next 1.4 seconds -- 203442, 191729, 20545, 15888 -- lapping the read point 695
+times on the way, which is the sandy, clicking noise the section above describes for two
+timelines anchored differently. What says there is no pair is the pair's *host time*, which no
+real pair has as zero.
 
 **One thing tried that is not it, and is worth not trying again.** Anchoring the read point to
 the host's first write shifts the read point without shifting `SetOutputLatency`, which makes

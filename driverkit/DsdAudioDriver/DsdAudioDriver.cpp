@@ -959,19 +959,27 @@ kern_return_t AllocateTransfers(DsdAudioDriver* driver, DsdAudioDriver_IVars* iv
 ///
 /// Before the first stream there is no pair and no measured clock, and the fallback is what
 /// this replaced -- a period on from whatever `GetCurrentZeroTimestamp` reports, which is
-/// zero on the first stream and starts the host from zero with it.
+/// zero on the first stream and starts the host from zero with it. What says there is no
+/// pair is its host time, never its sample: sample zero is where the first stream of a load
+/// starts, and a pair posted there is as real as any other.
 uint64_t ResumeTimeline(DsdAudioDriver_IVars* ivars, uint32_t rate, uint64_t now_host) {
     uint64_t stale_sample = 0;
     uint64_t stale_host = 0;
     ivars->device->GetCurrentZeroTimestamp(&stale_sample, &stale_host);
-    if (stale_sample == 0) {
+    // The host time says whether there is a pair at all, and the sample cannot: the first
+    // stream of a load starts the timeline at zero and posts a pair there, so a second
+    // stream opening inside that first period reads a sample of zero from a pair that is
+    // real. Starting from zero again on the strength of it puts the driver on a timeline
+    // Core Audio left two hundred milliseconds ago, and the walk back cost 695 laps.
+    if (stale_host == 0) {
+        Log("no pair to resume from: starting the timeline at zero");
         return 0;
     }
     // The period the host was told at the last configuration change, not the one this rate
     // would ask for: the two must wrap the ring at the same length, whatever that length is.
     const uint64_t period = ivars->ring_frames;
     if (ivars->host_ticks_per_second < kMinHostTicksPerSecond ||
-        ivars->host_ticks_per_second > kMaxHostTicksPerSecond || stale_host == 0) {
+        ivars->host_ticks_per_second > kMaxHostTicksPerSecond) {
         Log("resuming a period on from %llu: no host clock measured yet", stale_sample);
         return stale_sample + period;
     }
