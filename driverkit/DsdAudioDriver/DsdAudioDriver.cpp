@@ -1775,8 +1775,28 @@ void IMPL(DsdAudioDriver, IsochComplete) {
             }
         }
         if (ivars->prev_host != 0 && sample > ivars->prev_sample && ivars->device) {
-            const double per_sample = static_cast<double>(host - ivars->prev_host) /
-                                      static_cast<double>(sample - ivars->prev_sample);
+            // The slope a boundary is interpolated on, measured over the stream rather than
+            // over the transfer that happens to straddle it.
+            //
+            // One transfer is four milliseconds and its endpoints carry about a millisecond
+            // of jitter, so a rate read off it is a quarter out, and what that costs is the
+            // jitter multiplied by however far the boundary sits from the completion before
+            // it -- nothing when it lands on one, a millisecond when it lands a transfer
+            // away. Measured at 384000, posts ran +875 us, -875 us, and twice near exact, a
+            // four post cycle at 341 ms each. Core Audio believed every one of them: its
+            // cycle skipped forward about 350 frames every 1.365 seconds, leaving a hole in
+            // the ring where audio was never written, and that was the click.
+            //
+            // The anchor stays this completion's own pair, which is accurate. Only the
+            // slope comes from the long measurement, where the same jitter is divided by
+            // the whole stream instead of by one transfer.
+            const double measured = static_cast<double>(host - ivars->prev_host) /
+                                    static_cast<double>(sample - ivars->prev_sample);
+            const bool clock_known = ivars->host_ticks_per_second > kMinHostTicksPerSecond &&
+                                     ivars->host_ticks_per_second < kMaxHostTicksPerSecond &&
+                                     ivars->active_rate != 0;
+            const double per_sample =
+                clock_known ? ivars->host_ticks_per_second / ivars->active_rate : measured;
             while (ivars->next_timestamp_at <= sample &&
                    ivars->next_timestamp_at >= ivars->prev_sample) {
                 const uint64_t at = ivars->next_timestamp_at;

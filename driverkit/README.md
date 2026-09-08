@@ -235,10 +235,39 @@ Measured at 384000 against two clients on the same machine, same rate, same cold
 | Chrome | 128 frames, 0.33 ms | 32 in 42 s | about one a second |
 | Spotify | 512 frames, 1.33 ms | 2 in 79 s | about one in forty |
 
-128 frames is Web Audio's render quantum, which Chrome asks for whatever the rate, so at
-384000 its audio thread has a third of a millisecond to answer and misses about once a second.
-At 44100 the same buffer is 2.9 ms and it never misses. So the clicks were rate-dependent
-without anything about the rate being wrong.
+That reads as a client missing its deadline, and it is not. The same 128 frame buffer at 44100
+is 2.9 ms and skipped nothing at all in 159 seconds of trace, where 384000 skipped 41 times in
+54. Forcing the buffer up to 1024 frames at 384000 did not stop the clicks either; it only
+spaced them further apart. A buffer that absorbs more of an error is not the same as an error
+that is not there.
+
+**What was throwing the error was the driver.** Logging every posted timestamp with the
+interval since the last shows the timeline oscillating on a four post cycle:
+
+```
+posted 24248320 …  8191786 ticks,    +120 off nominal
+posted 24379392 …  8212655 ticks,  +20875 off nominal
+posted 24510464 …  8171013 ticks,  -20654 off nominal
+posted 24641536 …  8191607 ticks,     -60 off nominal
+host skipped 268 frames at sample 24650152
+```
+
+21000 ticks is 875 microseconds, and four posts at 341 ms each is 1.365 seconds, which is the
+click interval exactly. Core Audio believes each pair, so its cycle steps to where the newest
+one says the timeline has reached, and the step is the hole.
+
+The cause is where the slope came from. A boundary's host time was interpolated on a rate read
+off the single transfer straddling it -- four milliseconds, endpoints carrying about a
+millisecond of jitter, so a rate a quarter out. What that costs is the jitter multiplied by how
+far the boundary sits from the completion before it: nothing when it lands on one, the better
+part of a millisecond when it lands a transfer away, and the beat between a 131072 frame period
+and a 1536 frame transfer walks it through that range on a four post cycle. The anchor was
+never the problem -- posts landing near a completion were within 120 ticks -- so the anchor
+stays this completion's own pair and only the slope now comes from the stream length
+measurement, where the same jitter is divided by seconds instead of by four milliseconds.
+
+It is the same mistake as the cold open, at a different scale: a rate read off too short a
+baseline, believed by a host that has no way to tell.
 
 The driver patches the hole as soon as the cycle that skipped it reports, which is a read lag
 before the engine reaches it, and `holes the host skipped over` counts them.
