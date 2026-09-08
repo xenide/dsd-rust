@@ -92,6 +92,14 @@ When the chosen device advertises no PCM rate able to carry a file, `play` takes
 instead. It packs 32 DSD bits per channel into each USB frame with no markers and no carrier,
 and paces the stream from the DAC's own feedback endpoint.
 
+Before it does, it checks whether the device is really out of carrier. Core Audio derives the
+formats it advertises from the intersection of the streaming alternate settings with the clock
+ranges, and that intersection is sometimes narrower than what the hardware takes. Where the
+DAC's own clock range report claims a DoP carrier rate Core Audio does not advertise, `play`
+sets that rate, reads back what stuck, and puts the device where it found it. A DAC that
+answers yes plays over DoP and never touches the interface claim below. The probe runs once
+per rate per session, and only for rates the two sources disagree on.
+
 Reaching it means taking the device away from macOS. USB audio runs in a userspace daemon,
 `usbaudiod`, which holds the audio interfaces and will not give them up. It re-acquires them
 after a device enumerates, though, so `play` re-enumerates the DAC and claims the interfaces
