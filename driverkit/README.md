@@ -263,25 +263,30 @@ which is half a period spread across the whole of it.
 `engine was down N periods of the DAC's clock` says the resume ran; `resuming a period on from`
 says it fell back.
 
-**The short gap is still a lie, and it bounds the period from above.** A rate change puts
-`StopIsoc` and `StartIsoc` about twenty milliseconds apart, which is less than a period, so the
-resume falls back on one period past the last pair. Core Audio then reads one period of samples
-across twenty milliseconds of host time -- a rate of `period / gap`, which at 16384 frames is
-about four times too fast for the eighty-five milliseconds until the next boundary lands. It is
-the same fault the long gap had, in the one shape the anchor cannot take: placing the anchor a
-period back from the first transfer would date it before the pair the host already holds.
+**The short gap takes the same reasoning without the anchor.** A format change puts `StopIsoc`
+and `StartIsoc` about twenty milliseconds apart, which is less than a period, and an anchor a
+period back from the first transfer would be dated before the pair the host is already holding.
+So nothing is posted. The timeline still runs on to where the clock has reached, and the host
+keeps the pair it has -- under a period old, which is as fresh as the anchor would have made
+it, and describing this timeline exactly: the counter resumed here is what the host projects
+from that pair.
 
-What it costs is visible in the write head. Measured mid-song at 192000, the host wrote 224
-frames a cycle while its sample time advanced 64000 every 27 ms, about twelve times real time,
-until it caught up and snapped back to a steady margin. Audible as noise, and as half a second
-repeating where the write head laps the read point on the way past.
+Landing between two boundaries rather than on one has two consequences in the code.
+`next_timestamp_at` is the first boundary above the resume rather than a period past it, and
+the first completion seeds a pair only where the sample it starts at is a boundary. A zero
+timestamp names the sample the host wraps the ring at, so one posted off the lattice moves
+where the host writes.
 
-**So the period cannot simply be made longer, which is the obvious fix for the table above.**
-Scaling it with the rate -- 65536 at 192000, 131072 at 352800, holding 340 ms at every rate --
-was tried and made this worse in exact proportion: an eighteen times rate error lasting 371 ms,
-with laps in the tens of thousands where the fixed period had tens. More headroom for the
-over-run, and a bigger lie to open with. The two want opposite things, and the lie is the one
-that is heard, so the period stays at 16384 until the short gap resumes honestly.
+**Skipping to the next boundary instead is what this replaced, and it was bounding the period
+from above.** It handed Core Audio one period of samples across the twenty millisecond gap, a
+rate of `period / gap` -- four times too fast at 16384 frames, for the eighty-five milliseconds
+until the boundary landed. That is small enough to pass a listening test at 16384, and it is
+why scaling the period with the rate failed outright: at 65536 for 192000 and 131072 for
+352800, the same lie is eighteen times too fast and 371 ms long. Measured mid-song at 192000,
+the host wrote 224 frames a cycle while its sample time advanced 64000 every 27 ms, about
+twelve times real time, until it caught up and snapped back to a steady margin. Heard as noise,
+and as half a second repeating where the write head lapped the read point on the way past, with
+laps in the tens of thousands where the fixed period had tens.
 
 **One thing tried that is not it, and is worth not trying again.** Anchoring the read point to
 the host's first write shifts the read point without shifting `SetOutputLatency`, which makes
@@ -325,9 +330,12 @@ start no configuration change preceded, and it is a no-op when the numbers have 
 16384, so with a 4096 frame host buffer the lap threshold -- the ring less the buffer -- is
 12288, which the read lag reaches before the host has written anything. The ring is one zero
 timestamp period, and the period was sized for 352800, where 11289 plus 4096 leaves about a
-thousand frames spare. Making 384000 fit means a longer period, which was rejected when 32768
-made the host limp for a second and a half at 44100 -- a limp that was Core Audio failing to
-find its rate, which is what "The cold open" above addresses, so it is worth measuring again.
+thousand frames spare. Making 384000 fit means a longer period, and that was blocked twice
+over: by the short gap skipping to a boundary, which scaled the lie with the period, and by
+32768 making the host limp for a second and a half at 44100 -- a limp that was Core Audio
+failing to find its rate. The first is fixed above and the second is what "The cold open"
+addresses, so a period that scales with the rate is worth measuring again. Neither the honest
+short gap nor a longer period has been listened to yet.
 
 ## The feedback endpoint, and three ways to lose a servo
 

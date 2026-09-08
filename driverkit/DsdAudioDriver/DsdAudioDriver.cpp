@@ -909,6 +909,15 @@ kern_return_t AllocateTransfers(DsdAudioDriver* driver, DsdAudioDriver_IVars* iv
 /// the boundary quantisation costs is spread over the whole gap instead: half a period of
 /// samples against minutes of it.
 ///
+/// A gap shorter than a period has nowhere to put an anchor, and takes the same reasoning
+/// without one: the timeline runs on to where the clock has reached, and the pair the host
+/// is holding stays the newest one. Under a period old, it is as fresh as an anchor would
+/// have been, and it describes this timeline exactly -- the counter resumed here is what
+/// the host projects from it. Skipping to the next boundary instead, which is what a format
+/// change used to do, is the cold open in miniature: one period of samples across the twenty
+/// milliseconds `StopIsoc` and `StartIsoc` sit apart, read as a rate four times too fast
+/// until the boundary lands.
+///
 /// Before the first stream there is no pair and no measured clock, and the fallback is what
 /// this replaced -- a period on from whatever `GetCurrentZeroTimestamp` reports, which is
 /// zero on the first stream and starts the host from zero with it.
@@ -933,13 +942,23 @@ uint64_t ResumeTimeline(DsdAudioDriver_IVars* ivars, uint32_t rate, uint64_t now
         now_host +
         static_cast<uint64_t>(static_cast<double>(kStartLead) * ivars->host_ticks_per_second /
                               1000.0);
-    // The anchor sits one period back, so a gap shorter than that has nowhere to put it, and
-    // a gap the two clocks disagree about the direction of is not one this can measure. Both
-    // fall back on where the last pair was, which for a format change -- the short gap this
-    // catches -- is where the engine was streaming a moment ago anyway.
-    if (first_host <= stale_host + period_ticks) {
-        Log("resuming a period on from %llu: the gap is under a period", stale_sample);
+    // A gap the two clocks disagree about the direction of is not one this can measure.
+    if (first_host <= stale_host) {
+        Log("resuming a period on from %llu: the clocks disagree about the gap", stale_sample);
         return stale_sample + kZeroTimestampPeriod;
+    }
+    // The anchor sits one period back, so a gap shorter than that has nowhere to put it: one
+    // placed there would be dated before the pair the host is already holding. Run the
+    // timeline on to where the clock has reached and post nothing. That pair is then under a
+    // period old, which is the freshness the anchor was buying, and this counter is exactly
+    // what the host projects from it.
+    if (first_host <= stale_host + period_ticks) {
+        const double gap_frames = static_cast<double>(first_host - stale_host) / ticks_per_frame;
+        const uint64_t resumed = stale_sample + static_cast<uint64_t>(gap_frames + 0.5);
+        Log("engine was down %llu frames of the DAC's clock, under a period: resuming at %llu "
+            "on the pair the host holds (%llu at host time %llu)",
+            resumed - stale_sample, resumed, stale_sample, stale_host);
+        return resumed;
     }
     const uint64_t anchor_host = first_host - period_ticks;
     const double gap_frames = static_cast<double>(anchor_host - stale_host) / ticks_per_frame;
@@ -1170,7 +1189,10 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     // transfer goes out, and before the first transfer is filled, because that reads it.
     const uint64_t resumed_sample = ResumeTimeline(ivars, rate, when);
     ivars->sample_counter = resumed_sample;
-    ivars->next_timestamp_at = resumed_sample + kZeroTimestampPeriod;
+    // The first boundary above where the timeline picked up, not a period on from it: a
+    // resume that ran the clock on through a short gap lands between two boundaries, and a
+    // zero timestamp means nothing anywhere else.
+    ivars->next_timestamp_at = (resumed_sample / kZeroTimestampPeriod + 1) * kZeroTimestampPeriod;
 
     for (uint32_t index = 0; index < kTransfersInFlight; index++) {
         result = SubmitTransfer(index);
@@ -1550,11 +1572,19 @@ void IMPL(DsdAudioDriver, IsochComplete) {
         // wait for the second boundary opened at rate and needed no convergence at all.
         // This is the same pair, exact -- the sample the first transfer starts at, against
         // the bus time it actually went out on -- roughly fourteen milliseconds in.
-        if (ivars->prev_host == 0 && ivars->device) {
-            ivars->device->UpdateCurrentZeroTimestamp(sample, host);
+        //
+        // Only where that sample is a boundary. A zero timestamp names the sample the host
+        // wraps the ring at, so one posted off the lattice moves where the host writes. A
+        // start that ran the timeline on through a short gap begins between two boundaries
+        // and wants no seed: the pair it continued from is under a period old and already
+        // describes this timeline.
+        if (ivars->prev_host == 0) {
             ivars->session_sample = sample;
             ivars->session_host = host;
-            Log("seeded the timeline at sample %llu, host time %llu", sample, host);
+            if (ivars->device && sample % kZeroTimestampPeriod == 0) {
+                ivars->device->UpdateCurrentZeroTimestamp(sample, host);
+                Log("seeded the timeline at sample %llu, host time %llu", sample, host);
+            }
         }
         if (ivars->prev_host != 0 && sample > ivars->prev_sample && ivars->device) {
             const double per_sample = static_cast<double>(host - ivars->prev_host) /
