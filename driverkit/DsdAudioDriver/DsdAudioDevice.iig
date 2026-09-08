@@ -9,7 +9,7 @@
 
 class DsdAudioDriver;
 
-/// The published Core Audio device, subclassed for one reason.
+/// The published Core Audio device, subclassed for what a configuration change is for.
 ///
 /// The output latency and safety offset both scale with the rate, and a client reads them
 /// when it opens the device -- which is before `StartDevice`, where the driver used to set
@@ -21,6 +21,10 @@ class DsdAudioDriver;
 /// A configuration change is where state that affects IO is supposed to be published: the
 /// host has stopped IO, and it re-reads the device when the call returns. That is early
 /// enough for a client opening at the new rate to see the geometry it is opening into.
+///
+/// It is also the only place the zero timestamp period may be set, and that scales with the
+/// rate too -- the ring is one period long, and a period fixed in frames is a ring that
+/// shrinks in time as the rate rises until the read lag alone fills it.
 class LOCALONLY DsdAudioDevice: public IOUserAudioDevice
 {
 public:

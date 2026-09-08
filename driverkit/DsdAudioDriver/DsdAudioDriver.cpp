@@ -52,42 +52,45 @@ constexpr uint64_t kTransferMs = kMicroframesPerTransfer / kMicroframesPerFrame;
 constexpr uint64_t kIdleTeardownMs = 10000;
 constexpr uint64_t kIdleTeardownCompletions = kIdleTeardownMs / kTransferMs;
 
-/// Sample frames between the timestamps the host reads to build its timeline, which is also
-/// the length of the ring the two share.
+/// How long the timestamp period should last, whatever the rate.
 ///
-/// Sized for the fastest rate any DAC here publishes, not for the slowest, because both
-/// things that depend on it get worse as the rate rises.
+/// The period is the sample frames between the timestamps the host reads to build its
+/// timeline, and also the length of the ring the two share. Everything that has to fit
+/// inside that ring is measured in time -- the read lag is 32 ms, the host's own buffer is
+/// its cycle -- so a period fixed in frames means a ring that shrinks as the rate rises. At
+/// 16384 frames it is 371 ms at 44100 and 43 ms at 384000, where the read lag of 12288 plus
+/// a 4096 frame host buffer fills it exactly and the host overwrites the slot the engine is
+/// about to read. This gives every rate what 44100 already had.
 ///
-/// The host writes a safety offset ahead of the timeline and the driver reads an in-flight
-/// window behind it, so the two are more than twice that window apart in the ring. At 384000
-/// frames a second the window alone is 12288 frames, and a ring of 4096 wrapped the pair past
-/// each other several times a second.
+/// It is bounded at both ends, and by different things. Below, a period spanning few
+/// transfers inherits the jitter of individual ones, since a timestamp lands on an exact
+/// multiple of it interpolated between two isochronous completions: at 4096 frames and
+/// 352800 that was three transfers, and Core Audio read a rate 7% out and spent a minute and
+/// a half walking back from it. Above, it is how often Core Audio hears what the clock is
+/// doing, and it will not start cleanly without a few -- at 743 ms the host limped at a
+/// tenth of rate for a second and a half before finding its feet.
 ///
-/// A timestamp also has to land on an exact multiple of this period, interpolated between two
-/// isochronous completions, so a period spanning few transfers inherits the jitter of
-/// individual ones. At 44100 a period of 4096 frames covered 23 transfers; at 352800 it
-/// covered three, and Core Audio read a rate 7% out and spent a minute and a half walking
-/// back from it. This covers twelve at 352800, which is enough.
-///
-/// It is also how often Core Audio hears what the clock is doing, and it will not start
-/// cleanly without a few: at 32768 frames, which is three quarters of a second at 44100, the
-/// host limped at a tenth of rate for a second and a half before finding its feet, and
-/// everything the engine put out in the meantime had to be silence. Sizing this is a trade
-/// between the two, not a maximum.
-constexpr uint32_t kZeroTimestampPeriod = 16384;
-
+/// What made this unreachable was neither: a format change resumed the timeline on the next
+/// boundary rather than on the clock, which is a rate error of one period over a twenty
+/// millisecond gap, and scaling the period scaled the error with it. That is fixed in
+/// `ResumeTimeline`, and this is what it was blocking.
+constexpr uint32_t kZeroTimestampMs = 340;
+/// The period the device is published with, and the floor: 371 ms at 44100.
+constexpr uint32_t kMinZeroTimestampPeriod = 16384;
+/// The ceiling, which 352800 and 384000 both reach: 371 ms and 341 ms.
+constexpr uint32_t kMaxZeroTimestampPeriod = 131072;
 
 /// Widest sample frame any published format uses. One source of truth with the bound
 /// `BuildFormats` applies, so the ring cannot be sized for less than it publishes.
 constexpr uint32_t kWidestFrameBytes = dsd::kMaxFrameBytes;
-/// Bytes the ring holds.
+/// Bytes the ring holds, which is the longest period at the widest frame: 1 MiB.
 ///
 /// The host treats the stream buffer as exactly one zero timestamp period of frames and
-/// wraps there, whatever the buffer's length. Sizing it any other way leaves the driver
-/// reading a sweep of the whole allocation while the host writes and rewrites the first
-/// period of it, which is silence everywhere the two do not happen to coincide.
+/// wraps there, whatever the buffer's length, so only the first period of this is ever used.
+/// Sizing the allocation to the rate in force instead would mean reallocating the stream's
+/// memory under a running host on every rate change.
 constexpr uint64_t kRingBytes =
-    static_cast<uint64_t>(kZeroTimestampPeriod) * kWidestFrameBytes;
+    static_cast<uint64_t>(kMaxZeroTimestampPeriod) * kWidestFrameBytes;
 
 /// Bytes one high-speed feedback report occupies: a 16.16 fixed point count of samples per
 /// microframe, little endian.
@@ -115,6 +118,18 @@ constexpr uint8_t kRequestTypeGetInterface = 0xA1;
 constexpr uint16_t kClockRangeBytes = 2 + 12 * dsd::kMaxSampleRates;
 
 constexpr uint32_t kControlTimeoutMs = 1000;
+
+/// The timestamp period a rate wants: the smallest power of two covering
+/// `kZeroTimestampMs`, bounded at both ends. A power of two only because the lattice is
+/// tidier to read in a log; nothing depends on it.
+uint32_t PeriodForRate(uint32_t rate) {
+    const uint64_t wanted = static_cast<uint64_t>(rate) * kZeroTimestampMs / 1000;
+    uint32_t period = kMinZeroTimestampPeriod;
+    while (period < wanted && period < kMaxZeroTimestampPeriod) {
+        period *= 2;
+    }
+    return period;
+}
 
 /// One isochronous transfer's data buffer and frame list.
 struct Transfer {
@@ -446,6 +461,30 @@ void DsdAudioDriver::PublishGeometry(uint32_t rate) {
         window_frames, read_lag);
 }
 
+/// The timestamp period the rate wants, published where the host will re-read it.
+///
+/// Apart from `PublishGeometry` because `SetZeroTimeStampPeriod` is only legal inside a
+/// configuration change, which is why this has exactly one caller and no backstop in
+/// `StartDevice`. A start that no configuration change preceded keeps the period already in
+/// force, and `StartIsoc` reads that back rather than deriving it: a period the host has not
+/// been told about is a ring the two wrap at different lengths.
+void DsdAudioDriver::PublishTimestampPeriod(uint32_t rate) {
+    if (!ivars->device || rate == 0) {
+        return;
+    }
+    const uint32_t period = PeriodForRate(rate);
+    if (ivars->device->GetZeroTimestampPeriod() == period) {
+        return;
+    }
+    const kern_return_t result = ivars->device->SetZeroTimeStampPeriod(period);
+    if (result != kIOReturnSuccess) {
+        Log("cannot set a %u frame timestamp period for %u Hz: 0x%08x", period, rate, result);
+        return;
+    }
+    Log("timestamp period for %u Hz: %u frames, %llu ms", rate, period,
+        static_cast<uint64_t>(period) * 1000 / rate);
+}
+
 void DsdAudioDriver::free() {
     if (ivars != nullptr) {
         ivars->device.reset();
@@ -627,7 +666,7 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
         return kIOReturnNoMemory;
     }
     if (!device->init(this, false, device_uid.get(), model_uid.get(), manufacturer.get(),
-                      kZeroTimestampPeriod)) {
+                      kMinZeroTimestampPeriod)) {
         Log("DsdAudioDevice::init failed");
         OSSafeReleaseNULL(device);
         return kIOReturnNoMemory;
@@ -928,14 +967,17 @@ uint64_t ResumeTimeline(DsdAudioDriver_IVars* ivars, uint32_t rate, uint64_t now
     if (stale_sample == 0) {
         return 0;
     }
+    // The period the host was told at the last configuration change, not the one this rate
+    // would ask for: the two must wrap the ring at the same length, whatever that length is.
+    const uint64_t period = ivars->ring_frames;
     if (ivars->host_ticks_per_second < kMinHostTicksPerSecond ||
         ivars->host_ticks_per_second > kMaxHostTicksPerSecond || stale_host == 0) {
         Log("resuming a period on from %llu: no host clock measured yet", stale_sample);
-        return stale_sample + kZeroTimestampPeriod;
+        return stale_sample + period;
     }
     const double ticks_per_frame = ivars->host_ticks_per_second / static_cast<double>(rate);
     const uint64_t period_ticks =
-        static_cast<uint64_t>(static_cast<double>(kZeroTimestampPeriod) * ticks_per_frame);
+        static_cast<uint64_t>(static_cast<double>(period) * ticks_per_frame);
     // The bus timestamp the first transfer will carry: it goes out kStartLead bus frames on
     // from the one GetFrameNumber just read, and a bus frame is a millisecond.
     const uint64_t first_host =
@@ -945,7 +987,7 @@ uint64_t ResumeTimeline(DsdAudioDriver_IVars* ivars, uint32_t rate, uint64_t now
     // A gap the two clocks disagree about the direction of is not one this can measure.
     if (first_host <= stale_host) {
         Log("resuming a period on from %llu: the clocks disagree about the gap", stale_sample);
-        return stale_sample + kZeroTimestampPeriod;
+        return stale_sample + period;
     }
     // The anchor sits one period back, so a gap shorter than that has nowhere to put it: one
     // placed there would be dated before the pair the host is already holding. Run the
@@ -962,14 +1004,13 @@ uint64_t ResumeTimeline(DsdAudioDriver_IVars* ivars, uint32_t rate, uint64_t now
     }
     const uint64_t anchor_host = first_host - period_ticks;
     const double gap_frames = static_cast<double>(anchor_host - stale_host) / ticks_per_frame;
-    const uint64_t periods =
-        static_cast<uint64_t>(gap_frames / static_cast<double>(kZeroTimestampPeriod) + 0.5);
-    const uint64_t anchor = stale_sample + periods * kZeroTimestampPeriod;
+    const uint64_t periods = static_cast<uint64_t>(gap_frames / static_cast<double>(period) + 0.5);
+    const uint64_t anchor = stale_sample + periods * period;
     ivars->device->UpdateCurrentZeroTimestamp(anchor, anchor_host);
     Log("engine was down %llu periods of the DAC's clock: anchored at %llu (host time %llu), "
         "last pair was %llu (host time %llu)",
         periods, anchor, anchor_host, stale_sample, stale_host);
-    return anchor + kZeroTimestampPeriod;
+    return anchor + period;
 }
 
 }  // namespace
@@ -1124,8 +1165,16 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     }
     ivars->frame_bytes = frame_bytes;
     // Not the mapping length over the frame width: the host wraps at the zero timestamp
-    // period regardless of how much memory the buffer actually holds.
-    ivars->ring_frames = kZeroTimestampPeriod;
+    // period regardless of how much memory the buffer actually holds. Read back rather than
+    // derived from the rate, because what the host was told at the last configuration change
+    // is what it is wrapping at, and the two wrapping at different lengths is the one thing
+    // that must never happen.
+    ivars->ring_frames = ivars->device ? ivars->device->GetZeroTimestampPeriod() : 0;
+    if (ivars->ring_frames == 0) {
+        Log("the device reports no timestamp period; falling back on %u",
+            kMinZeroTimestampPeriod);
+        ivars->ring_frames = kMinZeroTimestampPeriod;
+    }
     ivars->samples_per_microframe = static_cast<double>(rate) / 8000.0;
     ivars->nominal_samples_per_microframe = ivars->samples_per_microframe;
     ivars->feedback_reports = 0;
@@ -1192,7 +1241,7 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     // The first boundary above where the timeline picked up, not a period on from it: a
     // resume that ran the clock on through a short gap lands between two boundaries, and a
     // zero timestamp means nothing anywhere else.
-    ivars->next_timestamp_at = (resumed_sample / kZeroTimestampPeriod + 1) * kZeroTimestampPeriod;
+    ivars->next_timestamp_at = (resumed_sample / ivars->ring_frames + 1) * ivars->ring_frames;
 
     for (uint32_t index = 0; index < kTransfersInFlight; index++) {
         result = SubmitTransfer(index);
@@ -1581,7 +1630,7 @@ void IMPL(DsdAudioDriver, IsochComplete) {
         if (ivars->prev_host == 0) {
             ivars->session_sample = sample;
             ivars->session_host = host;
-            if (ivars->device && sample % kZeroTimestampPeriod == 0) {
+            if (ivars->device && ivars->ring_frames != 0 && sample % ivars->ring_frames == 0) {
                 ivars->device->UpdateCurrentZeroTimestamp(sample, host);
                 Log("seeded the timeline at sample %llu, host time %llu", sample, host);
             }
@@ -1601,7 +1650,7 @@ void IMPL(DsdAudioDriver, IsochComplete) {
                     Log("posted zero timestamp %llu at host time %llu", at, when);
                 }
                 ivars->timestamps_posted++;
-                ivars->next_timestamp_at += kZeroTimestampPeriod;
+                ivars->next_timestamp_at += ivars->ring_frames;
             }
             // How fast the host clock runs, over this stream's whole length rather than over
             // one transfer. Nothing in the stream needs it -- the next start does, to work

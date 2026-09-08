@@ -38,12 +38,18 @@ void DsdAudioDevice::SetOwner(DsdAudioDriver* in_owner) {
 
 /// Republish the geometry once the change has been made, not before: the rate is read back
 /// off the device, and until `super` has run it is still the one being left behind.
+///
+/// The timestamp period goes out from here and nowhere else. `SetZeroTimeStampPeriod` is
+/// only legal during a configuration change, and this is one: IO has stopped and the host
+/// re-reads the device when the call returns.
 kern_return_t DsdAudioDevice::PerformDeviceConfigurationChange(uint64_t in_change_action,
                                                                OSObject* in_change_info) {
     const kern_return_t result =
         super::PerformDeviceConfigurationChange(in_change_action, in_change_info);
     if (ivars != nullptr && ivars->owner != nullptr) {
-        ivars->owner->PublishGeometry(static_cast<uint32_t>(GetSampleRate()));
+        const uint32_t rate = static_cast<uint32_t>(GetSampleRate());
+        ivars->owner->PublishTimestampPeriod(rate);
+        ivars->owner->PublishGeometry(rate);
     }
     return result;
 }

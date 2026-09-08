@@ -52,6 +52,12 @@ public:
     /// which is the backstop for a start that no configuration change preceded.
     void PublishGeometry(uint32_t rate) LOCALONLY;
 
+    /// Publish the timestamp period a rate implies, which is also the ring's length.
+    ///
+    /// Separate from `PublishGeometry` because setting it is only legal inside a
+    /// configuration change, so this has one caller and no backstop.
+    void PublishTimestampPeriod(uint32_t rate) LOCALONLY;
+
     /// Select the alternate setting the format needs, set the clock, and fill the pipe.
     kern_return_t StartIsoc(uint32_t rate, uint8_t alt_setting, uint32_t frame_bytes) LOCALONLY;
 

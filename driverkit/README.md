@@ -59,15 +59,39 @@ on its own. `dsd-rust play` takes it whenever the file's rate has no PCM carrier
 needs a 705600 Hz DoP carrier the DAC does not offer, and goes down alternate setting 4 at
 352800 frames a second instead.
 
-**The timestamp period is sized for the fastest rate, not the slowest.** Two things scale
-with it and both get worse as the rate rises. The host writes a safety offset ahead of the
-timeline while the driver reads an in-flight window behind it, so the pair sit more than
-twice that window apart in a ring exactly one period long: at 4096 frames and 352800 Hz they
-wrapped past each other several times a second. And a timestamp has to land on an exact
-multiple of the period, interpolated between two isochronous completions, so a period
-covering few transfers inherits the jitter of individual ones -- three transfers at 352800
-against twenty-three at 44100, and Core Audio read a rate 7% out and spent a minute and a
-half walking back from it. 32768 frames covers twenty-three transfers at 352800 again.
+**The timestamp period is a duration, not a frame count.** The ring is exactly one period
+long, and everything that has to fit inside it is measured in time: the read lag is 32 ms and
+the host's buffer is one of its own cycles. A period fixed at 16384 frames is therefore a
+ring of 371 ms at 44100 and 43 ms at 384000, where the read lag of 12288 plus a 4096 frame
+host buffer fills it exactly and the host overwrites the slot the engine is about to read.
+So the period is the smallest power of two covering 340 ms of the rate in force -- 16384 at
+44100, 32768 at 96000, 65536 at 192000, 131072 at 352800 and 384000 -- which gives every rate
+what 44100 already had.
+
+It is bounded at both ends. Below, a timestamp lands on an exact multiple of the period
+interpolated between two isochronous completions, so a period covering few transfers inherits
+the jitter of individual ones: at 4096 frames and 352800 that was three transfers, and Core
+Audio read a rate 7% out and spent a minute and a half walking back from it. Above, the period
+is how often Core Audio hears what the clock is doing, and at 743 ms the host limped at a tenth
+of rate for a second and a half before finding its feet.
+
+`SetZeroTimeStampPeriod` is only legal inside a configuration change, so
+`PerformDeviceConfigurationChange` is its only caller, and everything that needs the period
+reads it back with `GetZeroTimestampPeriod` rather than deriving it from the rate again. The
+host and the driver wrapping the ring at different lengths is the one thing that must never
+happen. The allocation is sized once for the longest period at the widest frame, 1 MiB.
+
+**What a period change does to the lattice, and the assumption in it.** Timestamps land on
+multiples of the period counted from zero, and so does the ring's wrap: the driver reads at
+`sample % period` and the host writes at the slot the same arithmetic gives, which is how the
+two agree without ever exchanging a position. A period change relocates both lattices at once,
+and the pair the host is holding -- a multiple of the old period -- is no longer a multiple of
+the new one. That pair stays a true statement about the clock, which is all it is used for,
+and the first pair posted after the change lands on the new lattice, leaving one interval
+whose sample delta is not a whole period. If the host instead wraps relative to the pair it
+holds, this is where it would show, and it shows immediately: the first write after a switch
+into 352800 would land nowhere near the read point, and the `first IO` line says by how many
+frames.
 
 **Core Audio's timeline outlives an IO stop, so the driver's has to as well.** Its sample time
 carries across a stop and start, and its counter follows the timeline the driver posts rather
@@ -326,16 +350,14 @@ affects IO is supposed to be published: the host has stopped IO, and it re-reads
 the call returns. `StartDevice` still calls the same `PublishGeometry`, as the backstop for a
 start no configuration change preceded, and it is a no-op when the numbers have not moved.
 
-**384000 is a separate problem and is not fixed.** The read lag there is 12288 on a ring of
-16384, so with a 4096 frame host buffer the lap threshold -- the ring less the buffer -- is
-12288, which the read lag reaches before the host has written anything. The ring is one zero
-timestamp period, and the period was sized for 352800, where 11289 plus 4096 leaves about a
-thousand frames spare. Making 384000 fit means a longer period, and that was blocked twice
-over: by the short gap skipping to a boundary, which scaled the lie with the period, and by
-32768 making the host limp for a second and a half at 44100 -- a limp that was Core Audio
-failing to find its rate. The first is fixed above and the second is what "The cold open"
-addresses, so a period that scales with the rate is worth measuring again. Neither the honest
-short gap nor a longer period has been listened to yet.
+**This is what sized the period against the rate.** The read lag at 384000 is 12288, so on a
+ring of 16384 with a 4096 frame host buffer the lap threshold -- the ring less the buffer -- is
+12288, which the read lag reaches before the host has written anything. 352800 cleared it by
+about a thousand frames. A longer period was blocked twice over: by the short gap skipping to
+a boundary, which scaled the rate error with the period, and by 32768 making the host limp for
+a second and a half at 44100, a limp that was Core Audio failing to find its rate. The first is
+fixed in "The cold open" above and measured; the second is what that section addresses. At
+131072 the read lag is a tenth of the ring at both rates.
 
 ## The feedback endpoint, and three ways to lose a servo
 
