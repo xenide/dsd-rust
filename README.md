@@ -89,14 +89,21 @@ cannot reach it however willing the DAC is. Those DACs usually can still play th
 an alternate setting Core Audio never offers because its format is `RAW_DATA` rather than PCM.
 
 When the chosen device advertises no PCM rate able to carry a file, `play` takes that path
-instead. It packs 32 DSD bits per channel into each USB frame with no markers and no carrier,
-and paces the stream from the DAC's own feedback endpoint.
+instead. Either way it packs 32 DSD bits per channel into each frame with no markers and no
+carrier; what differs is who puts the frames on the wire.
 
-Reaching it means taking the device away from macOS. USB audio runs in a userspace daemon,
-`usbaudiod`, which holds the audio interfaces and will not give them up. It re-acquires them
-after a device enumerates, though, so `play` re-enumerates the DAC and claims the interfaces
-in the window before the daemon does, then holds them for the session. No kernel extension,
-no system extension, and no change to System Integrity Protection.
+**Through a driver.** When the driver extension below owns the DAC, it publishes the
+`RAW_DATA` alternate setting as an ordinary Core Audio format, and `play` writes the DSD
+bytes into it like any other non-mixable stream. The DAC stays a normal output device, and
+nothing has to be taken away from anything.
+
+**By claiming the DAC.** With no driver, reaching the same alternate setting means taking the
+device away from macOS. USB audio runs in a userspace daemon, `usbaudiod`, which holds the
+audio interfaces and will not give them up. It re-acquires them after a device enumerates,
+though, so `play` re-enumerates the DAC and claims the interfaces in the window before the
+daemon does, then holds them for the session, pacing the stream from the DAC's own feedback
+endpoint. No kernel extension, no system extension, and no change to System Integrity
+Protection.
 
 `devices` reports both paths, so the difference is visible before playing anything:
 
@@ -107,7 +114,11 @@ no system extension, and no change to System Integrity Protection.
 ```
 
 The native rates come from the DAC's own clock range report rather than from what the
-endpoint could carry, so they are rates it will actually accept.
+endpoint could carry, so they are rates it will actually accept. A device a driver owns
+reports the rates the driver publishes instead, which come from the same report.
+
+Both native paths claim the device exclusively, so a file that has to go native is refused
+under `--shared`. The rest of what follows is the cost of the claiming path only.
 
 The cost is that claiming the DAC drops it off the USB bus for a moment and takes it away
 from every other application until playback ends, which is heavier than Core Audio's hog
@@ -121,6 +132,21 @@ USB product string: Core Audio and USB name the same device differently -- "Cayi
 Playback" against "Cayin RU7" -- so whichever name contains the other counts as a match. A
 DAC whose two names have nothing in common needs its USB name passed to `--device`, which
 `devices` lists on the `native` line.
+
+## Driver extension
+
+`driverkit/` holds a DriverKit extension that answers the same problem the other way: it
+matches the DAC's streaming interface itself, so `usbaudiod` never gets it and there is no
+race to win. Owning the interface also means the `RAW_DATA` alternate setting can be
+published as an ordinary Core Audio output device, which puts native DSD in front of every
+application rather than only this CLI.
+
+It loads, matches a Cayin RU7, and publishes it as a Core Audio device that plays PCM and
+native DSD up to DSD256. Getting it onto a machine is the hard part: DriverKit's USB and audio
+entitlements need an Apple Developer Program membership to sign against, and a dext installs
+only from an app that carries them. `driverkit/README.md` has the details, including the
+unsupported route with the checks off. Nothing in `driverkit/` is built by `cargo`, and none
+of it is needed to use the player.
 
 ## What "bit-perfect" means here
 

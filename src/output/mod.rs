@@ -18,7 +18,7 @@ use coreaudio_sys::{
 
 use crate::dsd::DsdRate;
 use crate::output::hal::Device;
-use crate::output::stream::supported_dop_rates;
+use crate::output::stream::{supported_dop_rates, supported_native_rates};
 use crate::output::usb::device::Dac;
 
 /// What the `devices` command shows for one output device.
@@ -29,8 +29,8 @@ pub struct DeviceSummary {
     pub current_rate: f64,
     pub dop_rates: Vec<u32>,
     pub hog_owner: Option<i32>,
-    /// DSD rates this device plays natively, when it advertises a RAW_DATA alternate
-    /// setting. Independent of `dop_rates`, and usually reaching higher.
+    /// DSD rates this device plays natively, in DSD bits per second. Independent of
+    /// `dop_rates`, and usually reaching higher.
     pub native_dsd: Vec<u32>,
 }
 
@@ -41,7 +41,7 @@ pub fn list_devices() -> Result<Vec<DeviceSummary>> {
     for device in Device::all()? {
         let name = device.name().unwrap_or_else(|_| "<unnamed>".to_owned());
         summaries.push(DeviceSummary {
-            native_dsd: native_rates(&native, &name),
+            native_dsd: native_dsd_rates(&device, &native, &name),
             name,
             uid: device.uid().unwrap_or_default(),
             is_default: default == Some(device),
@@ -53,12 +53,25 @@ pub fn list_devices() -> Result<Vec<DeviceSummary>> {
     Ok(summaries)
 }
 
-/// DSD rates one device plays natively.
+/// DSD rates one device plays natively, whichever way it reaches them.
+///
+/// A driver that owns the DAC publishes its `RAW_DATA` alternate setting as a Core Audio
+/// format, which is the whole point of the driver and takes precedence: a DAC the driver
+/// holds is not on the bus for `Dac::discover` to find at all.
+fn native_dsd_rates(device: &Device, dacs: &[Dac], core_audio_name: &str) -> Vec<u32> {
+    let published = supported_native_rates(device);
+    if !published.is_empty() {
+        return published;
+    }
+    claimable_native_rates(dacs, core_audio_name)
+}
+
+/// DSD rates one device plays natively once this process claims its USB interfaces.
 ///
 /// The clock is shared with the PCM path, so its range report lists PCM rates too. A frame
 /// rate counts here only when 32 DSD bits per frame lands on a real DSD rate, which is what
 /// separates 352800 Hz carrying DSD256 from 352800 Hz carrying PCM.
-fn native_rates(dacs: &[Dac], core_audio_name: &str) -> Vec<u32> {
+fn claimable_native_rates(dacs: &[Dac], core_audio_name: &str) -> Vec<u32> {
     let Some(dac) = dacs.iter().find(|dac| dac.matches(core_audio_name)) else {
         return Vec::new();
     };

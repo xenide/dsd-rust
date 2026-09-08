@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use crate::dop;
 use crate::dsd::DsdFormat;
 use crate::dsd::DsdRate;
-use crate::output::stream::{DeviceBusy, Output, Request, supported_dop_rates};
+use crate::output::encoding::Carrier;
+use crate::output::stream::{
+    DeviceBusy, Output, Request, supported_dop_rates, supported_native_rates,
+};
 use crate::output::usb::device::Held;
 use crate::output::usb::session::NativeSession;
 use crate::output::{self, hal::Device};
@@ -56,6 +59,9 @@ pub struct Target {
     /// Read once, because `device` goes stale while the DAC is held natively and the rates
     /// are a property of the DAC rather than of the `AudioDeviceID` it happens to have.
     dop_rates: Vec<u32>,
+    /// DSD rates the device carries natively through Core Audio, which only a driver that
+    /// owns the DAC's streaming interface can publish. Read once, for the same reason.
+    native_rates: Vec<u32>,
     /// The DAC claimed for native DSD, held between tracks. Handing it back re-enumerates
     /// it, and the next claim would then have to race `usbaudiod` for a window that the
     /// re-enumeration has already closed.
@@ -70,6 +76,7 @@ impl Target {
         let (device, name) = output::find_device(query)?;
         Ok(Self {
             dop_rates: supported_dop_rates(&device),
+            native_rates: supported_native_rates(&device),
             device,
             name,
             query: query.map(str::to_owned),
@@ -81,6 +88,11 @@ impl Target {
     /// True when this device advertises a PCM rate able to carry the file as DoP.
     fn carries_dop(&self, rate: DsdRate) -> bool {
         self.dop_rates.contains(&rate.dop_pcm_rate())
+    }
+
+    /// True when this device publishes the file's rate as native DSD through Core Audio.
+    fn carries_native(&self, rate: DsdRate) -> bool {
+        self.native_rates.contains(&rate.hz())
     }
 
     /// Hand a natively held DAC back to `usbaudiod`. Instant, because picking the device up
@@ -108,6 +120,7 @@ impl Target {
             if let Ok((device, found)) = output::find_device(Some(&name))
                 && !supported_dop_rates(&device).is_empty()
             {
+                self.native_rates = supported_native_rates(&device);
                 self.device = device;
                 self.name = found;
                 self.stale = false;
@@ -185,6 +198,9 @@ pub struct Session {
     feed: Arc<FeedState>,
     stop: Arc<AtomicBool>,
     queue_frames: u64,
+    /// DSD bytes per channel one device frame carries: two under DoP, four natively. Every
+    /// frame count the session keeps is in device frames, so seeking converts through this.
+    bytes_per_frame: u64,
     pub track: TrackInfo,
     pub device: DeviceInfo,
 }
@@ -196,50 +212,52 @@ impl Session {
         target: &Target,
         options: &PlayOptions,
         stop: &Arc<AtomicBool>,
+        carrier: Carrier,
     ) -> Result<Self> {
         let source = reader::open(path)?;
         let format = source.format();
         let channels = format.channels as usize;
-        let pcm_rate = format.rate.dop_pcm_rate();
+        // The queue holds DSD byte pairs whichever carrier takes them, so it is sized by the
+        // DoP rate either way. The device runs at half that natively, where one frame takes
+        // two pairs per channel instead of one.
+        let payload_rate = format.rate.dop_pcm_rate();
+        let frame_rate = payload_rate / carrier.payloads_per_frame() as u32;
+        let bytes_per_frame = DOP_BYTES_PER_FRAME * carrier.payloads_per_frame() as u64;
         let track = TrackInfo {
             container: source.container(),
             tags: source.tags().clone(),
             format,
             duration: source.duration_secs(),
-            total_frames: source.total_bytes_per_channel() / 2,
+            total_frames: source.total_bytes_per_channel() / bytes_per_frame,
             bytes_per_channel: source.total_bytes_per_channel(),
         };
 
         let device = target.device;
         let capacity =
-            (pcm_rate as usize * channels * options.buffer_ms as usize / 1000).max(1 << 14);
+            (payload_rate as usize * channels * options.buffer_ms as usize / 1000).max(1 << 14);
         let (producer, consumer) = RingBuffer::<u16>::new(capacity);
 
         let request = Request {
-            pcm_rate,
+            frame_rate,
             channels: format.channels,
+            carrier,
             exclusive: options.exclusive,
             buffer_frames: options.buffer_frames,
         };
         let mut output = Output::open(device, &request, consumer)
             .with_context(|| format!("{} cannot play {}", target.name, format.rate))?;
 
+        let integer = output.is_integer();
         let info = DeviceInfo {
             name: target.name.clone(),
-            carrier: "DoP",
-            bits: 24,
-            pcm_rate,
+            carrier: carrier.label(),
+            bits: carrier.bits(),
+            pcm_rate: frame_rate,
             buffer_frames: output.buffer_frames,
-            transport: if output.encoding.is_integer() {
-                "integer"
-            } else {
-                "float32"
-            },
+            transport: if integer { "integer" } else { "float32" },
             exclusive: output.is_exclusive(),
             mixing_disabled: output.mixing_disabled(),
-            volume: (!output.encoding.is_integer())
-                .then(|| device.volume_scalar())
-                .flatten(),
+            volume: (!integer).then(|| device.volume_scalar()).flatten(),
         };
 
         let feed = Arc::new(FeedState::default());
@@ -249,6 +267,7 @@ impl Session {
             producer,
             Arc::clone(&feed),
             Arc::clone(stop),
+            carrier,
         );
 
         let prefill = (capacity / channels / 2) as u64;
@@ -266,7 +285,8 @@ impl Session {
             feeder: Some(feeder),
             feed,
             stop: Arc::clone(stop),
-            queue_frames: (capacity / channels) as u64,
+            queue_frames: (capacity / (channels * carrier.payloads_per_frame())) as u64,
+            bytes_per_frame,
             track,
             device: info,
         })
@@ -278,10 +298,11 @@ impl Session {
         target: &Target,
         options: &PlayOptions,
         stop: &Arc<AtomicBool>,
+        carrier: Carrier,
     ) -> Result<Self> {
         let mut last = None;
         for attempt in 1..=SETUP_ATTEMPTS {
-            let error = match Self::open(path, target, options, stop) {
+            let error = match Self::open(path, target, options, stop, carrier) {
                 Ok(session) => return Ok(session),
                 Err(error) => error,
             };
@@ -351,7 +372,7 @@ impl Session {
         let mut source = self.source.lock().unwrap_or_else(PoisonError::into_inner);
         let reached = source.seek(target)?;
         self.output.state.drop_queued();
-        let frames = reached / DOP_BYTES_PER_FRAME;
+        let frames = reached / self.bytes_per_frame;
         self.output
             .state
             .frames_played
@@ -401,13 +422,19 @@ impl Drop for Session {
 
 /// One playing track, over whichever transport the device can carry it on.
 pub enum Playback {
-    Dop(Box<Session>),
-    Native(Box<NativeSession>),
+    /// Through Core Audio, over DoP or over a driver's native DSD format.
+    HostAudio(Box<Session>),
+    /// Through the USB interfaces this process claimed off `usbaudiod` itself.
+    ClaimedUsb(Box<NativeSession>),
 }
 
 impl Playback {
-    /// Open `path`, preferring DoP. A DAC whose PCM rates cannot carry the file still plays
-    /// it natively, where 32 DSD bits ride in each frame instead of 16.
+    /// Open `path` on the best transport the target offers.
+    ///
+    /// DoP first, because it leaves the device an ordinary Core Audio device. A rate no PCM
+    /// carrier reaches goes native, which is 32 DSD bits per frame instead of 16: through
+    /// Core Audio when a driver owns the DAC and publishes the format, and otherwise by
+    /// claiming the DAC's USB interfaces outright.
     pub fn open(
         path: &Path,
         target: &mut Target,
@@ -419,18 +446,25 @@ impl Playback {
             // DoP goes through Core Audio, which cannot see a DAC this process is holding
             // for native DSD, so a claim carried over from an earlier track ends here.
             target.restore_core_audio()?;
-            let session = Session::open_retrying(path, target, options, stop)?;
-            return Ok(Self::Dop(Box::new(session)));
+            let session = Session::open_retrying(path, target, options, stop, Carrier::Dop)?;
+            return Ok(Self::HostAudio(Box::new(session)));
         }
-        // The native path takes both audio interfaces away from usbaudiod for the whole
-        // track, which is heavier than hog mode and cannot be shared. Say so rather than
-        // quietly doing the opposite of what was asked.
+        // Both native paths take the mixer out of the way for the whole track and cannot be
+        // shared. Say so rather than quietly doing the opposite of what was asked.
         if !options.exclusive {
             bail!(
                 "{} cannot carry {rate} over DoP, and the native DSD path always claims the \
                  device exclusively; drop --shared to play this file",
                 target.name
             );
+        }
+        if target.carries_native(rate) {
+            // A driver already owns the DAC's streaming interface and publishes its
+            // RAW_DATA alternate setting as a Core Audio format, so there is nothing to
+            // claim: the bits go out through the HAL like any other non-mixable stream.
+            target.restore_core_audio()?;
+            let session = Session::open_retrying(path, target, options, stop, Carrier::NativeDsd)?;
+            return Ok(Self::HostAudio(Box::new(session)));
         }
         if options.buffer_frames.is_some() {
             warn!("--buffer-frames sizes the Core Audio buffer, so it does not apply natively");
@@ -439,43 +473,43 @@ impl Playback {
         // it up again before anything goes back over DoP.
         target.stale = true;
         let session = NativeSession::open(path, target, options.buffer_ms, stop)?;
-        Ok(Self::Native(Box::new(session)))
+        Ok(Self::ClaimedUsb(Box::new(session)))
     }
 
     pub fn track(&self) -> TrackInfo {
         match self {
-            Self::Dop(session) => session.track.clone(),
-            Self::Native(session) => session.track(),
+            Self::HostAudio(session) => session.track.clone(),
+            Self::ClaimedUsb(session) => session.track(),
         }
     }
 
     pub fn device(&self) -> DeviceInfo {
         match self {
-            Self::Dop(session) => session.device.clone(),
-            Self::Native(session) => session.device(),
+            Self::HostAudio(session) => session.device.clone(),
+            Self::ClaimedUsb(session) => session.device(),
         }
     }
 
     pub fn progress(&self) -> Progress {
         match self {
-            Self::Dop(session) => session.progress(),
-            Self::Native(session) => session.progress(),
+            Self::HostAudio(session) => session.progress(),
+            Self::ClaimedUsb(session) => session.progress(),
         }
     }
 
     pub fn is_complete(&self) -> bool {
         match self {
-            Self::Dop(session) => session.is_complete(),
-            Self::Native(session) => session.is_complete(),
+            Self::HostAudio(session) => session.is_complete(),
+            Self::ClaimedUsb(session) => session.is_complete(),
         }
     }
 
-    /// True when playback stopped on its own, short of the end of the file. Only the native
-    /// path can: a Core Audio IOProc runs until it is told to stop.
+    /// True when playback stopped on its own, short of the end of the file. Only the claimed
+    /// USB path can: a Core Audio IOProc runs until it is told to stop.
     pub fn has_stalled(&self) -> bool {
         match self {
-            Self::Dop(_) => false,
-            Self::Native(session) => session.has_stalled(),
+            Self::HostAudio(_) => false,
+            Self::ClaimedUsb(session) => session.has_stalled(),
         }
     }
 
@@ -483,38 +517,38 @@ impl Playback {
     /// rather than a dropout.
     pub fn fully_queued(&self) -> bool {
         match self {
-            Self::Dop(session) => session.feed.finished.load(Ordering::Relaxed),
-            Self::Native(session) => session.fully_queued(),
+            Self::HostAudio(session) => session.feed.finished.load(Ordering::Relaxed),
+            Self::ClaimedUsb(session) => session.fully_queued(),
         }
     }
 
     pub fn set_paused(&self, paused: bool) {
         match self {
-            Self::Dop(session) => session.set_paused(paused),
-            Self::Native(session) => session.set_paused(paused),
+            Self::HostAudio(session) => session.set_paused(paused),
+            Self::ClaimedUsb(session) => session.set_paused(paused),
         }
     }
 
     pub fn is_paused(&self) -> bool {
         match self {
-            Self::Dop(session) => session.is_paused(),
-            Self::Native(session) => session.is_paused(),
+            Self::HostAudio(session) => session.is_paused(),
+            Self::ClaimedUsb(session) => session.is_paused(),
         }
     }
 
     /// Move the play position by `delta` seconds, clamped to the file.
     pub fn seek(&self, delta: f64) -> Result<()> {
         match self {
-            Self::Dop(session) => session.seek(delta),
-            Self::Native(session) => session.seek(delta),
+            Self::HostAudio(session) => session.seek(delta),
+            Self::ClaimedUsb(session) => session.seek(delta),
         }
     }
 
     /// Stop playing and give the target its DAC back, so the next track finds it held.
     pub fn finish(self, target: &mut Target) -> Result<()> {
         match self {
-            Self::Dop(session) => session.finish(),
-            Self::Native(session) => {
+            Self::HostAudio(session) => session.finish(),
+            Self::ClaimedUsb(session) => {
                 let (dac, result) = session.finish();
                 target.dac = dac;
                 result
@@ -639,6 +673,7 @@ fn spawn_feeder(
     mut producer: Producer<u16>,
     feed: Arc<FeedState>,
     stop: Arc<AtomicBool>,
+    carrier: Carrier,
 ) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || {
         let (channels, chunk_bytes) = {
@@ -647,17 +682,48 @@ fn spawn_feeder(
         };
         let mut planes: Vec<Box<[u8]>> = vec![vec![0; chunk_bytes].into(); channels];
         let mut payloads = Vec::new();
+        let mut queued = Queued::new(channels * carrier.payloads_per_frame());
         let result = feed_loop(
             &source,
             &mut producer,
             &feed,
             &stop,
-            &mut planes,
-            &mut payloads,
+            (&mut planes, &mut payloads, &mut queued),
         );
         feed.finished.store(true, Ordering::Relaxed);
         result
     })
+}
+
+/// The reader's running count of what it has handed the queue.
+///
+/// Payloads are counted rather than frames because a native frame takes two of them per
+/// channel, and a chunk of DSD does not have to end on one: flooring each chunk on its own
+/// would lose a frame here and there, and the transport reads the difference between what is
+/// queued and what is played as the queue depth.
+struct Queued {
+    frame_payloads: usize,
+    pending: usize,
+}
+
+impl Queued {
+    const fn new(frame_payloads: usize) -> Self {
+        Self {
+            frame_payloads,
+            pending: 0,
+        }
+    }
+
+    fn advance(&mut self, feed: &FeedState, payloads: usize) {
+        if self.frame_payloads == 0 {
+            return;
+        }
+        self.pending += payloads;
+        let frames = self.pending / self.frame_payloads;
+        self.pending -= frames * self.frame_payloads;
+        feed.frames_written
+            .fetch_add(frames as u64, Ordering::Relaxed);
+    }
 }
 
 /// Read, pack, and queue until the file ends or `stop` is set.
@@ -670,12 +736,14 @@ fn feed_loop(
     producer: &mut Producer<u16>,
     feed: &FeedState,
     stop: &AtomicBool,
-    planes: &mut [Box<[u8]>],
-    payloads: &mut Vec<u16>,
+    reading: (&mut [Box<[u8]>], &mut Vec<u16>, &mut Queued),
 ) -> Result<()> {
-    let channels = planes.len();
+    let (planes, payloads, queued) = reading;
     while !stop.load(Ordering::Relaxed) {
         if feed.seeking.load(Ordering::Relaxed) {
+            // A seek resets the counters, so a part frame left from the old position would
+            // be counted against the new one.
+            queued.pending = 0;
             thread::sleep(PARK);
             continue;
         }
@@ -692,7 +760,7 @@ fn feed_loop(
         payloads.clear();
         let slices: Vec<&[u8]> = planes.iter().map(|plane| &plane[..count]).collect();
         dop::pack_planes(&slices, payloads);
-        queue(producer, feed, stop, payloads, channels)?;
+        queue(producer, feed, stop, payloads, queued)?;
     }
     Ok(())
 }
@@ -704,7 +772,7 @@ fn queue(
     feed: &FeedState,
     stop: &AtomicBool,
     payloads: &[u16],
-    channels: usize,
+    queued: &mut Queued,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < payloads.len() {
@@ -720,8 +788,7 @@ fn queue(
         let chunk = producer.write_chunk_uninit(take)?;
         chunk.fill_from_iter(payloads[offset..offset + take].iter().copied());
         offset += take;
-        feed.frames_written
-            .fetch_add((take / channels) as u64, Ordering::Relaxed);
+        queued.advance(feed, take);
     }
     Ok(())
 }

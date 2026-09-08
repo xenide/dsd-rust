@@ -1,10 +1,69 @@
 use anyhow::{Result, bail};
 use coreaudio_sys::{
     AudioStreamBasicDescription, kAudioFormatFlagIsAlignedHigh, kAudioFormatFlagIsBigEndian,
-    kAudioFormatFlagIsFloat, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonMixable, kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM,
 };
 
 use crate::dop::FLOAT_SCALE;
+use crate::native::BYTES_PER_SUBSLOT;
+
+/// How the DSD bits reach the DAC through Core Audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carrier {
+    /// DoP 1.1: an alternating marker byte and 16 DSD bits per channel in each frame.
+    Dop,
+    /// Native DSD: 32 raw DSD bits per channel in each frame, no marker and no carrier.
+    /// A driver that owns the DAC's `RAW_DATA` alternate setting publishes it as big-endian
+    /// non-mixable 32-bit integer PCM, which is what ALSA calls `DSD_U32_BE`.
+    NativeDsd,
+}
+
+impl Carrier {
+    /// DSD byte pairs one device frame carries per channel. The queue between the reader and
+    /// the render callback holds those pairs whichever carrier takes them, so this is the
+    /// only place the two differ in how much of it one frame consumes.
+    pub const fn payloads_per_frame(self) -> usize {
+        match self {
+            Self::Dop => 1,
+            Self::NativeDsd => 2,
+        }
+    }
+
+    /// What the transport display calls this carrier.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dop => "DoP",
+            Self::NativeDsd => "native DSD",
+        }
+    }
+
+    /// Bits of container one frame gives each channel.
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Dop => 24,
+            Self::NativeDsd => 32,
+        }
+    }
+}
+
+/// Whether a stream format is the one a driver publishes for native DSD.
+///
+/// Nothing in the format says "DSD": Core Audio has no such format ID, so native goes out as
+/// integer PCM of the same width and rate as ordinary 32-bit PCM. Only the big-endian flag
+/// separates the two, and the driver reads exactly that flag to choose an alternate setting.
+/// Getting it wrong either way is audible, so all of the flags have to agree before a format
+/// counts as native.
+pub fn is_native_dsd(format: &AudioStreamBasicDescription) -> bool {
+    const REQUIRED: u32 = kAudioFormatFlagIsSignedInteger
+        | kAudioFormatFlagIsBigEndian
+        | kAudioFormatFlagIsNonMixable;
+    let channels = format.mChannelsPerFrame.max(1);
+    format.mFormatID == kAudioFormatLinearPCM
+        && format.mFormatFlags & REQUIRED == REQUIRED
+        && format.mBitsPerChannel == BYTES_PER_SUBSLOT as u32 * 8
+        && format.mBytesPerFrame / channels == BYTES_PER_SUBSLOT as u32
+}
 
 /// How a 24-bit DoP word is laid out in one sample of the device's stream format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
