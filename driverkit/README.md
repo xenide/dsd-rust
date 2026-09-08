@@ -211,6 +211,40 @@ the read position: it writes at a fraction of real time for about a second after
 starts. The read is bounded by the host's own last write, with silence past it, and `starved`
 counts how long that lasted.
 
+**The host leaves holes in the ring, and they are filled rather than counted.** Core Audio's
+IO cycle steps forward when a client misses its deadline: the sample time it hands the driver
+jumps past frames it never wrote. They sit *behind* the write head, which is where the
+starvation bound does not look, so the engine reads them, and what is in those slots is a ring
+wrap old -- a full amplitude discontinuity at each end of the hole.
+
+Nothing counted here can see it. The sample numbers are all correct, the margin is steady, and
+`crossings` and `laps` stay at zero while the contents are wrong. What found it was the write
+head's own arithmetic: consecutive cycles should advance by exactly one host buffer, and these
+did not.
+
+```
+09:56:19.348  host jumped +720 frames beyond its 128-frame cycles
+09:56:20.350  host jumped +572
+09:56:22.017  host jumped +320
+```
+
+Measured at 384000 against two clients on the same machine, same rate, same cold open:
+
+| client | host buffer | cycles skipped over | |
+| --- | --- | --- | --- |
+| Chrome | 128 frames, 0.33 ms | 32 in 42 s | about one a second |
+| Spotify | 512 frames, 1.33 ms | 2 in 79 s | about one in forty |
+
+128 frames is Web Audio's render quantum, which Chrome asks for whatever the rate, so at
+384000 its audio thread has a third of a millisecond to answer and misses about once a second.
+At 44100 the same buffer is 2.9 ms and it never misses. So the clicks were rate-dependent
+without anything about the rate being wrong.
+
+The driver writes the carrier's silence over the hole as soon as the cycle that skipped it
+reports, which is a read lag before the engine reaches it. `holes the host skipped over` counts
+them. A millisecond of silence once a second is not nothing, but it is inaudible beside what it
+replaces, and the frames it covers were never going to be audio.
+
 **A test signal helps.** A slow rising sine sweep makes these obvious where music does not: a
 repeat is heard as the pitch dropping back, a read point move as the pitch stepping. Twenty
 seconds from 300 Hz to 1200 Hz at low amplitude is enough.

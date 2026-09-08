@@ -131,6 +131,24 @@ uint32_t PeriodForRate(uint32_t rate) {
     return period;
 }
 
+/// Write one carrier's silence over `frames` sample frames of the ring at `position`,
+/// wrapping once at the end.
+void FillRing(uint8_t* ring, uint64_t ring_frames, uint64_t position, uint64_t frames,
+              uint32_t stride, uint8_t silence) {
+    if (ring == nullptr || ring_frames == 0 || frames == 0 || stride == 0) {
+        return;
+    }
+    uint64_t at = position % ring_frames;
+    uint64_t remaining = frames;
+    while (remaining > 0) {
+        const uint64_t available = ring_frames - at;
+        const uint64_t run = remaining < available ? remaining : available;
+        memset(ring + at * stride, silence, static_cast<size_t>(run * stride));
+        remaining -= run;
+        at = (at + run) % ring_frames;
+    }
+}
+
 /// One isochronous transfer's data buffer and frame list.
 struct Transfer {
     IOBufferMemoryDescriptor* data;
@@ -234,6 +252,11 @@ struct DsdAudioDriver_IVars {
     uint32_t last_write_frames;
     /// Frames sent as silence because the host had not written that far yet.
     uint64_t starved;
+    /// Cycles where Core Audio's sample time stepped over frames it never wrote, and the
+    /// frames in them. A client that misses its deadline leaves the hole rather than
+    /// filling it, and what is in those slots is a ring wrap old.
+    uint64_t skips;
+    uint64_t skipped;
     /// The byte this carrier calls silence: DSD silence is alternating bits, not zero.
     uint8_t silence_byte;
     /// IO operations the host has performed, so a sample of them can be logged.
@@ -775,6 +798,31 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                 if (margin >= lapped_at) {
                     state->laps++;
                 }
+                // A hole the host stepped over, filled with the carrier's silence before
+                // the engine reaches it.
+                //
+                // Core Audio's cycle can skip forward when a client misses its deadline,
+                // and the frames it skipped are never written. They sit behind the write
+                // head, where the starvation bound does not look, so the engine reads them
+                // and what is there is a ring wrap old -- a full amplitude discontinuity at
+                // both ends of it. Measured with Chrome at 384000, where its 128 frame
+                // buffer is a third of a millisecond: a few hundred frames skipped about
+                // once a second, heard as a regular click. Silence is the honest thing to
+                // put there and is inaudible beside what it replaces. The read point is a
+                // read lag ahead of this, so there is time.
+                const uint64_t written_to = state->last_write_sample + state->last_write_frames;
+                if (state->last_write_frames != 0 && in_sample_time > written_to &&
+                    state->ring_map) {
+                    uint64_t hole = in_sample_time - written_to;
+                    if (hole > state->ring_frames) {
+                        hole = state->ring_frames;
+                    }
+                    FillRing(reinterpret_cast<uint8_t*>(state->ring_map->GetAddress()),
+                             state->ring_frames, written_to, hole, state->frame_bytes,
+                             state->silence_byte);
+                    state->skips++;
+                    state->skipped += hole;
+                }
                 state->last_write_sample = in_sample_time;
                 state->last_write_frames = in_frame_size;
             }
@@ -1074,6 +1122,8 @@ kern_return_t DsdAudioDriver::StartDevice(IOUserAudioObjectID in_object_id,
         // that describe a start are per client, so they begin again here.
         ivars->crossings = 0;        ivars->laps = 0;
         ivars->starved = 0;
+        ivars->skips = 0;
+        ivars->skipped = 0;
         ivars->idle_completions = 0;
         ivars->client_active = true;
         Log("client starts on the engine already streaming %u Hz on alt %u",
@@ -1114,8 +1164,9 @@ kern_return_t DsdAudioDriver::StopDevice(IOUserAudioObjectID in_object_id,
     ivars->client_active = false;
     ivars->idle_completions = 0;
     Log("client stops: %llu cycles the engine had overtaken the host, %llu cycles the host "
-        "had lapped the read point, %llu frames sent as silence",
-        ivars->crossings, ivars->laps, ivars->starved);
+        "had lapped the read point, %llu frames sent as silence, %llu holes the host skipped "
+        "over (%llu frames)",
+        ivars->crossings, ivars->laps, ivars->starved, ivars->skips, ivars->skipped);
     return super::StopDevice(in_object_id, in_flags);
 }
 
@@ -1221,6 +1272,8 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->last_write_sample = 0;
     ivars->last_write_frames = 0;
     ivars->starved = 0;
+    ivars->skips = 0;
+    ivars->skipped = 0;
     ivars->silence_byte = alt->raw_data ? kDsdSilenceByte : 0;
     ivars->active_rate = rate;
     ivars->running = true;
@@ -1277,8 +1330,9 @@ void DsdAudioDriver::StopIsoc() {
     if (ivars->running) {
         if (ivars->crossings != 0 || ivars->laps != 0 || ivars->starved != 0) {
             Log("stream ends: %llu cycles the engine had overtaken the host, %llu cycles the "
-                "host had lapped the read point, %llu frames sent as silence",
-                ivars->crossings, ivars->laps, ivars->starved);
+                "host had lapped the read point, %llu frames sent as silence, %llu holes the "
+                "host skipped over (%llu frames)",
+                ivars->crossings, ivars->laps, ivars->starved, ivars->skips, ivars->skipped);
             Log("feedback over the session: %llu submits, %llu completions, %llu reports, "
                 "%llu misses, %llu re-arms",
                 ivars->feedback_submits, ivars->feedback_completions, ivars->feedback_reports,
