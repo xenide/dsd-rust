@@ -114,6 +114,10 @@ constexpr double kMaxFeedbackRatio = 1.05;
 /// within sixteen transfers, which is 64 milliseconds.
 constexpr double kTimelineGain = 1.0 / 16.0;
 
+/// The longest hole a straight line is drawn across. Past this a line stops resembling what
+/// it replaces, and a hole this long is a client restarting rather than one running late.
+constexpr uint64_t kBridgeMs = 5;
+
 /// A measured host clock outside this band is not a clock, and the timeline is resumed the
 /// blind way instead. The mach timebase is 24 MHz on Apple silicon and nanoseconds elsewhere;
 /// what the band is really guarding is the divide that turns a gap into sample frames.
@@ -207,11 +211,15 @@ void BridgeRing(uint8_t* ring, uint64_t ring_frames, uint64_t position, uint64_t
         const uint32_t offset = channel * sample_bytes;
         const int64_t from = ReadSample(ring + before * frame_bytes + offset, sample_bytes);
         const int64_t to = ReadSample(ring + after * frame_bytes + offset, sample_bytes);
+        uint64_t at = position % ring_frames;
         for (uint64_t index = 0; index < frames; index++) {
-            const uint64_t at = (position + index) % ring_frames;
             const int64_t value = from + (to - from) * static_cast<int64_t>(index + 1) / span;
             WriteSample(ring + at * frame_bytes + offset, sample_bytes,
                         static_cast<int32_t>(value));
+            at++;
+            if (at == ring_frames) {
+                at = 0;
+            }
         }
     }
 }
@@ -907,7 +915,9 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                     // that long is a client restarting rather than one running late. A raw
                     // carrier is never bridged: DSD is one bit per sample and the arithmetic
                     // between two of them means nothing.
-                    if (!state->raw_carrier && hole * 200 <= state->active_rate) {
+                    const uint64_t bridgeable =
+                        static_cast<uint64_t>(state->active_rate) * kBridgeMs / 1000;
+                    if (!state->raw_carrier && hole <= bridgeable) {
                         BridgeRing(ring_base, state->ring_frames, written_to, hole,
                                    state->frame_bytes, state->sample_bytes);
                     } else {
