@@ -304,6 +304,10 @@ struct DsdAudioDriver_IVars {
     uint32_t last_write_frames;
     /// Frames sent as silence because the host had not written that far yet.
     uint64_t starved;
+    /// The last pair posted, so the interval to the next one can be measured against the
+    /// rate it is supposed to describe. Diagnostic only.
+    uint64_t last_post_sample;
+    uint64_t last_post_host;
     /// Cycles where Core Audio's sample time stepped over frames it never wrote, and the
     /// frames in them. A client that misses its deadline leaves the hole rather than
     /// filling it, and what is in those slots is a ring wrap old.
@@ -888,6 +892,9 @@ kern_return_t DsdAudioDriver::PublishAudioObjects() {
                     }
                     state->skips++;
                     state->skipped += hole;
+                    if (state->skips <= 60) {
+                        Log("host skipped %llu frames at sample %llu", hole, written_to);
+                    }
                 }
                 state->last_write_sample = in_sample_time;
                 state->last_write_frames = in_frame_size;
@@ -1328,6 +1335,8 @@ kern_return_t DsdAudioDriver::StartIsoc(uint32_t rate, uint8_t alt_setting, uint
     ivars->prev_host = 0;
     ivars->session_sample = 0;
     ivars->session_host = 0;
+    ivars->last_post_sample = 0;
+    ivars->last_post_host = 0;
     ivars->io_calls = 0;
     ivars->timestamps_posted = 0;
     ivars->crossings = 0;
@@ -1776,9 +1785,24 @@ void IMPL(DsdAudioDriver, IsochComplete) {
                     static_cast<uint64_t>(static_cast<double>(at - ivars->prev_sample) *
                                           per_sample);
                 ivars->device->UpdateCurrentZeroTimestamp(at, when);
-                if (ivars->timestamps_posted < 3) {
-                    Log("posted zero timestamp %llu at host time %llu", at, when);
+                // Every one of them, with what the interval since the last says the clock
+                // is doing. Three a second, and the question this is asked to settle is
+                // whether they are steady.
+                if (ivars->last_post_host != 0 && at > ivars->last_post_sample &&
+                    ivars->host_ticks_per_second > kMinHostTicksPerSecond) {
+                    const double ticks_per_frame =
+                        ivars->host_ticks_per_second / static_cast<double>(ivars->active_rate);
+                    const double expected =
+                        static_cast<double>(at - ivars->last_post_sample) * ticks_per_frame;
+                    const double actual = static_cast<double>(when - ivars->last_post_host);
+                    Log("posted %llu at %llu: %lld frames on, %lld ticks, %lld off nominal",
+                        at, when, at - ivars->last_post_sample,
+                        static_cast<int64_t>(actual), static_cast<int64_t>(actual - expected));
+                } else {
+                    Log("posted %llu at %llu: first of the session", at, when);
                 }
+                ivars->last_post_sample = at;
+                ivars->last_post_host = when;
                 ivars->timestamps_posted++;
                 ivars->next_timestamp_at += ivars->ring_frames;
             }
