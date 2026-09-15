@@ -53,8 +53,12 @@ pub struct FlacReader {
     scratch: Vec<i32>,
     /// Interleaved carrier samples decoded but not yet handed out.
     pending: Vec<i32>,
-    /// Frame index the next [`FlacReader::read`] starts at.
+    /// Frame index the first sample of `pending` sits at, and so where the next
+    /// [`FlacReader::read`] starts.
     position: u64,
+    /// Set while the decoder has been pointed somewhere new and the next frame header is
+    /// the only thing that says where that is.
+    resynced: bool,
     max_block_frames: usize,
 }
 
@@ -74,6 +78,7 @@ impl FlacReader {
             scratch: Vec::new(),
             pending: Vec::new(),
             position: 0,
+            resynced: true,
             max_block_frames: metadata.max_block_frames,
         })
     }
@@ -88,8 +93,14 @@ impl FlacReader {
         let Some(block) = reader.read_next_or_eof(scratch)? else {
             return Ok(false);
         };
-        // The frame header carries its own sample number, which is what a seek landed on.
-        self.position = block.time();
+        // Only a frame that follows a jump is asked where it sits. Reading on from one that
+        // does is cheaper and, at the end of a stream whose blocks are a fixed size, more
+        // accurate: a final short block reports a sample number scaled by its own length
+        // rather than by the length the rest of the stream used.
+        if self.resynced {
+            self.position = block.time();
+            self.resynced = false;
+        }
         let channels = u32::from(self.format.channels);
         let planes: Vec<&[i32]> = (0..channels)
             .map(|channel| block.channel(channel))
@@ -115,6 +126,7 @@ impl FlacReader {
         file.seek(SeekFrom::Start(offset))?;
         self.frames = Some(FrameReader::new(BufferedReader::new(file)));
         self.pending.clear();
+        self.resynced = true;
         Ok(())
     }
 
