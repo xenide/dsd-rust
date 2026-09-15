@@ -23,9 +23,9 @@ use crate::output::hal::{self, Device, Stream};
 pub struct PlaybackState {
     pub frames_played: AtomicU64,
     pub underrun_frames: AtomicU64,
-    /// Set to drop whatever is queued and send DoP silence, so playback can end without a pop.
+    /// Set to drop whatever is queued and send carrier silence, so playback ends without a pop.
     pub silence: AtomicBool,
-    /// Set to hold the queue where it is and send DoP silence, so the DAC keeps DSD lock.
+    /// Set to hold the queue where it is and send carrier silence, so a DSD stream keeps lock.
     pub paused: AtomicBool,
     /// Set while a seek is being served: the queue is left alone and a short read is not an
     /// underrun, because the reader is repositioning rather than falling behind.
@@ -56,11 +56,32 @@ impl PlaybackState {
     }
 }
 
+/// How the samples waiting in the queue reach the DAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carrier {
+    /// DSD payloads, which the callback wraps in alternating-marker DoP frames.
+    Dop,
+    /// The container's own PCM codes, written out as they stand.
+    Pcm,
+}
+
+impl Carrier {
+    /// What the callback sends when there is nothing queued: DSD silence under a marker, or
+    /// PCM zero. Either way the DAC keeps its lock and nothing pops.
+    const fn silence(self) -> i32 {
+        match self {
+            Self::Dop => SILENCE_PAYLOAD as i32,
+            Self::Pcm => 0,
+        }
+    }
+}
+
 struct IoContext {
-    consumer: Consumer<u16>,
+    consumer: Consumer<i32>,
     channels: usize,
     stream_index: usize,
     encoding: Encoding,
+    carrier: Carrier,
     marker: Marker,
     state: Arc<PlaybackState>,
 }
@@ -71,6 +92,7 @@ impl IoContext {
             consumer,
             channels,
             encoding,
+            carrier,
             marker,
             state,
             ..
@@ -106,15 +128,16 @@ impl IoContext {
         for _ in 0..frames {
             let marker = marker.next();
             for channel in 0..stream_channels {
-                let payload = if channel < *channels {
-                    payloads.next().unwrap_or(SILENCE_PAYLOAD)
+                let sample = if channel < *channels {
+                    payloads.next().unwrap_or_else(|| carrier.silence())
                 } else {
-                    SILENCE_PAYLOAD
+                    carrier.silence()
                 };
-                encoding.write(
-                    dop::word(marker, payload),
-                    &mut out[cursor..cursor + sample_bytes],
-                );
+                let word = match carrier {
+                    Carrier::Dop => dop::word(marker, sample as u16),
+                    Carrier::Pcm => sample,
+                };
+                encoding.write(word, &mut out[cursor..cursor + sample_bytes]);
                 cursor += sample_bytes;
             }
         }
@@ -256,6 +279,7 @@ pub fn supported_dop_rates(device: &Device) -> Vec<u32> {
 pub struct Request {
     pub pcm_rate: u32,
     pub channels: u16,
+    pub carrier: Carrier,
     pub exclusive: bool,
     pub buffer_frames: Option<u32>,
     /// Set when `pcm_rate` came from [`probe_dop_rate`] rather than from the advertised
@@ -283,10 +307,11 @@ pub struct Output {
 }
 
 impl Output {
-    pub fn open(device: Device, request: &Request, consumer: Consumer<u16>) -> Result<Self> {
+    pub fn open(device: Device, request: &Request, consumer: Consumer<i32>) -> Result<Self> {
         let Request {
             pcm_rate,
             channels,
+            carrier,
             exclusive,
             buffer_frames,
             ..
@@ -369,6 +394,7 @@ impl Output {
             channels: channels as usize,
             stream_index,
             encoding: output.encoding,
+            carrier,
             marker: Marker::new(),
             state: Arc::clone(&output.state),
         }));
@@ -756,7 +782,7 @@ mod tests {
 
     use crate::dop::{MARKER_A, MARKER_B, SILENCE_PAYLOAD, pack_planes, split_word};
     use crate::output::encoding::Encoding;
-    use crate::output::stream::{IoContext, Marker, PlaybackState, keep_distinct_layouts};
+    use crate::output::stream::{Carrier, IoContext, Marker, PlaybackState, keep_distinct_layouts};
     use crate::reader::DsdSource;
     use crate::reader::dsf::DsfReader;
     use crate::reader::dsf::tests::{BLOCK, dsf_file};
@@ -796,7 +822,7 @@ mod tests {
     }
 
     /// Pull a whole file through the reader and the DoP packer.
-    fn payloads_of(file: Vec<u8>) -> (Vec<u16>, Vec<Vec<u8>>) {
+    fn payloads_of(file: Vec<u8>) -> (Vec<i32>, Vec<Vec<u8>>) {
         let mut source = DsfReader::new(Cursor::new(file)).expect("parses");
         let channels = source.format().channels as usize;
         let mut planes: Vec<Box<[u8]>> = vec![vec![0; source.chunk_bytes()].into(); channels];
@@ -815,8 +841,8 @@ mod tests {
         }
     }
 
-    fn context(payloads: &[u16], stream_channels: usize) -> (IoContext, Arc<PlaybackState>) {
-        let (mut producer, consumer) = RingBuffer::<u16>::new(payloads.len().max(1) * 2);
+    fn context(payloads: &[i32], stream_channels: usize) -> (IoContext, Arc<PlaybackState>) {
+        let (mut producer, consumer) = RingBuffer::<i32>::new(payloads.len().max(1) * 2);
         for payload in payloads {
             producer.push(*payload).expect("ring has room");
         }
@@ -826,6 +852,7 @@ mod tests {
             channels: 2,
             stream_index: 0,
             encoding: ENCODING,
+            carrier: Carrier::Dop,
             marker: Marker::new(),
             state: Arc::clone(&state),
         };

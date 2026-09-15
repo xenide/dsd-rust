@@ -4,7 +4,6 @@
 //! and a ring feeds the isochronous engine. It exists separately because the two carry
 //! different units -- DoP queues 24-bit words, native queues raw bytes.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -13,17 +12,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rtrb::{Producer, RingBuffer};
 
+use crate::audio::AudioFormat;
 use crate::dsd::DsdFormat;
 use crate::native;
 use crate::output::stream::PlaybackState;
 use crate::output::usb::descriptors::NativeDsd;
 use crate::output::usb::device::{Dac, Held};
 use crate::output::usb::stream::NativeStream;
-use crate::player::{
-    DeviceInfo, PARK, PREFILL_TIMEOUT, Progress, Target, TrackInfo, seek_position,
-};
+use crate::player::{DeviceInfo, PARK, PREFILL_TIMEOUT, Progress, Target, TrackInfo, seek_to};
 use crate::reader::tags::TrackTags;
-use crate::reader::{self, DsdSource};
+use crate::reader::{self, DsdSource, TrackRef};
 
 /// How long the DAC keeps receiving DSD silence after the music ends, so it does not pop.
 const TAIL: Duration = Duration::from_millis(150);
@@ -181,12 +179,16 @@ impl NativeSession {
     /// window that the re-enumeration has already closed, so the race is run once per
     /// playlist rather than once per track.
     pub fn open(
-        path: &Path,
+        track: &TrackRef,
         target: &mut Target,
         buffer_ms: u32,
         stop: &Arc<AtomicBool>,
     ) -> Result<Self> {
-        let source = reader::open(path)?;
+        let opened = reader::open(track)?;
+        let duration = opened.duration_secs();
+        let Some(source) = opened.into_dsd() else {
+            bail!("{track} holds PCM, which has no native DSD path");
+        };
         let format = source.format();
         let channels = format.channels as usize;
         let dsd_rate = format.rate.hz();
@@ -217,7 +219,7 @@ impl NativeSession {
             tags: source.tags().clone(),
             format,
             container: source.container(),
-            duration: source.duration_secs(),
+            duration,
             frame_rate: format.rate.native_frame_rate(),
             bytes_per_channel: source.total_bytes_per_channel(),
         };
@@ -285,10 +287,10 @@ impl NativeSession {
     /// Take the source from the parked reader, move it, and drop the queue that was filled
     /// from the old position, moving the counters with it.
     fn reposition(&self, delta: f64) -> Result<()> {
-        let target = seek_position(
+        let target = seek_to(
             self.elapsed(),
             delta,
-            self.info.format.rate,
+            f64::from(self.info.format.rate.hz()) / 8.0,
             self.info.bytes_per_channel,
         );
         let mut source = self.source.lock().unwrap_or_else(PoisonError::into_inner);
@@ -317,10 +319,9 @@ impl NativeSession {
         TrackInfo {
             container: self.info.container,
             tags: self.info.tags.clone(),
-            format: self.info.format,
+            format: AudioFormat::Dsd(self.info.format),
             duration: self.info.duration,
             total_frames: self.info.total_frames(),
-            bytes_per_channel: self.info.bytes_per_channel,
         }
     }
 

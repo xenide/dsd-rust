@@ -43,7 +43,10 @@ pub const fn split_word(word: i32) -> (u8, u16) {
 
 /// Interleave planar MSB-first DSD into DoP payloads: two DSD bytes per frame per channel.
 /// A plane of odd length pairs its final byte with DSD silence.
-pub fn pack_planes(planes: &[&[u8]], out: &mut Vec<u16>) -> usize {
+///
+/// Payloads ride in the low sixteen bits of the carrier word the queue carries; the marker
+/// that completes the DoP frame is added by the render callback, which owns the alternation.
+pub fn pack_planes(planes: &[&[u8]], out: &mut Vec<i32>) -> usize {
     let Some(first) = planes.first() else {
         return 0;
     };
@@ -56,7 +59,7 @@ pub fn pack_planes(planes: &[&[u8]], out: &mut Vec<u16>) -> usize {
                 .get(frame * 2 + 1)
                 .copied()
                 .unwrap_or(DSD_SILENCE_BYTE);
-            out.push(u16::from_be_bytes([high, low]));
+            out.push(i32::from(u16::from_be_bytes([high, low])));
         }
     }
     frames
@@ -74,7 +77,7 @@ mod tests {
         for frame in payloads.chunks(planes.len()) {
             let byte = marker.next();
             for payload in frame {
-                words.push(word(byte, *payload));
+                words.push(word(byte, *payload as u16));
             }
         }
         words

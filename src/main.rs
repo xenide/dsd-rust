@@ -1,3 +1,4 @@
+mod audio;
 mod dop;
 mod dsd;
 mod native;
@@ -6,6 +7,7 @@ mod player;
 mod reader;
 mod tui;
 
+use crate::audio::AudioFormat;
 use crate::dsd::DsdRate;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +20,8 @@ use crate::output::FormatLine;
 use crate::player::{PlayOptions, Target};
 use crate::reader::tags::TrackTags;
 
-/// Bit-perfect DSD player. DSD is carried to the DAC untouched, as DoP 1.1.
+/// Bit-perfect player. DSD reaches the DAC as DoP 1.1 or native DSD, and PCM at the file's
+/// own sample rate, either way untouched.
 #[derive(Debug, Parser)]
 #[command(name = "dsd-rust", version, about, long_about = None)]
 struct Cli {
@@ -28,7 +31,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Play DSF or DSDIFF files in order
+    /// Play DSF, DSDIFF, FLAC, or SACD image files in order
     Play {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -38,14 +41,14 @@ enum Command {
         /// Leave the device shared with other apps instead of claiming it exclusively
         #[arg(long)]
         shared: bool,
-        /// Size of the DoP queue between the reader and the audio callback
+        /// Size of the queue between the reader and the audio callback
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(20..=10000))]
         buffer_ms: u32,
         /// Override the device IO buffer size, in frames
         #[arg(long)]
         buffer_frames: Option<u32>,
     },
-    /// Browse and play DSD files in a terminal UI
+    /// Browse and play files in a terminal UI
     Tui {
         /// Directory to start browsing in; defaults to the working directory
         dir: Option<PathBuf>,
@@ -55,20 +58,20 @@ enum Command {
         /// Leave the device shared with other apps instead of claiming it exclusively
         #[arg(long)]
         shared: bool,
-        /// Size of the DoP queue between the reader and the audio callback
+        /// Size of the queue between the reader and the audio callback
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(20..=10000))]
         buffer_ms: u32,
         /// Override the device IO buffer size, in frames
         #[arg(long)]
         buffer_frames: Option<u32>,
     },
-    /// List output devices and the DoP rates they accept
+    /// List output devices and the DSD rates they accept
     Devices {
         /// Also list every stream format each device advertises
         #[arg(long)]
         formats: bool,
     },
-    /// Print what a DSD file contains
+    /// Print what a file contains
     Info {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -142,8 +145,14 @@ fn play_all(files: &[PathBuf], device: Option<&str>, options: &PlayOptions) -> R
         handler_stop.store(true, Ordering::Relaxed);
     })?;
 
+    // A disc image is a whole disc, so it joins the playlist as the tracks it holds.
+    let mut playlist = Vec::new();
     for file in files {
-        let played = player::play(file, &mut target, options, &stop);
+        playlist.extend(reader::tracks_of(file)?);
+    }
+
+    for track in &playlist {
+        let played = player::play(track, &mut target, options, &stop);
         // An interrupt can surface as an error from a half-opened device. The user asked to
         // stop, so that is not worth reporting as a failure.
         if interrupted.load(Ordering::Relaxed) {
@@ -238,25 +247,37 @@ fn tag_rows(tags: &TrackTags) -> Vec<(&'static str, String)> {
 
 fn show_info(files: &[PathBuf]) -> Result<()> {
     for file in files {
-        let source = reader::open(file)?;
-        let format = source.format();
-        let seconds = source.duration_secs();
-        println!("{}", file.display());
-        for (label, value) in tag_rows(source.tags()) {
-            println!("    {label:<11} {value}");
+        for track in reader::tracks_of(file)? {
+            let source = reader::open(&track)?;
+            let format = source.format();
+            let seconds = source.duration_secs();
+            println!("{track}");
+            for (label, value) in tag_rows(source.tags()) {
+                println!("    {label:<11} {value}");
+            }
+            println!("    container   {}", source.container());
+            println!("    format      {format}");
+            println!(
+                "    duration    {}:{:05.2}",
+                (seconds / 60.0) as u64,
+                seconds % 60.0
+            );
+            println!(
+                "    carrier     {} {} Hz, {} bit",
+                format.carrier_name(),
+                format.carrier_rate(),
+                format.carrier_bits()
+            );
+            match format {
+                AudioFormat::Dsd(_) => println!(
+                    "    audio       {} bytes per channel",
+                    source.total_frames() * 2
+                ),
+                AudioFormat::Pcm(_) => {
+                    println!("    audio       {} frames", source.total_frames());
+                }
+            }
         }
-        println!("    container   {}", source.container());
-        println!("    format      {format}");
-        println!(
-            "    duration    {}:{:05.2}",
-            (seconds / 60.0) as u64,
-            seconds % 60.0
-        );
-        println!("    dop rate    {} Hz, 24 bit", format.rate.dop_pcm_rate());
-        println!(
-            "    audio       {} bytes per channel",
-            source.total_bytes_per_channel()
-        );
     }
     Ok(())
 }

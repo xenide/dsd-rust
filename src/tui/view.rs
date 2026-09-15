@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph};
 
+use crate::audio::AudioFormat;
 use crate::player::{DeviceInfo, Progress, TrackInfo, clock};
 use crate::tui::browser::Browser;
 use crate::tui::engine::{State, Status};
@@ -34,15 +35,16 @@ fn draw_files(frame: &mut Frame, area: Rect, browser: &Browser, status: &Status)
     let title = format!(" {} ", short_path(&browser.dir));
     let mut items = Vec::new();
     for entry in &browser.entries {
-        let playing = status.path.as_deref() == Some(entry.path.as_path());
+        let playing =
+            entry.kind.track().is_some() && status.track_ref.as_ref() == entry.kind.track();
         let (marker, style) = if playing {
             ("▸ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
-        } else if entry.is_dir {
+        } else if entry.kind.opens() {
             ("  ", Style::new().fg(Color::Blue))
         } else {
             ("  ", Style::new())
         };
-        let suffix = if entry.is_dir { "/" } else { "" };
+        let suffix = if entry.kind.opens() { "/" } else { "" };
         let label = entry.title.as_ref().unwrap_or(&entry.name);
         items.push(ListItem::new(Line::from(vec![
             Span::raw(marker),
@@ -75,10 +77,9 @@ fn draw_playing(frame: &mut Frame, area: Rect, status: &Status) {
     ])
     .areas(inner);
     let filename = status
-        .path
+        .track_ref
         .as_ref()
-        .and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(|track| track.label())
         .unwrap_or_else(|| "nothing loaded".to_owned());
     // The tags name the recording; the filename is what is left when a file carries none.
     let tags = status.track.as_ref().map(|track| &track.tags);
@@ -213,15 +214,23 @@ fn debug_rows(device: &DeviceInfo, track: &TrackInfo, progress: Progress) -> Vec
             "frames",
             format!("{} of {}", progress.frames_played, track.total_frames),
         ),
-        row(
-            "dsd",
-            format!(
-                "{} bit/s per channel, {} bytes per channel",
-                track.format.rate.hz(),
-                track.bytes_per_channel
-            ),
-        ),
+        row("stream", stream_row(track)),
     ]
+}
+
+/// What the recording itself is, under whatever the device made of it.
+fn stream_row(track: &TrackInfo) -> String {
+    match track.format {
+        AudioFormat::Dsd(format) => format!(
+            "{} bit/s per channel, {} bytes per channel",
+            format.rate.hz(),
+            track.total_frames * 2
+        ),
+        AudioFormat::Pcm(format) => format!(
+            "{} Hz {} bit, {} frames",
+            format.rate, format.bits, track.total_frames
+        ),
+    }
 }
 
 /// Directory titles are long and the pane is narrow, so abbreviate home and keep the tail.
@@ -258,8 +267,10 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crate::audio::AudioFormat;
     use crate::dsd::{DsdFormat, DsdRate};
     use crate::player::{DeviceInfo, Progress, TrackInfo};
+    use crate::reader::TrackRef;
     use crate::reader::tags::TrackTags;
     use crate::tui::browser::Browser;
     use crate::tui::engine::{State, Status};
@@ -268,17 +279,16 @@ mod tests {
     fn playing_status(dir: &std::path::Path) -> Status {
         Status {
             state: State::Playing,
-            path: Some(dir.join("track.dsf")),
+            track_ref: Some(TrackRef::file(dir.join("track.dsf"))),
             track: Some(TrackInfo {
                 container: "DSF",
                 tags: TrackTags::default(),
-                format: DsdFormat {
+                format: AudioFormat::Dsd(DsdFormat {
                     rate: DsdRate::new(5_644_800),
                     channels: 2,
-                },
+                }),
                 duration: 120.0,
                 total_frames: 42_336_000,
-                bytes_per_channel: 84_672_000,
             }),
             device: Some(DeviceInfo {
                 carrier: "DoP",
@@ -298,7 +308,7 @@ mod tests {
                 queued_frames: 44_100,
                 queue_frames: 88_200,
             },
-            playlist: vec![dir.join("track.dsf")],
+            playlist: vec![TrackRef::file(dir.join("track.dsf"))],
             index: 0,
             error: None,
         }
