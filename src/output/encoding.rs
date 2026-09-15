@@ -6,7 +6,8 @@ use coreaudio_sys::{
 
 use crate::dop::FLOAT_SCALE;
 
-/// How a 24-bit DoP word is laid out in one sample of the device's stream format.
+/// How a 24-bit carrier word is laid out in one sample of the device's stream format. DoP
+/// frames and left-justified PCM are the same width, so one layout serves both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Float32,
@@ -35,10 +36,10 @@ impl Encoding {
             return Ok(Self::Float32);
         }
         if flags & kAudioFormatFlagIsSignedInteger == 0 {
-            bail!("unsigned integer stream formats cannot carry DoP");
+            bail!("unsigned integer stream formats are not supported");
         }
         if bits < 24 {
-            bail!("DoP needs at least 24 bits per sample, the stream offers {bits}");
+            bail!("the carrier needs at least 24 bits per sample, the stream offers {bits}");
         }
 
         let aligned_high = flags & kAudioFormatFlagIsAlignedHigh != 0;
@@ -71,7 +72,7 @@ impl Encoding {
         }
     }
 
-    /// Write one DoP word into `out`, which must be [`Encoding::bytes_per_sample`] long.
+    /// Write one carrier word into `out`, which must be [`Encoding::bytes_per_sample`] long.
     pub fn write(self, word: i32, out: &mut [u8]) {
         match self {
             Self::Float32 => out.copy_from_slice(&(word as f32 * FLOAT_SCALE).to_le_bytes()),

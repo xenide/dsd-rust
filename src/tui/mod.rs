@@ -91,20 +91,23 @@ impl App {
         }
     }
 
-    /// A folder is descended into; a file starts the whole folder playing from that file.
+    /// A folder or a disc image is descended into; a recording starts the whole listing
+    /// playing from there.
     fn open_selection(&mut self) {
         let Some(entry) = self.browser.selection() else {
             return;
         };
-        if entry.is_dir {
-            let dir = entry.path.clone();
-            self.browser.enter(dir);
+        if entry.kind.opens() {
+            let path = entry.path.clone();
+            self.browser.enter(path);
             return;
         }
-        let path = entry.path.clone();
-        let files = self.browser.playable();
-        let index = files.iter().position(|file| *file == path).unwrap_or(0);
-        self.engine.load(files, index);
+        let Some(track) = entry.kind.track().cloned() else {
+            return;
+        };
+        let tracks = self.browser.playable();
+        let index = tracks.iter().position(|other| *other == track).unwrap_or(0);
+        self.engine.load(tracks, index);
     }
 
     fn go_up(&mut self) {

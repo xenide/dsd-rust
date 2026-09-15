@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -6,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::player::{DeviceInfo, PlayOptions, Playback, Progress, Target, TrackInfo};
+use crate::reader::TrackRef;
 
 const POLL: Duration = Duration::from_millis(20);
 /// How long the worker waits for a command when there is nothing playing to watch.
@@ -13,7 +13,7 @@ const IDLE: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 enum Command {
-    Load { files: Vec<PathBuf>, index: usize },
+    Load { tracks: Vec<TrackRef>, index: usize },
     Toggle,
     Stop,
     Skip(i32),
@@ -51,11 +51,11 @@ impl State {
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     pub state: State,
-    pub path: Option<PathBuf>,
+    pub track_ref: Option<TrackRef>,
     pub track: Option<TrackInfo>,
     pub device: Option<DeviceInfo>,
     pub progress: Progress,
-    pub playlist: Vec<PathBuf>,
+    pub playlist: Vec<TrackRef>,
     pub index: usize,
     pub error: Option<String>,
 }
@@ -101,8 +101,8 @@ impl Engine {
             .clone()
     }
 
-    pub fn load(&self, files: Vec<PathBuf>, index: usize) {
-        self.send(Command::Load { files, index });
+    pub fn load(&self, tracks: Vec<TrackRef>, index: usize) {
+        self.send(Command::Load { tracks, index });
     }
 
     pub fn toggle(&self) {
@@ -143,7 +143,7 @@ struct Worker {
     commands: Receiver<Command>,
     session: Option<Playback>,
     stop: Arc<AtomicBool>,
-    playlist: Vec<PathBuf>,
+    playlist: Vec<TrackRef>,
     index: usize,
 }
 
@@ -166,8 +166,8 @@ impl Worker {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Load { files, index } => {
-                self.playlist = files;
+            Command::Load { tracks, index } => {
+                self.playlist = tracks;
                 self.start(index);
             }
             Command::Toggle => match &self.session {
@@ -199,14 +199,14 @@ impl Worker {
     /// Play the track at `index`, replacing whatever is playing now.
     fn start(&mut self, index: usize) {
         self.end_session();
-        let Some(path) = self.playlist.get(index).cloned() else {
+        let Some(track) = self.playlist.get(index).cloned() else {
             return;
         };
         self.index = index;
         self.set_error(None);
-        match Playback::open(&path, &mut self.target, &self.options, &self.stop) {
+        match Playback::open(&track, &mut self.target, &self.options, &self.stop) {
             Ok(session) => self.session = Some(session),
-            Err(error) => self.set_error(Some(format!("{path:?}: {error:#}"))),
+            Err(error) => self.set_error(Some(format!("{}: {error:#}", track.label()))),
         }
     }
 
@@ -277,7 +277,7 @@ impl Worker {
         } else {
             State::Playing
         };
-        status.path = self.playlist.get(self.index).cloned();
+        status.track_ref = self.playlist.get(self.index).cloned();
         status.track = Some(session.track());
         status.device = Some(session.device());
         status.progress = session.progress();

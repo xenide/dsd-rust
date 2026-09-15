@@ -1,7 +1,11 @@
 # dsd-rust
 
-A bit-perfect command line DSD player for macOS. DSD bits reach the DAC exactly as they
-are stored in the file, wrapped in DSD over PCM (DoP) 1.1.
+A bit-perfect command line player for macOS. Samples reach the DAC exactly as the file
+stores them: DSD wrapped in DSD over PCM (DoP) 1.1 or sent natively, and PCM at the file's
+own sample rate. Either way the device is claimed and locked to the rate the recording
+wants, so nothing resamples, mixes, or attenuates on the way.
+
+It reads DSF, DSDIFF, FLAC, and SACD disc images.
 
 ## Usage
 
@@ -10,8 +14,10 @@ dsd-rust devices                       # output devices, and the DSD rates they 
 dsd-rust devices --formats             # plus every stream format each device advertises
 dsd-rust info track.dsf                # tags, container, rate, channels, duration
 dsd-rust play track.dsf                # play on the default output device
+dsd-rust play album.flac               # PCM, at the file's own rate and width
+dsd-rust play disc.iso                 # every track of a SACD image, in order
 dsd-rust play *.dsf --device "D50"     # pick a device by name fragment or UID
-dsd-rust tui ~/Music/dsd               # browse, play, and watch the transport
+dsd-rust tui ~/Music                   # browse, play, and watch the transport
 ```
 
 `play` options: `--shared` leaves the device available to other apps, `--buffer-ms`
@@ -22,16 +28,18 @@ refused under `--shared`, because that path claims the DAC outright.
 
 Files play in the order given, and the device is resolved once for the whole list: holding a
 device exclusively moves the system default output elsewhere, so re-resolving between tracks
-would pick the wrong one. Tracks may mix DSD rates; the device is reconfigured for each.
+would pick the wrong one. A playlist may mix DSD and PCM and mix rates within either; the
+device is reconfigured for each track. A disc image joins the list as the tracks it holds.
 
 ## Tags
 
-Both containers can name the recording, and `info`, the file browser, and the transport all
+Every container can name the recording, and `info`, the file browser, and the transport all
 show what they carry. DSF files keep an ID3v2 tag past the audio; DSDIFF files keep the
 artist and title in an edited-master information chunk, which may sit either side of the
-sound data. Only the title, artist, album, and track number are read: artwork and the rest
-of a tag are skipped. A file with no tags, or one whose tag will not parse, still lists and plays
-under its filename.
+sound data; FLAC files keep a Vorbis comment; a SACD image names its album and every track
+in the disc's own text blocks. Only the title, artist, album, and track number are read:
+artwork and the rest of a tag are skipped. A file with no tags, or one whose tag will not
+parse, still lists and plays under its filename.
 
 ```
 dsd-rust info track.dsf
@@ -47,9 +55,10 @@ track.dsf
 ## Terminal UI
 
 `dsd-rust tui [dir]` opens a file browser over `dir` (the working directory by default),
-showing folders and DSD files only. A tagged file lists under its track number and title, an
-untagged one under its filename, and either way the pane keeps the order the files sort in on
-disk. It takes the same `--device`, `--shared`, `--buffer-ms`,
+showing folders, disc images, and playable files only. A tagged file lists under its track
+number and title, an untagged one under its filename, and either way the pane keeps the order
+the files sort in on disk. A disc image opens like a folder, listing the tracks inside it in
+the order the disc numbers them. It takes the same `--device`, `--shared`, `--buffer-ms`,
 and `--buffer-frames` options as `play`.
 
 ```
@@ -60,7 +69,8 @@ and `--buffer-frames` options as `play`.
  r            re-read folder
 ```
 
-Playing a file queues the whole folder from that file on, in the order the pane lists it.
+Playing a file queues the rest of the listing from that file on, in the order the pane shows
+it -- the folder's other files, or the disc image's remaining tracks.
 Pausing and seeking keep the DAC fed with DoP silence rather than stopping the stream, so the
 DAC holds DSD lock and neither costs a relock. Seeking drops what is queued and restarts the
 reader at the new position, so the jump takes about as long as it takes to refill. The debug
@@ -73,13 +83,47 @@ device     Topping D50  exclusive, mixing off
 transport  integer 24 bit, DoP 352800 Hz
 io buffer  512 frames (1.5 ms)
 queue       50%   44100 of 88200 frames
-underruns  0 frames (0 ms of DoP silence)
+underruns  0 frames (0 ms of DSD silence)
 frames     10584000 of 42336000
-dsd        5644800 bit/s per channel, 84672000 bytes per channel
+stream     5644800 bit/s per channel, 84672000 bytes per channel
 ```
 
 A rising `underruns` count means the reader is not keeping up; raise `--buffer-ms`. A `queue`
 that sits near 0% is the same warning before it becomes audible.
+
+## PCM
+
+A FLAC file is decoded and handed to the device at its own sample rate and width. The device
+is claimed the same way a DSD file claims it -- hog mode, mixing off where the device offers
+the switch, and the stream format set to the file's rate -- so macOS neither resamples the
+file nor mixes anything else into it. A DAC that does not offer the file's rate is told so
+rather than played to at a rate it does offer: resampling is the one thing this player will
+not do.
+
+Samples are left-justified into the same 24-bit word DoP frames use, which is a shift by a
+power of two and so exact; a 16-bit file reaches the DAC as the codes it stores, scaled but
+never rounded. FLAC wider than 24 bits is refused rather than truncated.
+
+Seeking uses the file's seek table where it has one, so a jump costs a single read. A file
+written without one is decoded forward to the target instead, which is why only a seek
+backwards through such a file takes a moment.
+
+## SACD disc images
+
+A `.iso` rip of a SACD is a whole disc, so it opens as a list of tracks: `play disc.iso`
+plays all of them in order, and the file browser descends into the image the way it descends
+into a folder. The two-channel area is used where the disc has one, and the multichannel area
+where it does not.
+
+Almost every SACD stores its DSD compressed with DST, so an image is decoded rather than
+copied: the arithmetic coder, the prediction filters and the probability tables are read from
+each frame and reset at its start. DST is lossless, so what reaches the DAC is the DSD the
+disc was mastered with, bit for bit. Decoding runs at about twenty times real time per core
+for stereo DSD64, so it keeps ahead of playback with room to spare.
+
+Because every frame stands on its own, a seek needs no history: the track's sectors are
+halved by the timecode each audio frame carries, which finds the frame holding the target in
+about twenty reads rather than by decoding the distance.
 
 ## Native DSD
 
@@ -132,8 +176,11 @@ DAC whose two names have nothing in common needs its USB name passed to `--devic
 
 ## What "bit-perfect" means here
 
-* DSD samples are never resampled, filtered, or attenuated. The player only reorders bits
-  and adds DoP marker bytes.
+* Samples are never resampled, filtered, or attenuated. For DSD the player only reorders
+  bits and adds DoP marker bytes; for PCM it only shifts codes into a wider container, which
+  scales every one of them by the same power of two.
+* A file is played at its own rate or not at all. The device is set to the rate the recording
+  wants, and a device that will not take that rate is reported rather than worked around.
 * DSF stores DSD least-significant-bit first; those bytes are flipped to MSB-first because
   that is the order DoP defines. DSDIFF is already MSB-first and passes through untouched.
 * Each 24-bit PCM frame carries an alternating `0x05`/`0xFA` marker and 16 DSD bits, so the
@@ -147,8 +194,10 @@ DAC whose two names have nothing in common needs its USB name passed to `--devic
 * Because the callback is handed whatever the stream's virtual format happens to be, the
   player waits for that format to settle before creating the callback. Sampling it too early
   would mean writing float samples into an integer buffer, which is noise, not a subtle fault.
-* Underruns and the end of a track emit DSD silence (`0x69`), never PCM zero, so the DAC
-  stays locked and does not pop.
+* Underruns and the end of a DSD track emit DSD silence (`0x69`), never PCM zero, so the DAC
+  stays locked and does not pop. A PCM track emits zero, which is what silence is there.
+* DST decoding is lossless by construction, and the decoder is exact: no filtering or
+  dithering stands between a disc image and the DoP frames the DAC receives.
 
 The device format, sample rate, mixing switch, and hog mode are all restored when playback
 ends, along with the system output device: claiming a device exclusively makes macOS pick a
@@ -162,10 +211,12 @@ and exits at once, still handing the device back.
 
 * DSF (`.dsf`), DSD64 through DSD512, up to 6 channels
 * DSDIFF (`.dff`), uncompressed `DSD ` sound data
+* FLAC (`.flac`), any sample rate the device offers, 16 or 24 bit, up to 8 channels
+* SACD disc images (`.iso`), DSD64, DST-compressed or not
 
-DST-compressed DSDIFF and SACD ISO images are not supported.
+DST-compressed DSDIFF is not supported; the same compression inside a disc image is.
 
 ## Requirements
 
-macOS, a DAC that accepts DoP or native DSD, and a stable Rust toolchain. Build with
-`cargo build --release`.
+macOS, a DAC that accepts DoP or native DSD for DSD material (any output device will do for
+PCM), and a stable Rust toolchain. Build with `cargo build --release`.
