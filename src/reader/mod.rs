@@ -1,7 +1,9 @@
+pub mod cue;
 pub mod dff;
 pub mod dsf;
 pub mod flac;
 pub mod sacd;
+pub mod span;
 pub mod tags;
 
 use std::fmt;
@@ -14,20 +16,24 @@ use anyhow::{Context, Result, bail};
 use crate::audio::{AudioFormat, PcmFormat};
 use crate::dop;
 use crate::dsd::DsdFormat;
+use crate::reader::cue::{CueTrack, Sheet};
 use crate::reader::dff::DffReader;
 use crate::reader::dsf::DsfReader;
 use crate::reader::flac::FlacReader;
 use crate::reader::sacd::Disc;
+use crate::reader::span::{SpanDsd, SpanPcm};
 use crate::reader::tags::TrackTags;
 
 /// DSD bytes per channel one DoP frame carries.
 pub const DOP_BYTES_PER_FRAME: u64 = 2;
 
-/// One recording to play: a file, or one track of a container that holds a whole disc.
+/// One recording to play: a file, or one track of something that describes a whole disc --
+/// a SACD image, or a cue sheet over a file holding a whole side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackRef {
+    /// The file the track is named in: the image itself, or the cue sheet.
     pub path: PathBuf,
-    /// Which track of a disc image. `None` for a file that is one recording on its own.
+    /// Which track of that disc. `None` for a file that is one recording on its own.
     pub number: Option<u32>,
 }
 
@@ -199,6 +205,36 @@ impl Source {
         }
     }
 
+    /// Narrow this to one track of a cue sheet: the same audio, bounded to the times the
+    /// sheet gives and carrying the names it gives instead of the file's.
+    fn narrowed(self, track: &CueTrack) -> Result<Self> {
+        let tags = track.tags.clone();
+        match self {
+            Self::Dsd { source, .. } => {
+                let rate = source.format().rate.hz();
+                let total = source.total_bytes_per_channel();
+                let end = track
+                    .end
+                    .map_or(total, |time| time.dsd_bytes(rate))
+                    .min(total);
+                let start = track.start.dsd_bytes(rate).min(end);
+                Ok(Self::of_dsd(Box::new(SpanDsd::new(
+                    source, start, end, tags,
+                )?)))
+            }
+            Self::Pcm(source) => {
+                let rate = source.format().rate;
+                let total = source.total_frames();
+                let end = track
+                    .end
+                    .map_or(total, |time| time.pcm_frames(rate))
+                    .min(total);
+                let start = track.start.pcm_frames(rate).min(end);
+                Ok(Self::Pcm(Box::new(SpanPcm::new(source, start, end, tags)?)))
+            }
+        }
+    }
+
     /// Hand the DSD source over to the native USB path, which carries the bytes itself
     /// rather than wrapping them in DoP frames.
     pub fn into_dsd(self) -> Option<Box<dyn DsdSource>> {
@@ -212,6 +248,9 @@ impl Source {
 /// Open a recording, dispatching on the container magic rather than the extension.
 pub fn open(track: &TrackRef) -> Result<Source> {
     if let Some(number) = track.number {
+        if cue::is_cue(&track.path) {
+            return open_cue_track(&Sheet::read(&track.path)?, number);
+        }
         return Ok(Source::of_dsd(Box::new(
             Disc::open(&track.path)?.reader(number)?,
         )));
@@ -253,18 +292,59 @@ pub fn open(track: &TrackRef) -> Result<Source> {
     }
 }
 
+/// Open one track of a cue sheet: the file the sheet names, bounded to the track.
+fn open_cue_track(sheet: &Sheet, number: u32) -> Result<Source> {
+    let Some(track) = sheet.track(number) else {
+        bail!(
+            "{} lists tracks {}, so there is no track {number}",
+            sheet.path.display(),
+            sheet.numbering()
+        );
+    };
+    let source = open(&TrackRef::file(track.file.clone())).with_context(|| {
+        format!(
+            "{} names {} as its audio",
+            sheet.path.display(),
+            track.file.display()
+        )
+    })?;
+    source.narrowed(track)
+}
+
 /// Every recording a path holds, in playing order: one for a file, and one per track for a
-/// disc image.
+/// disc image or for a file a cue sheet beside it splits.
 pub fn tracks_of(path: &Path) -> Result<Vec<TrackRef>> {
-    if !sacd::is_image(path) {
-        return Ok(vec![TrackRef::file(path.to_path_buf())]);
+    if sacd::is_image(path) {
+        let disc = Disc::open(path)?;
+        return Ok(disc
+            .tracks()
+            .iter()
+            .map(|track| TrackRef::of_disc(path.to_path_buf(), track.number))
+            .collect());
     }
-    let disc = Disc::open(path)?;
-    Ok(disc
-        .tracks()
-        .iter()
-        .map(|track| TrackRef::of_disc(path.to_path_buf(), track.number))
-        .collect())
+    if cue::is_cue(path) {
+        let sheet = Sheet::read(path)?;
+        return Ok(cue_tracks(&sheet, &sheet.tracks));
+    }
+    match cue::sheet_for(path) {
+        // Only this file's share of the sheet: a sheet naming several files describes one
+        // album, and every file in it would otherwise queue the whole album again.
+        Some(sheet) => Ok(cue_tracks(&sheet, sheet.tracks_in(path))),
+        None => Ok(vec![TrackRef::file(path.to_path_buf())]),
+    }
+}
+
+/// Name tracks of a cue sheet by the sheet rather than by the audio file, so that opening
+/// one goes back through the sheet for its bounds.
+pub fn cue_tracks<'a>(
+    sheet: &Sheet,
+    tracks: impl IntoIterator<Item = &'a CueTrack>,
+) -> Vec<TrackRef> {
+    let mut refs = Vec::new();
+    for track in tracks {
+        refs.push(TrackRef::of_disc(sheet.path.clone(), track.number));
+    }
+    refs
 }
 
 /// Read only what a recording says it is, for a listing with no reason to keep the audio open.
@@ -287,9 +367,130 @@ pub(crate) fn read_available<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
-    use crate::reader::TrackRef;
+    use crate::reader::dsf::tests::{BLOCK, dsf_file};
+    use crate::reader::{DOP_BYTES_PER_FRAME, TrackRef, open, tracks_of};
+
+    /// DSD bytes per channel one cue frame holds at DSD64.
+    const CUE_FRAME_BYTES: u64 = 4_704;
+
+    const SHEET: &str = "TITLE \"Kind of Blue\"\n\
+                         PERFORMER \"Miles Davis\"\n\
+                         FILE \"side.dsf\" WAVE\n\
+                         TRACK 01 AUDIO\n  TITLE \"One\"\n  INDEX 01 00:00:00\n\
+                         TRACK 02 AUDIO\n  TITLE \"Two\"\n  INDEX 01 00:00:01\n\
+                         TRACK 03 AUDIO\n  TITLE \"Three\"\n  INDEX 01 00:00:02\n";
+
+    /// A DSF holding three cue frames of audio, with a sheet beside it splitting it in three.
+    fn side() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blocks = (CUE_FRAME_BYTES as usize * 3).div_ceil(BLOCK);
+        let samples = (blocks * BLOCK * 8) as u64;
+        fs::write(dir.path().join("side.dsf"), dsf_file(8, samples, blocks)).expect("audio");
+        fs::write(dir.path().join("side.cue"), SHEET).expect("sheet");
+        dir
+    }
+
+    #[test]
+    fn a_file_a_sheet_splits_opens_as_the_tracks_the_sheet_names() {
+        let dir = side();
+
+        let tracks = tracks_of(&dir.path().join("side.dsf")).expect("lists");
+
+        assert_eq!(tracks.len(), 3);
+        assert!(
+            tracks
+                .iter()
+                .all(|track| track.path == dir.path().join("side.cue"))
+        );
+        assert_eq!(tracks[1].number, Some(2));
+    }
+
+    #[test]
+    fn each_cue_track_carries_its_own_stretch_of_the_file_and_the_sheets_names() {
+        let dir = side();
+        let tracks = tracks_of(&dir.path().join("side.dsf")).expect("lists");
+
+        let second = open(&tracks[1]).expect("opens");
+
+        assert_eq!(second.total_frames(), CUE_FRAME_BYTES / DOP_BYTES_PER_FRAME);
+        assert_eq!(second.container(), "DSF");
+        assert_eq!(second.tags().title.as_deref(), Some("Two"));
+        assert_eq!(second.tags().artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(second.tags().album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(second.tags().track, Some(2));
+    }
+
+    #[test]
+    fn the_last_cue_track_runs_to_the_end_of_the_file() {
+        let dir = side();
+        let tracks = tracks_of(&dir.path().join("side.dsf")).expect("lists");
+
+        let last = open(&tracks[2]).expect("opens");
+
+        assert_eq!(last.total_frames(), CUE_FRAME_BYTES / DOP_BYTES_PER_FRAME);
+    }
+
+    #[test]
+    fn a_cue_track_reads_the_bytes_that_stretch_of_the_file_holds() {
+        let dir = side();
+        let tracks = tracks_of(&dir.path().join("side.dsf")).expect("lists");
+        let whole = {
+            let mut source = open(&TrackRef::file(dir.path().join("side.dsf"))).expect("opens");
+            let mut out = Vec::new();
+            while source.read(&mut out).expect("reads") > 0 {}
+            out
+        };
+
+        let mut second = open(&tracks[1]).expect("opens");
+        let mut out = Vec::new();
+        while second.read(&mut out).expect("reads") > 0 {}
+
+        let frames = (CUE_FRAME_BYTES / DOP_BYTES_PER_FRAME) as usize;
+        let channels = 2;
+        assert_eq!(out, whole[frames * channels..frames * 2 * channels]);
+    }
+
+    #[test]
+    fn a_file_takes_only_its_own_share_of_a_sheet_that_names_several() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in ["one.dsf", "two.dsf"] {
+            fs::write(dir.path().join(name), dsf_file(8, 96, 2)).expect("audio");
+        }
+        fs::write(
+            dir.path().join("album.cue"),
+            "FILE \"one.dsf\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n\
+             FILE \"two.dsf\" WAVE\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+        )
+        .expect("sheet");
+
+        let first = tracks_of(&dir.path().join("one.dsf")).expect("lists");
+        let second = tracks_of(&dir.path().join("two.dsf")).expect("lists");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].number, Some(1));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].number, Some(2));
+        assert_eq!(
+            tracks_of(&dir.path().join("album.cue"))
+                .expect("lists")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_sheet_beside_it_stays_one_recording() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("track.dsf");
+        fs::write(&path, dsf_file(8, 96, 2)).expect("audio");
+
+        let tracks = tracks_of(&path).expect("lists");
+
+        assert_eq!(tracks, [TrackRef::file(path)]);
+    }
 
     #[test]
     fn a_disc_track_names_itself_by_file_and_number() {

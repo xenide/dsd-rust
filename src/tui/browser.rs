@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
+use crate::reader::cue::{self, Sheet};
 use crate::reader::sacd::{self, Disc};
 use crate::reader::{self, TrackRef};
 
@@ -9,8 +10,8 @@ use crate::reader::{self, TrackRef};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     Folder,
-    /// A disc image. It opens like a folder, because it holds a list of tracks rather than
-    /// one recording.
+    /// A disc image, or a file a cue sheet splits. It opens like a folder, because it holds
+    /// a list of tracks rather than one recording.
     Disc,
     Track(TrackRef),
 }
@@ -119,7 +120,31 @@ fn list(path: &Path) -> Result<Vec<Entry>> {
     if sacd::is_image(path) {
         return list_disc(path);
     }
+    if path.is_file() {
+        let Some(sheet) = cue::sheet_for(path) else {
+            bail!("holds one recording rather than a list of them");
+        };
+        return Ok(list_sheet(&sheet, path));
+    }
     list_dir(path)
+}
+
+/// The tracks a cue sheet splits a file into, in the order it numbers them.
+fn list_sheet(sheet: &Sheet, path: &Path) -> Vec<Entry> {
+    let mut entries = vec![parent_entry(path)];
+    for (track, reference) in sheet
+        .tracks_in(path)
+        .into_iter()
+        .zip(reader::cue_tracks(sheet, sheet.tracks_in(path)))
+    {
+        entries.push(Entry {
+            name: format!("track {}", track.number),
+            title: track.tags.label(),
+            path: path.to_path_buf(),
+            kind: Kind::Track(reference),
+        });
+    }
+    entries
 }
 
 /// The tracks of a disc image, in the order the disc numbers them.
@@ -139,6 +164,7 @@ fn list_disc(path: &Path) -> Result<Vec<Entry>> {
 }
 
 fn list_dir(dir: &Path) -> Result<Vec<Entry>> {
+    let sheets = cue::sheets_in(dir);
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -147,7 +173,7 @@ fn list_dir(dir: &Path) -> Result<Vec<Entry>> {
             continue;
         }
         let path = entry.path();
-        let Some(kind) = kind_of(&path) else {
+        let Some(kind) = kind_of(&path, &sheets) else {
             continue;
         };
         // A recording that will not open, or carries no tags, still lists under its own name.
@@ -184,16 +210,28 @@ fn parent_entry(path: &Path) -> Entry {
 }
 
 /// What a path is worth listing as, or nothing when this player cannot open it.
-fn kind_of(path: &Path) -> Option<Kind> {
+///
+/// A sheet is not listed itself: the file it splits stands for it, and listing both would
+/// put the same music in the folder's playlist twice.
+fn kind_of(path: &Path, sheets: &[Sheet]) -> Option<Kind> {
     if path.is_dir() {
         return Some(Kind::Folder);
+    }
+    if cue::is_cue(path) {
+        return None;
     }
     if sacd::is_image(path) {
         return Some(Kind::Disc);
     }
     let extension = path.extension()?.to_string_lossy().to_lowercase();
     let playable = extension == "dsf" || extension == "dff" || extension == "flac";
-    playable.then(|| Kind::Track(TrackRef::file(path.to_path_buf())))
+    if !playable {
+        return None;
+    }
+    if sheets.iter().any(|sheet| sheet.covers(path)) {
+        return Some(Kind::Disc);
+    }
+    Some(Kind::Track(TrackRef::file(path.to_path_buf())))
 }
 
 #[cfg(test)]
@@ -203,10 +241,76 @@ mod tests {
     use crate::reader::dsf::tests::dsf_file_with_tag;
     use crate::tui::browser::{Browser, Kind, list_dir};
 
+    const SHEET: &str = "TITLE \"Kind of Blue\"\nFILE \"side.dsf\" WAVE\n\
+                         TRACK 01 AUDIO\n  TITLE \"So What\"\n  INDEX 01 00:00:00\n\
+                         TRACK 02 AUDIO\n  TITLE \"Blue in Green\"\n  INDEX 01 00:00:01\n";
+
+    fn side() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("side.dsf"), dsf_file_with_tag("Side One")).expect("audio");
+        fs::write(dir.path().join("side.cue"), SHEET).expect("sheet");
+        dir
+    }
+
+    #[test]
+    fn a_file_a_sheet_splits_lists_as_something_to_open_and_the_sheet_itself_is_not_listed() {
+        let dir = side();
+
+        let entries = list_dir(dir.path()).expect("reads");
+
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["..", "side.dsf"]);
+        assert_eq!(entries[1].kind, Kind::Disc);
+    }
+
+    #[test]
+    fn opening_a_file_a_sheet_splits_lists_the_tracks_the_sheet_names() {
+        let dir = side();
+        let mut browser = Browser::open(dir.path().to_path_buf());
+        browser.move_to(0);
+
+        browser.enter(dir.path().join("side.dsf"));
+
+        let titles: Vec<Option<&str>> = browser
+            .entries
+            .iter()
+            .map(|entry| entry.title.as_deref())
+            .collect();
+        assert_eq!(
+            titles,
+            [None, Some(" 1. So What"), Some(" 2. Blue in Green")]
+        );
+        let playlist = browser.playable();
+        assert_eq!(playlist.len(), 2);
+        assert!(
+            playlist
+                .iter()
+                .all(|track| track.path == dir.path().join("side.cue"))
+        );
+    }
+
+    #[test]
+    fn going_back_up_from_a_file_a_sheet_splits_lands_in_its_folder() {
+        let dir = side();
+        let mut browser = Browser::open(dir.path().join("side.dsf"));
+
+        let parent = browser.entries[0].path.clone();
+        browser.enter(parent);
+
+        assert_eq!(browser.dir, dir.path());
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp dir");
         fs::create_dir(dir.path().join("album")).expect("subdir");
-        for name in ["b.dsf", "A.DFF", "c.flac", "notes.txt", ".hidden.dsf"] {
+        for name in [
+            "b.dsf",
+            "A.DFF",
+            "c.flac",
+            "notes.txt",
+            ".hidden.dsf",
+            "stray.cue",
+        ] {
             fs::write(dir.path().join(name), b"").expect("file");
         }
         dir
