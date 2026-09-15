@@ -5,7 +5,8 @@ stores them: DSD wrapped in DSD over PCM (DoP) 1.1 or sent natively, and PCM at 
 own sample rate. Either way the device is claimed and locked to the rate the recording
 wants, so nothing resamples, mixes, or attenuates on the way.
 
-It reads DSF, DSDIFF, FLAC, and SACD disc images.
+It reads DSF, DSDIFF, FLAC, and SACD disc images, and splits a file that holds a whole
+side into tracks where a cue sheet sits beside it.
 
 ## Usage
 
@@ -16,6 +17,7 @@ dsd-rust info track.dsf                # tags, container, rate, channels, durati
 dsd-rust play track.dsf                # play on the default output device
 dsd-rust play album.flac               # PCM, at the file's own rate and width
 dsd-rust play disc.iso                 # every track of a SACD image, in order
+dsd-rust play side.dsf                 # split into tracks by side.cue, if that is there
 dsd-rust play *.dsf --device "D50"     # pick a device by name fragment or UID
 dsd-rust tui ~/Music                   # browse, play, and watch the transport
 ```
@@ -29,7 +31,8 @@ refused under `--shared`, because that path claims the DAC outright.
 Files play in the order given, and the device is resolved once for the whole list: holding a
 device exclusively moves the system default output elsewhere, so re-resolving between tracks
 would pick the wrong one. A playlist may mix DSD and PCM and mix rates within either; the
-device is reconfigured for each track. A disc image joins the list as the tracks it holds.
+device is reconfigured for each track. A disc image joins the list as the tracks it holds, and
+so does a file a cue sheet splits.
 
 ## Tags
 
@@ -52,13 +55,49 @@ track.dsf
     format      DSD64 (2.8224 MHz), 2 ch
 ```
 
+## Cue sheets
+
+A rip of a disc to one file keeps its track boundaries in a `.cue` sheet beside it. Where one
+is there, the file opens as the tracks the sheet describes rather than as one long recording:
+`play side.dsf`, `info side.dsf`, and the file browser all go through the sheet, and naming
+the sheet itself does the same. Each track plays only its own stretch of the file, seeks
+within it, and reports its own duration, so nothing about the transport tells them apart from
+separate files.
+
+A sheet's `TITLE` and `PERFORMER` name the album, and a track's own name that track; a track
+that gives no performer takes the album's. Times are read to the frame the sheet counts in, a
+seventy-fifth of a second, which is a whole number of DSD bytes and of PCM frames at every
+rate this player handles, so a boundary lands exactly where the sheet put it. A track runs to
+the start of the next one, so a pregap plays at the end of the track before it rather than
+being dropped. Data tracks are skipped, and the audio tracks either side keep their numbers.
+
+```
+dsd-rust info side.dsf
+side.cue track 2
+    title       Freddie Freeloader
+    artist      Miles Davis
+    album       Kind of Blue
+    track       2
+    container   DSF
+    format      DSD64 (2.8224 MHz), 2 ch
+    duration    9:46.00
+```
+
+The sheet does not have to name the file under the name it now has: a sheet that still names
+the `.wav` it was ripped from finds the `.dsf`, `.dff`, or `.flac` beside it under the same
+stem. A sheet naming several files gives each file only its own share of the tracks. A SACD
+image carries its own track list, so a sheet beside one is ignored; a sheet that names an
+image as its audio is refused, because an image is a disc rather than one stream.
+
 ## Terminal UI
 
 `dsd-rust tui [dir]` opens a file browser over `dir` (the working directory by default),
-showing folders, disc images, and playable files only. A tagged file lists under its track
+showing folders, disc images, and playable files only. A file a cue sheet splits lists and
+opens the way a disc image does, and the sheet itself is not listed, so the folder's playlist
+holds the music once rather than twice. A tagged file lists under its track
 number and title, an untagged one under its filename, and either way the pane keeps the order
 the files sort in on disk. A disc image opens like a folder, listing the tracks inside it in
-the order the disc numbers them. It takes the same `--device`, `--shared`, `--buffer-ms`,
+the order the disc numbers them, and a cue sheet's tracks list the same way. It takes the same `--device`, `--shared`, `--buffer-ms`,
 and `--buffer-frames` options as `play`.
 
 ```
