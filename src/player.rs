@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::AudioFormat;
 use crate::dsd::DsdRate;
+use crate::output::hal::Volume;
 use crate::output::stream::{
     Carrier, DOP_PCM_RATES, DeviceBusy, Output, Request, probe_dop_rate, supported_dop_rates,
 };
@@ -113,6 +114,30 @@ impl Target {
         );
         self.probed_rates.push(pcm_rate);
         Ok(true)
+    }
+
+    /// Where the device's own volume control sits, when macOS can see it and it has one.
+    ///
+    /// A DAC held for native DSD has left Core Audio, and one that attenuates nowhere but in
+    /// its own analogue stage has no control to read.
+    pub fn volume(&self) -> Option<Volume> {
+        if self.stale {
+            return None;
+        }
+        self.device.volume()
+    }
+
+    /// Move the device's volume by `decibels`.
+    pub fn adjust_volume(&self, decibels: f32) -> Result<Volume> {
+        if self.stale {
+            bail!(
+                "{} is claimed for native DSD, so macOS has no volume control over it",
+                self.name
+            );
+        }
+        self.device
+            .adjust_volume(decibels)
+            .with_context(|| format!("{} volume", self.name))
     }
 
     /// Hand a natively held DAC back to `usbaudiod`. Instant, because picking the device up
