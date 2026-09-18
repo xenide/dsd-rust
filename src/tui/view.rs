@@ -10,12 +10,12 @@ use crate::tui::browser::Browser;
 use crate::tui::engine::{State, Status};
 
 const ACCENT: Color = Color::Cyan;
-const KEYS: &str = " ↑↓ move   enter open   space play/pause   ,. seek 5s   s stop   n/p track   r refresh   q quit";
+const KEYS: &str = " ↑↓ move   enter open   space play/pause   ,. seek 5s   -/+ volume   s stop   n/p track   r refresh   q quit";
 
 pub fn draw(frame: &mut Frame, browser: &Browser, status: &Status) {
     let [top, debug, hints] = Layout::vertical([
         Constraint::Min(6),
-        Constraint::Length(10),
+        Constraint::Length(11),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -142,6 +142,12 @@ fn draw_debug(frame: &mut Frame, area: Rect, status: &Status) {
             Style::new().fg(Color::DarkGray),
         )],
     };
+    if let Some(volume) = status.volume {
+        rows.push(row(
+            "volume",
+            format!("{:.0}%   {:.1} dB", volume.scalar * 100.0, volume.decibels),
+        ));
+    }
     if let Some(error) = &status.error {
         rows.push(Line::styled(
             format!("error      {error}"),
@@ -269,6 +275,7 @@ mod tests {
 
     use crate::audio::AudioFormat;
     use crate::dsd::{DsdFormat, DsdRate};
+    use crate::output::hal::Volume;
     use crate::player::{DeviceInfo, Progress, TrackInfo};
     use crate::reader::TrackRef;
     use crate::reader::tags::TrackTags;
@@ -311,6 +318,10 @@ mod tests {
             playlist: vec![TrackRef::file(dir.join("track.dsf"))],
             index: 0,
             error: None,
+            volume: Some(Volume {
+                scalar: 0.126,
+                decibels: -41.0,
+            }),
         }
     }
 
@@ -348,6 +359,30 @@ mod tests {
         assert!(screen.contains("integer 24 bit, DoP 352800 Hz"), "{screen}");
         assert!(screen.contains("512 frames (1.5 ms)"), "{screen}");
         assert!(screen.contains("50%"), "{screen}");
+    }
+
+    #[test]
+    fn a_device_with_a_volume_control_shows_where_it_sits() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("track.dsf"), b"").expect("file");
+        let browser = Browser::open(dir.path().to_path_buf());
+
+        let screen = render(&browser, &playing_status(dir.path()));
+
+        assert!(screen.contains("volume     13%   -41.0 dB"), "{screen}");
+        assert!(screen.contains("-/+ volume"), "{screen}");
+    }
+
+    #[test]
+    fn a_device_with_no_volume_control_shows_no_volume_row() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut status = playing_status(dir.path());
+        status.volume = None;
+        let browser = Browser::open(dir.path().to_path_buf());
+
+        let screen = render(&browser, &status);
+
+        assert!(!screen.contains("dB"), "{screen}");
     }
 
     #[test]

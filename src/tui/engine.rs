@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::output::hal::Volume;
 use crate::player::{DeviceInfo, PlayOptions, Playback, Progress, Target, TrackInfo};
 use crate::reader::TrackRef;
 
@@ -18,6 +19,7 @@ enum Command {
     Stop,
     Skip(i32),
     Seek(f64),
+    Volume(f32),
     Quit,
 }
 
@@ -58,6 +60,8 @@ pub struct Status {
     pub playlist: Vec<TrackRef>,
     pub index: usize,
     pub error: Option<String>,
+    /// The device's own volume, which macOS drives whether or not anything is playing.
+    pub volume: Option<Volume>,
 }
 
 /// A playback worker on its own thread, so the audio path never waits on a redraw.
@@ -122,6 +126,11 @@ impl Engine {
         self.send(Command::Seek(delta));
     }
 
+    /// Move the device's volume by `decibels`.
+    pub fn volume(&self, decibels: f32) {
+        self.send(Command::Volume(decibels));
+    }
+
     fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
@@ -182,6 +191,7 @@ impl Worker {
                 }
             }
             Command::Seek(delta) => self.seek(delta),
+            Command::Volume(decibels) => self.set_volume(decibels),
             Command::Quit => {}
         }
     }
@@ -193,6 +203,14 @@ impl Worker {
         };
         if let Err(error) = session.seek(delta) {
             self.set_error(Some(format!("{error:#}")));
+        }
+    }
+
+    /// Move the device's volume, saying so when the device has none to move.
+    fn set_volume(&mut self, decibels: f32) {
+        match self.target.adjust_volume(decibels) {
+            Ok(_) => self.set_error(None),
+            Err(error) => self.set_error(Some(format!("{error:#}"))),
         }
     }
 
@@ -267,6 +285,7 @@ impl Worker {
             .unwrap_or_else(|guard| guard.into_inner());
         status.playlist = self.playlist.clone();
         status.index = self.index;
+        status.volume = self.target.volume();
         let Some(session) = &self.session else {
             status.state = State::Stopped;
             status.progress = Progress::default();

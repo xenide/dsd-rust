@@ -23,6 +23,8 @@ use crate::tui::engine::Engine;
 const TICK: Duration = Duration::from_millis(100);
 /// How far one press of the seek keys moves within a track, in seconds.
 const SEEK: f64 = 5.0;
+/// How far one press of the volume keys moves the device's own control, in decibels.
+const VOLUME: f32 = 1.0;
 
 pub struct App {
     browser: Browser,
@@ -86,6 +88,8 @@ impl App {
             KeyCode::Char('p') => self.engine.skip(-1),
             KeyCode::Char(',') => self.engine.seek(-SEEK),
             KeyCode::Char('.') => self.engine.seek(SEEK),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.engine.volume(-VOLUME),
+            KeyCode::Char('=') | KeyCode::Char('+') => self.engine.volume(VOLUME),
             KeyCode::Char('r') => self.browser.refresh(),
             _ => {}
         }

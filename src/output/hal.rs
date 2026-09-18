@@ -8,13 +8,15 @@ use coreaudio_sys::{
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectHasProperty,
     AudioObjectID, AudioObjectIsPropertySettable, AudioObjectPropertyAddress,
     AudioObjectSetPropertyData, AudioStreamBasicDescription, AudioStreamRangedDescription,
-    CFRelease, CFStringGetCString, CFStringGetLength, CFStringGetMaximumSizeForEncoding,
-    CFStringRef, OSStatus, kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyHogMode, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertyStreams, kAudioDevicePropertySupportsMixing,
-    kAudioDevicePropertyVolumeScalar, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    AudioValueRange, CFRelease, CFStringGetCString, CFStringGetLength,
+    CFStringGetMaximumSizeForEncoding, CFStringRef, OSStatus, kAudioDevicePropertyBufferFrameSize,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyHogMode,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
+    kAudioDevicePropertySupportsMixing, kAudioDevicePropertyVolumeDecibels,
+    kAudioDevicePropertyVolumeRangeDecibels, kAudioDevicePropertyVolumeScalar,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
     kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyAvailableVirtualFormats,
     kAudioStreamPropertyPhysicalFormat, kAudioStreamPropertyVirtualFormat, kCFStringEncodingUTF8,
 };
@@ -255,6 +257,86 @@ impl Device {
             return None;
         }
         get(self.0, &address).ok()
+    }
+
+    /// Master output volume in both units the HAL keeps it in.
+    pub fn volume(&self) -> Option<Volume> {
+        Some(Volume {
+            scalar: self.volume_scalar()?,
+            decibels: get(self.0, &address(kAudioDevicePropertyVolumeDecibels, OUTPUT)).ok()?,
+        })
+    }
+
+    /// Move the master volume by `decibels`, within the range the device allows.
+    ///
+    /// The control belongs to the device: a DAC that carries its own volume takes this over
+    /// the USB control endpoint and attenuates it internally, so the samples on the wire are
+    /// the file's own either way.
+    pub fn adjust_volume(&self, decibels: f32) -> Result<Volume> {
+        let control = address(kAudioDevicePropertyVolumeDecibels, OUTPUT);
+        if !has(self.0, &control) || !is_settable(self.0, &control) {
+            bail!("device has no volume control, so its output is whatever it is wired for");
+        }
+        let range = get(
+            self.0,
+            &address(kAudioDevicePropertyVolumeRangeDecibels, OUTPUT),
+        )?;
+        let wanted = stepped(get(self.0, &control)?, decibels, range);
+        set(self.0, &control, &wanted)?;
+        let Some(volume) = self.volume() else {
+            bail!("device took a volume of {wanted:.1} dB but will not report it back");
+        };
+        Ok(volume)
+    }
+}
+
+/// Where the master output volume sits: the fraction the macOS slider shows, and the
+/// attenuation the device is applying to reach it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Volume {
+    pub scalar: f32,
+    pub decibels: f32,
+}
+
+/// Where a step of `decibels` from `current` lands inside what the device allows.
+///
+/// A device turned all the way down reports negative infinity, which no step can climb out
+/// of, so the bottom of the range stands in for it.
+fn stepped(current: f32, decibels: f32, range: AudioValueRange) -> f32 {
+    let min = range.mMinimum as f32;
+    let max = range.mMaximum as f32;
+    let current = if current.is_finite() { current } else { min };
+    (current + decibels).clamp(min, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use coreaudio_sys::AudioValueRange;
+
+    use crate::output::hal::stepped;
+
+    fn range() -> AudioValueRange {
+        AudioValueRange {
+            mMinimum: -63.5,
+            mMaximum: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_step_moves_by_the_decibels_it_is_given() {
+        assert_eq!(stepped(-41.0, 1.0, range()), -40.0);
+        assert_eq!(stepped(-41.0, -1.0, range()), -42.0);
+    }
+
+    #[test]
+    fn a_step_past_either_end_stops_at_the_end() {
+        assert_eq!(stepped(-0.5, 4.0, range()), 0.0);
+        assert_eq!(stepped(-63.0, -4.0, range()), -63.5);
+    }
+
+    #[test]
+    fn a_device_turned_all_the_way_down_steps_up_from_the_bottom_of_its_range() {
+        assert_eq!(stepped(f32::NEG_INFINITY, 2.0, range()), -61.5);
     }
 }
 

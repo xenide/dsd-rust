@@ -105,7 +105,7 @@ and `--buffer-frames` options as `play`.
  ← / h        parent folder    space           play/pause
  s            stop             n / p           next / previous track
  , / .        back / on 5 s    q / esc         quit
- r            re-read folder
+ r            re-read folder   - / +           volume, 1 dB a press
 ```
 
 Playing a file queues the rest of the listing from that file on, in the order the pane shows
@@ -129,6 +129,24 @@ stream     5644800 bit/s per channel, 84672000 bytes per channel
 
 A rising `underruns` count means the reader is not keeping up; raise `--buffer-ms`. A `queue`
 that sits near 0% is the same warning before it becomes audible.
+
+### Volume
+
+`-` and `+` move the output device's own volume control a decibel a press, and the debug pane
+shows where it sits. It is the same control the macOS slider drives, which matters for a DAC
+with no knob of its own: claiming the device exclusively moves the system default output
+elsewhere, and the slider and the media keys follow the default, so they land on some other
+device for as long as a track is playing.
+
+The control belongs to the device, not to the player. A USB DAC that carries a volume feature
+unit takes the setting over its control endpoint and attenuates internally, so the samples on
+the wire are still the file's own and the volume costs nothing in bit depth here. A device
+that exposes no control at all -- an HDMI or DisplayPort output, say -- has nothing to move,
+and the keys say so rather than scaling the samples: this player has no gain stage of its own
+and will not grow one.
+
+A DAC being streamed native DSD is the exception. It has left Core Audio for the duration of
+the track, so the keys have nothing to set until it is handed back.
 
 ## PCM
 
